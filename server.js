@@ -30,7 +30,7 @@ const DEFAULTS = {
 
 const MANIFEST = {
   id: "com.antony.personalrecommendations",
-  version: "0.7.0",
+  version: "0.7.1",
   name: "🎯 Antony — Personal Recommendations",
   description: "Recommendations learned from Stremio 👍 and ❤️ only; watched items are used only for exclusion.",
   resources: ["catalog", "meta"],
@@ -48,7 +48,7 @@ const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 const TMDB_DETAIL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const EMBEDDING_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const LIBRARY_CACHE_TTL_MS = 30 * 1000;
+const LIBRARY_CACHE_TTL_MS = 60 * 1000;
 const RATING_CACHE_TTL_MS = 60 * 1000;
 const REFRESH_LOCK = new Map();
 const ACTIVE_CONFIGS = new Map();
@@ -58,6 +58,14 @@ const MAX_PROFILE_ITEMS = 60;
 const CANDIDATE_PAGES_PER_STRATEGY = 3;
 const CANDIDATE_DETAILS_LIMIT = 160;
 const EMBEDDING_BATCH = 80;
+const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
+let geminiCooldownUntil = 0;
+let geminiTail = Promise.resolve();
+function geminiAvailable(apiKey) { return Boolean(apiKey) && Date.now() >= geminiCooldownUntil; }
+function markGeminiFailure(err) {
+  const msg = String(err?.message || err || "Gemini error");
+  if (/HTTP 429|HTTP 403|quota|rate.?limit/i.test(msg)) geminiCooldownUntil = Date.now() + GEMINI_COOLDOWN_MS;
+}
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -270,39 +278,54 @@ function cosine(a, b) {
 }
 
 async function geminiEmbeddings(apiKey, texts) {
-  if (!apiKey || !texts.length) return null;
-  const out = [];
-  for (let start = 0; start < texts.length; start += EMBEDDING_BATCH) {
-    const chunk = texts.slice(start, start + EMBEDDING_BATCH);
-    const body = { requests: chunk.map(text => ({ model: "models/gemini-embedding-001", content: { parts: [{ text: String(text).slice(0, 12000) }] }, taskType: "SEMANTIC_SIMILARITY" })) };
-    const data = await jsonFetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify(body)
-    }, 30000);
-    out.push(...(data?.embeddings || []).map(x => x.values || []));
-  }
-  return out.length === texts.length ? out : null;
+  if (!geminiAvailable(apiKey) || !texts.length) return null;
+
+  // Serialize Gemini calls so movie/series prewarming cannot hit the same
+  // rate-limit bucket simultaneously.
+  const run = geminiTail.catch(() => null).then(async () => {
+    if (!geminiAvailable(apiKey)) return null;
+    try {
+      const out = [];
+      for (let start = 0; start < texts.length; start += EMBEDDING_BATCH) {
+        const chunk = texts.slice(start, start + EMBEDDING_BATCH);
+        const body = { requests: chunk.map(text => ({
+          model: "models/gemini-embedding-001",
+          content: { parts: [{ text: String(text).slice(0, 12000) }] },
+          taskType: "SEMANTIC_SIMILARITY"
+        })) };
+        const data = await jsonFetch(
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents",
+          { method: "POST", headers: {"content-type":"application/json","x-goog-api-key":apiKey}, body: JSON.stringify(body) },
+          30000
+        );
+        out.push(...(data?.embeddings || []).map(x => x.values || []));
+      }
+      return out.length === texts.length ? out : null;
+    } catch (e) {
+      markGeminiFailure(e);
+      console.warn(`Gemini unavailable; using local recommender fallback: ${e.message}`);
+      return null;
+    }
+  });
+  geminiTail = run.catch(() => null);
+  return run;
 }
 
 async function cachedEmbeddings(apiKey, texts, namespace) {
-  if (!apiKey || !texts.length) return null;
-  const result = new Array(texts.length);
-  const missing = [];
-  const missingIndexes = [];
-  for (let i = 0; i < texts.length; i++) {
-    const hash = crypto.createHash("sha256").update(`${namespace}:${texts[i]}`).digest("hex");
-    const cached = cacheGet(`embedding:${hash}`);
-    if (cached) result[i] = cached;
-    else { missing.push(texts[i]); missingIndexes.push(i); }
+  if (!geminiAvailable(apiKey) || !texts.length) return null;
+  const result = new Array(texts.length), missing = [], missingIndexes = [];
+  for (let i=0;i<texts.length;i++) {
+    const hash=crypto.createHash("sha256").update(`${namespace}:${texts[i]}`).digest("hex");
+    const cached=cacheGet(`embedding:${hash}`);
+    if (cached) result[i]=cached; else { missing.push(texts[i]); missingIndexes.push(i); }
   }
   if (missing.length) {
-    const fresh = await geminiEmbeddings(apiKey, missing);
-    if (!fresh) return result.every(Boolean) ? result : null;
-    fresh.forEach((v, j) => {
-      result[missingIndexes[j]] = v;
-      const hash = crypto.createHash("sha256").update(`${namespace}:${missing[j]}`).digest("hex");
-      cacheSet(`embedding:${hash}`, v, EMBEDDING_CACHE_TTL_MS);
+    const fresh=await geminiEmbeddings(apiKey, missing);
+    if (!fresh) return null;
+    fresh.forEach((v,j)=>{
+      result[missingIndexes[j]]=v;
+      const hash=crypto.createHash("sha256").update(`${namespace}:${missing[j]}`).digest("hex");
+      cacheSet(`embedding:${hash}`,v,EMBEDDING_CACHE_TTL_MS);
     });
   }
   return result.every(Boolean) ? result : null;
@@ -442,7 +465,7 @@ async function buildProfile(config, libraryItems, type) {
 
   const featureProfile = learnedFeatureProfile(details);
   let positiveVectors = null;
-  if (config.geminiApiKey && details.length) {
+  if (geminiAvailable(config.geminiApiKey) && details.length) {
     positiveVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x => textOf(x.details)), "positive");
   }
   const profile = { watched, positives: details, featureProfile, positiveVectors, positiveCount: positives.length };
@@ -500,7 +523,7 @@ async function buildTop50(type, config, profile) {
   if (!filtered.length) return [];
 
   let candidateVectors = null;
-  if (config.geminiApiKey && profile.positiveVectors?.length) {
+  if (geminiAvailable(config.geminiApiKey) && profile.positiveVectors?.length) {
     candidateVectors = await geminiEmbeddings(config.geminiApiKey, filtered.map(textOf)).catch(() => null);
   }
 
@@ -563,6 +586,25 @@ async function computeRecommendations(type, config, token, library) {
   return { top50, fingerprint, profile };
 }
 
+function resultMetaKey(token,type,fingerprint){return `resultmeta:${token}:${type}:${fingerprint}`;}
+function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
+  if(!config.geminiApiKey || !geminiAvailable(config.geminiApiKey)) return;
+  const k=`gemini-upgrade:${token}:${type}:${fingerprint}`;
+  if(cacheGet(k)) return;
+  cacheSet(k,true,10*60*1000);
+  setImmediate(async()=>{
+    try{
+      const profile=await buildProfile(config,library,type);
+      if(profileFingerprint(profile)!==fingerprint || !profile.positiveVectors?.length) return;
+      const rk=`result:${token}:${type}:${fingerprint}`, meta=cacheGet(resultMetaKey(token,type,fingerprint));
+      if(!cacheGet(rk) || meta?.geminiUsed) return;
+      const top50=await buildTop50(type,config,profile);
+      cacheSet(rk,top50,CACHE_TTL_MS);
+      cacheSet(resultMetaKey(token,type,fingerprint),{geminiUsed:true},CACHE_TTL_MS);
+      console.log(`Gemini upgrade completed for ${type}`);
+    }catch(e){console.warn(`Gemini upgrade failed for ${type}: ${e.message}`);}
+  });
+}
 async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
   const library = await getLibrary(config.stremioAuthKey);
@@ -572,9 +614,10 @@ async function discover(type, config, token) {
   const key = `result:${token}:${type}:${fingerprint}`;
   const cached = cacheGet(key);
   if (cached) {
-    // Refresh the other catalog in the background without delaying this response.
-    warmOtherType(type, config, token, library).catch(() => {});
-    return serializeAndShuffle(cached, type);
+    const meta=cacheGet(resultMetaKey(token,type,fingerprint));
+    if(!meta?.geminiUsed) scheduleGeminiUpgrade(type,config,token,library,fingerprint);
+    warmOtherType(type,config,token,library).catch(()=>{});
+    return serializeAndShuffle(cached,type);
   }
   const lockKey = `lock:${token}:${type}:${fingerprint}`;
   if (REFRESH_LOCK.has(lockKey)) {
@@ -584,6 +627,7 @@ async function discover(type, config, token) {
   const job = (async () => {
     const top50 = await buildTop50(type, config, profile);
     cacheSet(key, top50, CACHE_TTL_MS);
+    cacheSet(resultMetaKey(token,type,fingerprint), {geminiUsed:Boolean(profile.positiveVectors?.length)}, CACHE_TTL_MS);
     return { top50 };
   })();
   REFRESH_LOCK.set(lockKey, job);
@@ -606,6 +650,7 @@ async function warmOtherType(currentType, config, token, library) {
   const job = (async () => {
     const top50 = await buildTop50(other, config, profile);
     cacheSet(key, top50, CACHE_TTL_MS);
+    cacheSet(resultMetaKey(token,other,fingerprint), {geminiUsed:Boolean(profile.positiveVectors?.length)}, CACHE_TTL_MS);
   })();
   REFRESH_LOCK.set(lockKey, job);
   try { await job; } finally { REFRESH_LOCK.delete(lockKey); }
@@ -620,13 +665,21 @@ async function prewarmBoth(token, config) {
       const profile = await buildProfile(config, library, "movie");
       const fingerprint = profileFingerprint(profile);
       const key = `result:${token}:movie:${fingerprint}`;
-      if (!cacheGet(key)) cacheSet(key, await buildTop50("movie", config, profile), CACHE_TTL_MS);
+      if (!cacheGet(key)) {
+        const top50=await buildTop50("movie",config,profile);
+        cacheSet(key,top50,CACHE_TTL_MS);
+        cacheSet(resultMetaKey(token,"movie",fingerprint),{geminiUsed:Boolean(profile.positiveVectors?.length)},CACHE_TTL_MS);
+      }
     })(),
     (async () => {
       const profile = await buildProfile(config, library, "series");
       const fingerprint = profileFingerprint(profile);
       const key = `result:${token}:series:${fingerprint}`;
-      if (!cacheGet(key)) cacheSet(key, await buildTop50("series", config, profile), CACHE_TTL_MS);
+      if (!cacheGet(key)) {
+        const top50=await buildTop50("series",config,profile);
+        cacheSet(key,top50,CACHE_TTL_MS);
+        cacheSet(resultMetaKey(token,"series",fingerprint),{geminiUsed:Boolean(profile.positiveVectors?.length)},CACHE_TTL_MS);
+      }
     })()
   ]);
 }
@@ -717,4 +770,4 @@ setInterval(async () => {
   }
 }, 6 * 60 * 60 * 1000).unref();
 
-http.createServer((req,res) => handle(req,res).catch(e => { console.error(e); if (!res.headersSent) res.writeHead(500); res.end("Internal server error"); })).listen(PORT, HOST, () => console.log(`Antony addon v0.7.0 listening on ${HOST}:${PORT}`));
+http.createServer((req,res) => handle(req,res).catch(e => { console.error(e); if (!res.headersSent) res.writeHead(500); res.end("Internal server error"); })).listen(PORT, HOST, () => console.log(`Antony addon v0.7.1 listening on ${HOST}:${PORT}`));

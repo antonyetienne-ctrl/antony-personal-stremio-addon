@@ -1,4 +1,4 @@
-# 🎯 Antony — Personal Stremio Recommendations v0.7.0
+# 🎯 Antony — Personal Stremio Recommendations v0.7.1
 
 Personal movie and series catalogs for Stremio.
 
@@ -24,3 +24,7 @@ Personal movie and series catalogs for Stremio.
 - `README.md`
 - `render.yaml`
 - `server.js`
+
+
+## V0.7.1 resilience
+Gemini is an optional semantic layer. HTTP 429/403, quota, rate-limit, timeout, or network failures automatically trigger the local recommender fallback; the catalog endpoint does not fail because Gemini is unavailable. Gemini is retried automatically after a cooldown and cached local results can be upgraded in the background when Gemini becomes available again.
