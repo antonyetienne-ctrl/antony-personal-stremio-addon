@@ -1,33 +1,18 @@
-# Antony — Personal Stremio Recommendations v0.3.0
+# 🎯 Antony Personal Stremio Recommendations v0.6.0
 
-## What this release does
-- Two Stremio catalogs: **🎯 Antony — Films** and **🎯 Antony — Séries**.
-- Uses TMDB for discovery, metadata, vote-count-aware quality scoring and filters.
-- Reads Stremio account `libraryItem` data to exclude watched content.
-- Reads Stremio's current Likes service (`https://likes.stremio.com`) for `Liked` / `Loved` status.
-- Learns genre/keyword affinity from the user's actual positive signals; ❤️ is weighted more strongly than 👍.
-- Watched content is used for exclusion, not as evidence that the user liked it.
-- No torrent/source/quality management; Torrentio/LUMIO/etc. remain responsible for sources.
+Personal Stremio add-on with separate movie and series catalogs.
 
-## Configuration
-Open `/configure`, enter:
-1. a TMDB API key;
-2. a Stremio AuthKey.
+## Recommendation model
+- ❤️ is weighted 3× 👍.
+- Only Stremio 👍/❤️ teach the preference model.
+- Watched items are exclusion-only; watching never means liking.
+- TMDB rating and vote count are hard filters first, then weak ranking signals (8% combined).
+- TMDB popularity/release date do not drive the ranking.
+- Gemini embeddings provide semantic story/theme similarity when configured.
+- Structured signals include genres, keywords, collections, narrative text, with actors/directors kept low-weight.
+- Soft diversification is applied before selecting the final 50.
+- Exactly the selected top 50 are then shuffled for display.
+- A profile fingerprint invalidates the cache when likes/hearts or watched exclusions change.
 
-The page generates a `stremio://.../manifest.json` installation link. Stremio's add-on documentation explicitly supports user data in the add-on URL and configurable `/configure` pages.
-
-Never paste credentials into GitHub or into ChatGPT.
-
-## Render
-- Runtime: Docker
-- Plan: Free
-- Region: Frankfurt recommended for Switzerland
-- Health check: `/health`
-- Port: Render's `PORT` environment variable, default 10000.
-
-`CONFIG_SECRET` is recommended as a Render environment variable. If omitted, the service derives a per-service fallback secret from Render's service identity; setting `CONFIG_SECRET` explicitly is preferable if you want encrypted installation URLs to remain valid across service identity changes.
-
-## Verified design facts
-Stremio's current core defines rating states `Watched`, `Liked`, and `Loved`, and its rating requests use `https://likes.stremio.com/api/get_status`. The same core defines the account datastore collection `libraryItem` for library/watch-state synchronization.
-
-The Stremio add-on protocol requires a manifest and supports `catalog` and `meta`; configurable addons use `/configure` and a `stremio://` install link.
+## Deployment
+Deploy the five files to Render as a Docker service. Open `/configure`, enter TMDB and Stremio credentials, optionally Gemini, then install the generated Stremio manifest.

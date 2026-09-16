@@ -1,11 +1,7 @@
 services:
   - type: web
-    name: antony-personal-stremio
+    name: antony-personal-stremio-addon
     runtime: docker
     plan: free
-    healthCheckPath: /health
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: CONFIG_SECRET
-        generateValue: true
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
