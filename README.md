@@ -1,26 +1,33 @@
-# 🎯 Antony — Personal Recommendations
+# Antony — Personal Stremio Recommendations v0.3.0
 
-Local Stremio recommendation/catalog add-on.
+## What this release does
+- Two Stremio catalogs: **🎯 Antony — Films** and **🎯 Antony — Séries**.
+- Uses TMDB for discovery, metadata, vote-count-aware quality scoring and filters.
+- Reads Stremio account `libraryItem` data to exclude watched content.
+- Reads Stremio's current Likes service (`https://likes.stremio.com`) for `Liked` / `Loved` status.
+- Learns genre/keyword affinity from the user's actual positive signals; ❤️ is weighted more strongly than 👍.
+- Watched content is used for exclusion, not as evidence that the user liked it.
+- No torrent/source/quality management; Torrentio/LUMIO/etc. remain responsible for sources.
 
-Catalogs:
-- 🎯 Antony — Films
-- 🎯 Antony — Séries
+## Configuration
+Open `/configure`, enter:
+1. a TMDB API key;
+2. a Stremio AuthKey.
 
-It only handles recommendations/cataloguing. It does not handle Torrentio, LUMIO, AllDebrid, torrent quality, resolution, HDR, CAM/TS, or playback.
+The page generates a `stremio://.../manifest.json` installation link. Stremio's add-on documentation explicitly supports user data in the add-on URL and configurable `/configure` pages.
 
-## Install
+Never paste credentials into GitHub or into ChatGPT.
 
-Requires Node.js 20+.
+## Render
+- Runtime: Docker
+- Plan: Free
+- Region: Frankfurt recommended for Switzerland
+- Health check: `/health`
+- Port: Render's `PORT` environment variable, default 10000.
 
-```bash
-npm install
-npm start
-```
+`CONFIG_SECRET` is recommended as a Render environment variable. If omitted, the service derives a per-service fallback secret from Render's service identity; setting `CONFIG_SECRET` explicitly is preferable if you want encrypted installation URLs to remain valid across service identity changes.
 
-Open `http://127.0.0.1:7000/configure`, enter your TMDB API key and Stremio credentials/AuthKey, then install:
+## Verified design facts
+Stremio's current core defines rating states `Watched`, `Liked`, and `Loved`, and its rating requests use `https://likes.stremio.com/api/get_status`. The same core defines the account datastore collection `libraryItem` for library/watch-state synchronization.
 
-`stremio://127.0.0.1:7000/manifest.json`
-
-## Important
-
-The standard Stremio add-on API does not expose private user history/ratings directly. This first build uses Stremio's account datastore API for library synchronization. Stremio's internal Like/Love representation is not a stable public third-party contract, so the feedback parser is deliberately tolerant. The recommendation engine remains useful from the initial profile, TMDB quality signals and watched exclusion even if a specific Stremio version stores feedback differently.
+The Stremio add-on protocol requires a manifest and supports `catalog` and `meta`; configurable addons use `/configure` and a `stremio://` install link.
