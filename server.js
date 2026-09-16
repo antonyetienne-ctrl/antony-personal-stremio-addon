@@ -30,7 +30,7 @@ const DEFAULTS = {
 
 const MANIFEST = {
   id: "com.antony.personalrecommendations",
-  version: "0.8.0",
+  version: "0.9.0",
   name: "🎯 Antony — Personal Recommendations",
   description: "Recommendations learned from Stremio 👍 and ❤️ only; watched items are used only for exclusion.",
   resources: ["catalog", "meta"],
@@ -60,11 +60,11 @@ const STATE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const stateStore = new Map();
 const catalogStore = new Map();
 const refreshJobs = new Map();
-const MAX_POSITIVE_ITEMS = 100;
-const MAX_PROFILE_ITEMS = 60;
-const CANDIDATE_PAGES_PER_STRATEGY = 3;
-const CANDIDATE_DETAILS_LIMIT = 160;
-const EMBEDDING_BATCH = 80;
+const MAX_POSITIVE_ITEMS = Infinity;
+const MAX_PROFILE_ITEMS = Infinity;
+const CANDIDATE_PAGES_PER_STRATEGY = 8;
+const CANDIDATE_DETAILS_LIMIT = 900;
+const EMBEDDING_BATCH = 50;
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
 let geminiCooldownUntil = 0;
 let geminiTail = Promise.resolve();
@@ -181,20 +181,31 @@ async function getLibrary(authKey, { force = false } = {}) {
   const key = `library:${crypto.createHash("sha256").update(authKey).digest("hex").slice(0, 24)}`;
   const cached = cache.get(key);
   if (!force && cached && Date.now() - cached.time < STATE_REFRESH_MS) return cached.value;
-  const meta = resultOf(await stremioApi("datastoreMeta", { authKey, collection: "libraryItem" }));
-  const ids = arrayFrom(meta).map(x => typeof x === "string" ? x : x?._id || x?.id).filter(Boolean);
-  let items;
-  if (!ids.length) items = arrayFrom(await stremioApi("datastoreGet", { authKey, collection: "libraryItem", ids: [], all: true }));
-  else {
-    const out = [];
-    for (let i = 0; i < ids.length; i += 100) out.push(...arrayFrom(await stremioApi("datastoreGet", { authKey, collection: "libraryItem", ids: ids.slice(i, i + 100), all: false })));
-    items = out;
-  }
-  const deduped = [...new Map(items.map(x => [x?._id || x?.id, x])).values()].filter(Boolean);
-  cacheSet(key, deduped, STATE_STALE_MS);
-  return deduped;
-}
 
+  // Prefer one complete datastoreGet. This is the same basic strategy used by
+  // Watchly: fetch the whole library state once, then process it locally.
+  try {
+    const all = arrayFrom(await stremioApi("datastoreGet", {
+      authKey, collection: "libraryItem", ids: [], all: true
+    }));
+    const deduped = [...new Map(all.map(x => [x?._id || x?.id, x])).values()].filter(Boolean);
+    cacheSet(key, deduped, STATE_STALE_MS);
+    return deduped;
+  } catch (firstError) {
+    // Compatibility fallback for accounts/servers that reject all=true.
+    const meta = resultOf(await stremioApi("datastoreMeta", { authKey, collection: "libraryItem" }));
+    const ids = arrayFrom(meta).map(x => typeof x === "string" ? x : x?._id || x?.id).filter(Boolean);
+    const out = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      out.push(...arrayFrom(await stremioApi("datastoreGet", {
+        authKey, collection: "libraryItem", ids: ids.slice(i, i + 100), all: false
+      })));
+    }
+    const deduped = [...new Map(out.map(x => [x?._id || x?.id, x])).values()].filter(Boolean);
+    cacheSet(key, deduped, STATE_STALE_MS);
+    return deduped;
+  }
+}
 function libraryFingerprint(items) {
   return crypto.createHash("sha256").update((items || []).map(x => JSON.stringify({
     id: x?._id || x?.id,
@@ -505,21 +516,38 @@ function lexicalSimilarity(candidate, positives) {
   return best;
 }
 
-function semanticScore(candidateVector, positiveVectors, positives) {
+function weightedBestSimilarity(candidateVector, positiveVectors, positives, desiredRating) {
   if (!candidateVector || !positiveVectors?.length) return 0;
   const sims = [];
   for (let i = 0; i < Math.min(positiveVectors.length, positives.length); i++) {
+    if (desiredRating && positives[i].rating !== desiredRating) continue;
     const s = Math.max(0, cosine(candidateVector, positiveVectors[i]));
     const w = positives[i].rating === "heart" ? 3 : 1;
     sims.push({ s, w });
   }
-  sims.sort((a, b) => b.s - a.s);
-  const top = sims.slice(0, 12);
-  let num = 0, den = 0;
+  sims.sort((a,b) => b.s - a.s);
+  const top = sims.slice(0, 16);
+  let num=0, den=0;
   for (const x of top) { num += x.s * x.w; den += x.w; }
-  return den ? num / den : 0;
+  return den ? num/den : 0;
 }
 
+function semanticScore(candidateVector, positiveVectors, positives, clusters) {
+  if (!candidateVector || !positiveVectors?.length) return 0;
+  const heart = weightedBestSimilarity(candidateVector, positiveVectors, positives, "heart");
+  const like = weightedBestSimilarity(candidateVector, positiveVectors, positives, "like");
+  let cluster = 0;
+  if (clusters?.length) {
+    cluster = Math.max(...clusters.map(c => cosine(candidateVector, c.vector) * (0.75 + 0.25 * c.weight)));
+  }
+  // Loved items define the strongest center of taste; liked items broaden it.
+  return 0.58 * heart + 0.22 * like + 0.20 * Math.max(0, cluster);
+}
+
+function cosineProfileSimilarity(candidateVector, vectors) {
+  if (!candidateVector || !vectors?.length) return 0;
+  return vectors.reduce((best, v) => Math.max(best, Math.max(0, cosine(candidateVector, v))), 0);
+}
 function hardFilter(d, type, config, watched, excludedGenres) {
   const imdb = d.external_ids?.imdb_id || d.imdb_id;
   if (!imdb) return null;
@@ -565,130 +593,210 @@ function diversityPick(scored, target) {
   return selected;
 }
 
+function chooseDiversePositiveSeeds(positives, count) {
+  if (positives.length <= count) return positives;
+  const hearts = positives.filter(x => x.rating === "heart");
+  const likes = positives.filter(x => x.rating === "like");
+  const ordered = [...hearts, ...likes];
+  const selected = [];
+  const usedGenres = new Set();
+  for (const item of ordered) {
+    if (selected.length >= count) break;
+    const genres = new Set((item.details.genres || []).map(g => g.id));
+    const novelty = [...genres].filter(g => !usedGenres.has(g)).length;
+    if (selected.length < Math.ceil(count * 0.65) || novelty > 0) {
+      selected.push(item);
+      for (const g of genres) usedGenres.add(g);
+    }
+  }
+  for (const item of ordered) if (selected.length < count && !selected.includes(item)) selected.push(item);
+  return selected;
+}
+
+function buildTasteClusters(positiveVectors, positives) {
+  if (!positiveVectors?.length) return [];
+  const anchors = [];
+  const maxClusters = Math.min(8, Math.max(3, Math.round(Math.sqrt(positiveVectors.length / 8))));
+  const heartIndexes = positives.map((p,i)=>p.rating === "heart" ? i : -1).filter(i=>i>=0);
+  const candidates = heartIndexes.length ? heartIndexes : positiveVectors.map((_,i)=>i);
+  for (const idx of candidates) {
+    if (anchors.length >= maxClusters) break;
+    const v = positiveVectors[idx];
+    if (!v) continue;
+    if (anchors.every(a => cosine(v, a.vector) < 0.78)) anchors.push({vector:v, weight: positives[idx]?.rating === "heart" ? 1 : 0.8});
+  }
+  if (!anchors.length) return [];
+  // One Lloyd-like pass: each positive contributes to its nearest taste center.
+  const sums = anchors.map(a => ({v:new Array(a.vector.length).fill(0), w:0}));
+  for (let i=0;i<positiveVectors.length;i++) {
+    const v=positiveVectors[i]; if(!v) continue;
+    let bi=0, bs=-Infinity;
+    for(let j=0;j<anchors.length;j++){ const c=cosine(v,anchors[j].vector); if(c>bs){bs=c;bi=j;} }
+    const w=positives[i]?.rating === "heart" ? 3 : 1;
+    sums[bi].w += w;
+    for(let k=0;k<v.length;k++) sums[bi].v[k] += v[k]*w;
+  }
+  return sums.map((x,j)=>{
+    const n=Math.sqrt(x.v.reduce((a,b)=>a+b*b,0)) || 1;
+    return { vector:x.v.map(v=>v/n), weight:Math.min(1, x.w/(Math.max(1, positiveVectors.length*0.35))) };
+  }).filter(x=>x.vector.length);
+}
+
 async function buildProfile(config, libraryItems, type) {
-  const libraryFingerprint = crypto.createHash("sha256").update(libraryItems.map(x => JSON.stringify({ id:x?._id||x?.id, m:x?._mtime||x?._mtime, s:x?.state })).sort().join("|")).digest("hex").slice(0, 24);
+  const libraryFingerprint = crypto.createHash("sha256").update(libraryItems.map(x => JSON.stringify({ id:x?._id||x?.id, m:x?._mtime, s:x?.state })).sort().join("|")).digest("hex").slice(0, 24);
   const profileKey = `profile:${type}:${libraryFingerprint}:${config.useLikes}:${config.useHearts}:${config.geminiApiKey ? crypto.createHash("sha256").update(config.geminiApiKey).digest("hex").slice(0, 8) : "nogemini"}`;
   const cachedProfile = cacheGet(profileKey);
   if (cachedProfile) return cachedProfile;
   const watched = new Set();
   const positives = [];
   const relevant = libraryItems.filter(x => itemType(x) === type);
-  // IMPORTANT: watched is built from Stremio's LibraryItem state, not from ratings.
-  // Stremio's current model exposes timesWatched/flaggedWatched and a watched bitfield for series.
+
   for (const item of relevant) {
-    const id = extractImdb(item);
-    if (!id) continue;
-    if (config.useWatchedExclusion && isWatched(item)) {
-      watched.add(id);
-      watched.add(id.toLowerCase());
-    }
+    const id = extractImdb(item); if (!id) continue;
+    if (config.useWatchedExclusion && isWatched(item)) { watched.add(id); watched.add(id.toLowerCase()); }
   }
-  const rated = await mapLimit(relevant, 24, async item => {
-    const id = extractImdb(item);
-    if (!id) return null;
+
+  // Scan the COMPLETE relevant library. There is deliberately no 100/60 item cap.
+  // The positive signal is taken from every item that exposes a Stremio rating.
+  const rated = await mapLimit(relevant, 16, async item => {
+    const id = extractImdb(item); if (!id) return null;
     const rating = await getStremioRating(config.stremioAuthKey, id, type);
     if ((rating === "heart" && config.useHearts) || (rating === "like" && config.useLikes)) return { id, rating, type };
     return null;
   });
   for (const x of rated) if (x) positives.push(x);
 
-  const details = (await mapLimit(positives.slice(0, MAX_PROFILE_ITEMS), 16, async p => {
-    const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source: "imdb_id", language: "en-US" }, config.tmdbApiKey);
+  // Resolve every positive item to TMDB metadata. Cached results make subsequent rebuilds cheap.
+  const details = (await mapLimit(positives, 16, async p => {
+    const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source:"imdb_id", language:"en-US" }, config.tmdbApiKey);
     const d = type === "movie" ? found.movie_results?.[0] : found.tv_results?.[0];
     if (!d) return null;
-    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language: "en-US", append_to_response: "keywords,external_ids,credits" }, config.tmdbApiKey);
-    return { details: full, rating: p.rating, id: p.id };
+    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language:"en-US", append_to_response:"keywords,external_ids,credits" }, config.tmdbApiKey);
+    return { details:full, rating:p.rating, id:p.id };
   })).filter(Boolean);
 
   const featureProfile = learnedFeatureProfile(details);
   let positiveVectors = null;
-  if (geminiAvailable(config.geminiApiKey) && details.length) {
-    positiveVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x => textOf(x.details)), "positive");
-  }
-  const profile = { watched, positives: details, featureProfile, positiveVectors, positiveCount: positives.length };
+  if (geminiAvailable(config.geminiApiKey) && details.length) positiveVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x=>textOf(x.details)), "positive");
+  const clusters = buildTasteClusters(positiveVectors, details);
+  const seeds = chooseDiversePositiveSeeds(details, Math.min(36, details.length));
+  const profile = { watched, positives:details, featureProfile, positiveVectors, clusters, seeds, positiveCount:positives.length };
   cacheSet(profileKey, profile, PROFILE_CACHE_TTL_MS);
   return profile;
 }
-
 async function discoverCandidates(type, config, profile) {
-  const excludedGenres = new Set((config.excludeGenres || []).map(x => cleanText(x)));
-  const genreCounts = new Map();
-  for (const x of profile.positives) for (const g of (x.details.genres || [])) genreCounts.set(g.id, (genreCounts.get(g.id) || 0) + (x.rating === "heart" ? 3 : 1));
-  const learnedGenreIds = [...genreCounts.entries()].filter(([id]) => id).sort((a,b) => b[1]-a[1]).slice(0, 4).map(([id]) => id);
-  const keywordCounts = new Map();
-  for (const x of profile.positives) for (const k of (x.details.keywords?.keywords || [])) if (k.id) keywordCounts.set(k.id, (keywordCounts.get(k.id) || 0) + (x.rating === "heart" ? 3 : 1));
-  const topKeywordIds = [...keywordCounts.entries()].sort((a,b) => b[1]-a[1]).slice(0, 8).map(x => x[0]);
+  const excludedGenres = new Set((config.excludeGenres || []).map(x=>cleanText(x)));
+  const candidates = new Map();
+  const addResults = arr => { for (const x of arr || []) if (x?.id) candidates.set(`${type}:${x.id}`, x); };
 
-  const strategies = [
-    { sort_by: "vote_average.desc" },
-    { sort_by: "vote_count.desc" },
-    { sort_by: "popularity.desc" }
-  ];
-  if (learnedGenreIds.length) strategies.push({ sort_by: "vote_count.desc", with_genres: learnedGenreIds.slice(0, 2).join(",") });
-  if (topKeywordIds.length) strategies.push({ sort_by: "vote_count.desc", with_keywords: topKeywordIds.slice(0, 4).join(",") });
-
-  const candidates = [];
-  for (const strategy of strategies) {
-    const pages = await Promise.all(Array.from({ length: CANDIDATE_PAGES_PER_STRATEGY }, (_, i) => {
-      const params = { language: "en-US", include_adult: false, page: i + 1, ...strategy };
-      if (type === "movie") { params.primary_release_date_gte = `${config.yearMin}-01-01`; params.primary_release_date_lte = `${config.yearMax}-12-31`; }
-      else { params.first_air_date_gte = `${config.yearMin}-01-01`; params.first_air_date_lte = `${config.yearMax}-12-31`; }
-      return tmdb(type === "movie" ? "discover/movie" : "discover/tv", params, config.tmdbApiKey).catch(() => null);
-    }));
-    for (const data of pages) candidates.push(...(data?.results || []));
+  // 1) Candidate generation from the user's actual positive items.
+  // This is intentionally independent of popularity and release date.
+  const seeds = profile.seeds || [];
+  const seedJobs = [];
+  for (const seed of seeds) {
+    const tmdbId = seed.details?.id;
+    if (!tmdbId) continue;
+    const base = type === "movie" ? `movie/${tmdbId}` : `tv/${tmdbId}`;
+    seedJobs.push(tmdb(`${base}/recommendations`, { language:"en-US", page:1 }, config.tmdbApiKey).catch(()=>null));
+    seedJobs.push(tmdb(`${base}/similar`, { language:"en-US", page:1 }, config.tmdbApiKey).catch(()=>null));
   }
-  const unique = [...new Map(candidates.map(x => [x.id, x])).values()];
-  // Apply cheap filters before expensive detail calls. This removes most candidates immediately.
-  const cheap = unique.filter(d => {
-    const rating = Number(d.vote_average);
-    const votes = Number(d.vote_count);
-    if (Number.isFinite(rating) && (rating < config.tmdbMinRating || rating > config.tmdbMaxRating)) return false;
-    if (votes < config.tmdbMinVotes) return false;
-    const date = d.release_date || d.first_air_date || "";
-    const year = Number(String(date).slice(0,4));
-    if (year && (year < config.yearMin || year > config.yearMax)) return false;
-    if (type === "series" && config.excludeCancelledSeries && String(d.status || "").toLowerCase() === "canceled") return false;
-    return true;
-  }).slice(0, CANDIDATE_DETAILS_LIMIT);
-  const detailed = (await mapLimit(cheap, 24, async c => tmdb(`${type === "series" ? "tv" : "movie"}/${c.id}`, { language: "en-US", append_to_response: "keywords,external_ids,credits" }, config.tmdbApiKey))).filter(Boolean);
-  return detailed.filter(d => hardFilter(d, type, config, profile.watched, excludedGenres));
-}
+  const seedResults = await Promise.all(seedJobs);
+  for (const data of seedResults) addResults(data?.results);
 
+  // 2) Learned thematic discovery. We use multiple independent queries so one
+  // genre/keyword cannot dominate the candidate pool.
+  const genreCounts = new Map(), keywordCounts = new Map();
+  for (const x of profile.positives) {
+    const w=x.rating === "heart" ? 3 : 1;
+    for (const g of x.details.genres || []) genreCounts.set(g.id,(genreCounts.get(g.id)||0)+w);
+    for (const k of x.details.keywords?.keywords || []) keywordCounts.set(k.id,(keywordCounts.get(k.id)||0)+w);
+  }
+  const genres=[...genreCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8).map(x=>x[0]);
+  const keywords=[...keywordCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,16).map(x=>x[0]);
+
+  const strategies=[];
+  // Retrieval sorts are deliberately quality/reliability based, never popularity-based.
+  strategies.push({ sort_by:"vote_average.desc" });
+  strategies.push({ sort_by:"vote_count.desc" });
+  if (genres.length) {
+    for (const g of genres.slice(0,5)) strategies.push({ sort_by:"vote_average.desc", with_genres:String(g) });
+  }
+  if (keywords.length) {
+    for (const k of keywords.slice(0,8)) strategies.push({ sort_by:"vote_average.desc", with_keywords:String(k) });
+  }
+  // Pair the strongest genre/keyword combinations to capture compound tastes.
+  for (const g of genres.slice(0,4)) for (const k of keywords.slice(0,6)) {
+    strategies.push({ sort_by:"vote_average.desc", with_genres:String(g), with_keywords:String(k) });
+  }
+
+  const pageJobs=[];
+  for(const strategy of strategies.slice(0,42)){
+    for(let page=1;page<=CANDIDATE_PAGES_PER_STRATEGY;page++){
+      const params={language:"en-US",include_adult:false,page,...strategy};
+      if(type==="movie"){
+        params.primary_release_date_gte=`${config.yearMin}-01-01`;
+        params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
+      } else {
+        params.first_air_date_gte=`${config.yearMin}-01-01`;
+        params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
+      }
+      pageJobs.push(tmdb(type==="movie"?"discover/movie":"discover/tv",params,config.tmdbApiKey).catch(()=>null));
+    }
+  }
+  const discovered=await Promise.all(pageJobs);
+  for(const data of discovered) addResults(data?.results);
+
+  // Cheap filters before details. Do not slice until after all discovery sources
+  // have contributed, otherwise an early source can starve later sources.
+  const cheap=[...candidates.values()].filter(d=>{
+    const rating=Number(d.vote_average), votes=Number(d.vote_count);
+    if(Number.isFinite(rating)&&(rating<config.tmdbMinRating||rating>config.tmdbMaxRating)) return false;
+    if(votes<config.tmdbMinVotes) return false;
+    const date=d.release_date||d.first_air_date||"";
+    const year=Number(String(date).slice(0,4));
+    if(!year || year<config.yearMin || year>config.yearMax) return false;
+    if(type==="series"&&config.excludeCancelledSeries&&String(d.status||"").toLowerCase()==="canceled") return false;
+    return true;
+  });
+
+  // Prefer candidates that came from learned seed recommendations before the
+  // generic discovery pool, but retain a large, diverse pool for the final scorer.
+  const limited=cheap.slice(0,CANDIDATE_DETAILS_LIMIT);
+  const detailed=(await mapLimit(limited,18,async c=>tmdb(`${type==="series"?"tv":"movie"}/${c.id}`,{language:"en-US",append_to_response:"keywords,external_ids,credits"},config.tmdbApiKey))).filter(Boolean);
+  return detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
+}
 async function buildTop50(type, config, profile) {
   if (!profile.positiveCount) return [];
   const filtered = await discoverCandidates(type, config, profile);
   if (!filtered.length) return [];
 
-  let candidateVectors = null;
-  if (geminiAvailable(config.geminiApiKey) && profile.positiveVectors?.length) {
-    candidateVectors = await geminiEmbeddings(config.geminiApiKey, filtered.map(textOf)).catch(() => null);
+  let candidateVectors=null;
+  if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length){
+    candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${type}`).catch(()=>null);
   }
 
-  const scored = filtered.map((d, i) => {
-    const sem = candidateVectors?.[i] ? semanticScore(candidateVectors[i], profile.positiveVectors, profile.positives) : 0;
-    const feat = featureSimilarity(d, profile.featureProfile);
-    const lex = lexicalSimilarity(d, profile.positives);
-    // Personal taste is deliberately dominant. TMDB quality/popularity are weak
-    // secondary signals only: they can break close calls, but cannot dominate a
-    // strong taste match. Release date remains neutral.
-    const tasteScore = config.geminiApiKey && profile.positiveVectors?.length
-      ? 0.72 * sem + 0.23 * feat + 0.05 * lex
-      : 0.80 * feat + 0.20 * lex;
-    const rating = Math.max(0, Math.min(10, Number(d.vote_average) || 0)) / 10;
-    const votes = Math.max(0, Number(d.vote_count) || 0);
-    // Reliability rises with vote count but saturates quickly; it is not a
-    // popularity ranking. 100k votes is already close to the ceiling.
-    const voteReliability = Math.min(1, Math.log10(1 + votes) / 5);
-    const tmdbWeak = 0.05 * rating + 0.03 * voteReliability;
-    const personalScore = 0.92 * tasteScore + tmdbWeak;
-    return { details: d, imdbId: d.external_ids?.imdb_id || d.imdb_id, personalScore, tasteScore, tmdbWeak, semantic: candidateVectors?.[i] || null };
-  });
-  scored.sort((a,b) => b.personalScore - a.personalScore);
-  // Diversity is applied before the final top-50 cut. The result is then shuffled only for display.
-  const diversified = diversityPick(scored, Math.min(50, config.maxResults));
-  return diversified;
-}
+  const scored=filtered.map((d,i)=>{
+    const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;
+    const feat=featureSimilarity(d,profile.featureProfile);
+    const lex=lexicalSimilarity(d,profile.positives);
+    const clusterFeature = profile.clusters?.length && candidateVectors?.[i]
+      ? Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)) : 0;
+    // The taste score is intentionally multi-signal. Gemini semantic similarity
+    // is only one component; structured TMDB patterns remain significant.
+    const tasteScore=profile.positiveVectors?.length&&candidateVectors?.[i]
+      ? 0.58*sem + 0.22*feat + 0.10*clusterFeature + 0.10*lex
+      : 0.72*feat + 0.18*lex + 0.10*clusterFeature;
+    const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
+    const votes=Math.max(0,Number(d.vote_count)||0);
+    const voteReliability=Math.min(1,Math.log10(1+votes)/5);
+    const tmdbWeak=0.05*rating+0.03*voteReliability;
+    const personalScore=0.92*tasteScore+tmdbWeak;
+    return {details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,tmdbWeak,semantic:candidateVectors?.[i]||null};
+  }).filter(x=>x.imdbId);
 
+  scored.sort((a,b)=>b.personalScore-a.personalScore);
+  return diversityPick(scored,Math.min(50,config.maxResults));
+}
 function serializeAndShuffle(top50, type) {
   const shuffled = top50.slice();
   for (let i = shuffled.length - 1; i > 0; i--) {
@@ -756,10 +864,14 @@ async function discover(type, config, token) {
     return cached.payload;
   }
 
-  // First request after a restart/configuration: kick off the expensive work but
-  // return a valid empty catalog immediately. Stremio retries catalog requests;
-  // subsequent requests receive the precomputed catalog once ready.
-  scheduleRefresh(token, config, "cold-start");
+  // First request after a restart/configuration: kick off the expensive work.
+  // We only wait a tiny bounded interval; heavy work stays in the background.
+  const job = scheduleRefresh(token, config, "cold-start");
+  // Give a freshly warmed catalog a brief chance to become available without
+  // ever making the catalog endpoint wait on external services for seconds.
+  await Promise.race([job.catch(()=>null), new Promise(r=>setTimeout(r, 150))]);
+  const ready = getCatalogCached(token, type);
+  if (ready) return ready.payload;
   return { metas: [] };
 }
 
@@ -871,4 +983,4 @@ http.createServer((req,res) => handle(req,res).catch(e => {
   console.error(e);
   if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
   res.end(JSON.stringify({ error:"internal_error" }));
-})).listen(PORT, HOST, () => console.log(`Antony addon v0.8.0 listening on ${HOST}:${PORT}`));
+})).listen(PORT, HOST, () => console.log(`Antony addon v0.9.0 listening on ${HOST}:${PORT}`));

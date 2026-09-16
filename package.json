@@ -1,8 +1,8 @@
 {
   "name": "antony-personal-stremio-addon",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": true,
-  "description": "Personal Stremio recommendations learned from likes and loves.",
+  "description": "Deep personal Stremio recommendations learned from the complete 👍/❤️ signal available through the configured Stremio library.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
