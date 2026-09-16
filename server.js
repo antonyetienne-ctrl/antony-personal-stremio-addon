@@ -40,7 +40,7 @@ const MANIFEST = {
   ],
   behaviorHints: {
     configurable: true,
-    configurationRequired: true
+    configurationRequired: false
   }
 };
 
