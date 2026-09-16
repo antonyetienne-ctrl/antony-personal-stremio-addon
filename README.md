@@ -1,35 +1,50 @@
-# 🎯 Antony — Personal Stremio Recommendations v0.9.0
+# 🎯 Antony — Personal Stremio Recommendations v1.1.0
 
-## Objective
-A personal Stremio movie/series recommender. It learns only from the user's actual 👍 and ❤️ signals available through the configured Stremio account/library; watched content is used only as an exclusion signal.
+Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 👍/❤️ signals.
 
-## Recommendation engine
-- Complete scan of the configured Stremio library: no artificial 100/60-item learning cap.
+## v1.1.0 changes
+
+- TMDB authentication uses the **API Read Access Token** (`Authorization: Bearer ...`), not the legacy API-key query parameter.
+- Candidate discovery no longer uses `popular` and does not use popularity as a final ranking signal.
+- Candidates are gathered from the user's positive items through TMDB `similar` and `recommendations`, then broadened with profile-derived genre/keyword combinations through TMDB `discover`.
+- Discovery samples multiple pages and multiple non-popularity sort orders, including rating, release-date sweeps and low-vote-count sweeps, so old/less-popular qualifying works can enter the candidate pool.
+- The final ranking remains **92% taste + 5% TMDB rating + 3% vote-count reliability**. TMDB rating/vote count are hard filters first.
 - ❤️ has 3× the positive weight of 👍.
-- Positive items are resolved to full TMDB metadata and, when configured, Gemini embeddings.
-- Taste is modeled at several levels: genres, keywords, collections, narrative text, creators/cast, countries/language/runtime, semantic similarity and learned taste clusters.
-- Loved and liked items contribute separately; loved items define the strongest semantic center while liked items broaden the profile.
-- Candidate generation uses multiple independent sources: TMDB recommendations/similar for diverse positive seeds plus learned genre/keyword discovery. Popularity is not a final ranking signal and release date is neutral.
-- Hard filters are applied before ranking: TMDB rating/vote thresholds, year, runtime, excluded genres, cancelled/ongoing series settings and watched IDs.
-- Final ranking: 92% personal taste + 5% TMDB rating + 3% vote-count reliability.
-- Diversity is applied softly before selection to prevent repeated franchises/near-duplicates from consuming the catalog.
-- Exactly the best 50 admissible films and 50 admissible series are selected when the candidate universe contains at least 50; only the final display order is shuffled.
+- Watched content is an exclusion only; it is never treated as a positive preference.
+- The final 30 are selected first, diversified softly, then shuffled only for display.
+- Gemini remains optional. A Gemini 429/timeout/error falls back to the local recommender.
+- Background refresh and last-known-good catalogs remain in place. The 20-second cold-start wait is only a response-time guard; it is **not** a cap on the background recommendation computation.
 
-## Performance/resilience
-- `/catalog` never waits for the full recommendation build.
-- Last-known-good catalogs are served immediately while refreshes happen in the background.
-- Complete Stremio library is fetched with one `datastoreGet(all=true)` request first; the older metadata+100-ID batching method is only a compatibility fallback.
-- External HTTP has bounded timeouts, retries, exponential backoff and jitter.
-- Gemini is optional and never a hard dependency. 429/quota/network failures fall back to the structured local model.
-- Expensive TMDB metadata and Gemini embeddings are cached in-process.
-- Background jobs are deduplicated.
+## Configuration
+
+Open `/configure` and provide:
+
+1. **TMDB API Read Access Token** — required.
+2. **Stremio AuthKey** — required.
+3. **Gemini API key** — optional.
+
+The TMDB Read Access Token is stored encrypted inside the generated manifest token and sent to TMDB only as an HTTP Bearer token.
+
+## Candidate discovery philosophy
+
+The addon cannot download every TMDB title with full metadata on every request. Instead it uses several independent discovery routes so candidate eligibility is not determined by TMDB's popularity ranking:
+
+- recommendations from positive seeds;
+- similar titles from positive seeds;
+- genre-driven discovery learned from 👍/❤️;
+- keyword-driven discovery learned from 👍/❤️;
+- genre + keyword combinations;
+- sampled pages across several non-popularity sorts.
+
+TMDB's daily ID exports are not used as a runtime dependency: TMDB documents them as ID lists with limited higher-level attributes rather than full metadata exports. This keeps the Render Free deployment small and avoids turning the addon into a data warehouse.
+
+## Resilience
+
+- Stremio state is cached and a last-known-good catalog is retained.
+- Expensive recommendation work is performed in the background when possible.
+- TMDB calls use retries, timeouts and the Bearer token.
+- Gemini is optional and non-blocking for correctness.
 
 ## Important limitation
-Stremio's official Liked and Loved features are exposed as dedicated addons/catalogs. This build uses the authenticated Stremio rating-status endpoint for every item in the complete configured library, so it does not arbitrarily truncate the library at 100 items. The public documentation available for the Liked/Loved addons does not expose a documented bulk private-user API that can be called directly by this addon; therefore the build does not pretend to have a guaranteed bulk Likes endpoint that has not been verified.
 
-## Files
-- Dockerfile
-- package.json
-- README.md
-- render.yaml
-- server.js
+A third-party Stremio addon cannot simply request "all of TMDB with every metadata field" in one operation. This version therefore maximizes candidate coverage within reasonable API traffic rather than pretending to exhaustively crawl the entire TMDB database.

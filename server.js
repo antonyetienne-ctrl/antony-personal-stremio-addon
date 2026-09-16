@@ -9,7 +9,7 @@ const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
 
 const DEFAULTS = {
-  tmdbApiKey: "",
+  tmdbAccessToken: "",
   stremioAuthKey: "",
   geminiApiKey: "",
   tmdbMinRating: 7,
@@ -25,12 +25,12 @@ const DEFAULTS = {
   useHearts: true,
   excludeCancelledSeries: true,
   allowOngoingSeries: true,
-  maxResults: 50
+  maxResults: 30
 };
 
 const MANIFEST = {
   id: "com.antony.personalrecommendations",
-  version: "0.9.0",
+  version: "1.1.0",
   name: "🎯 Antony — Personal Recommendations",
   description: "Recommendations learned from Stremio 👍 and ❤️ only; watched items are used only for exclusion.",
   resources: ["catalog", "meta"],
@@ -62,9 +62,11 @@ const catalogStore = new Map();
 const refreshJobs = new Map();
 const MAX_POSITIVE_ITEMS = Infinity;
 const MAX_PROFILE_ITEMS = Infinity;
-const CANDIDATE_PAGES_PER_STRATEGY = 8;
-const CANDIDATE_DETAILS_LIMIT = 900;
+const CANDIDATE_PAGES_PER_STRATEGY = 3;
+const CANDIDATE_DISCOVERY_STRATEGIES = 20;
+const CANDIDATE_DETAILS_LIMIT = 650;
 const EMBEDDING_BATCH = 50;
+const COLD_START_WAIT_MS = 20000;
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
 let geminiCooldownUntil = 0;
 let geminiTail = Promise.resolve();
@@ -138,7 +140,7 @@ async function stremioApi(method, body) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
-  });
+  }, 8000, 2);
 }
 function resultOf(x) { return x && typeof x === "object" ? (x.result ?? x) : x; }
 function arrayFrom(x) {
@@ -315,10 +317,10 @@ async function buildAndStoreCatalog(type, config, token, library) {
   const existing = getCatalogCached(token, type);
   // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
   if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
-  const top50 = await buildTop50(type, config, profile);
-  const payload = serializeAndShuffle(top50, type);
+  const top30 = await buildTop50(type, config, profile);
+  const payload = serializeAndShuffle(top30, type);
   putCatalog(token, type, payload, fingerprint, Boolean(profile.positiveVectors?.length));
-  cacheSet(`result:${token}:${type}:${fingerprint}`, top50, CACHE_TTL_MS);
+  cacheSet(`result:${token}:${type}:${fingerprint}`, top30, CACHE_TTL_MS);
   cacheSet(resultMetaKey(token, type, fingerprint), { geminiUsed: Boolean(profile.positiveVectors?.length) }, CACHE_TTL_MS);
   return payload;
 }
@@ -370,14 +372,13 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
-async function tmdb(endpoint, params, apiKey) {
+async function tmdb(endpoint, params, accessToken) {
   const u = new URL(`https://api.themoviedb.org/3/${endpoint}`);
   for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null && v !== "") u.searchParams.set(k, String(v));
-  u.searchParams.set("api_key", apiKey);
-  const key = `tmdb:${crypto.createHash("sha256").update(u.toString()).digest("hex").slice(0, 28)}`;
+  const key = `tmdb:${crypto.createHash("sha256").update(`${endpoint}?${u.searchParams.toString()}`).digest("hex").slice(0, 28)}`;
   const cached = cacheGet(key);
   if (cached) return cached;
-  const data = await jsonFetch(u);
+  const data = await jsonFetch(u, { headers: { Authorization: `Bearer ${accessToken}` } }, 10000, 3);
   cacheSet(key, data, endpoint.startsWith("discover/") ? CATALOG_FRESH_MS : TMDB_DETAIL_CACHE_TTL_MS);
   return data;
 }
@@ -668,10 +669,10 @@ async function buildProfile(config, libraryItems, type) {
 
   // Resolve every positive item to TMDB metadata. Cached results make subsequent rebuilds cheap.
   const details = (await mapLimit(positives, 16, async p => {
-    const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source:"imdb_id", language:"en-US" }, config.tmdbApiKey);
+    const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source:"imdb_id", language:"en-US" }, config.tmdbAccessToken);
     const d = type === "movie" ? found.movie_results?.[0] : found.tv_results?.[0];
     if (!d) return null;
-    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language:"en-US", append_to_response:"keywords,external_ids,credits" }, config.tmdbApiKey);
+    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language:"en-US", append_to_response:"keywords,external_ids,credits" }, config.tmdbAccessToken);
     return { details:full, rating:p.rating, id:p.id };
   })).filter(Boolean);
 
@@ -681,77 +682,89 @@ async function buildProfile(config, libraryItems, type) {
   const clusters = buildTasteClusters(positiveVectors, details);
   const seeds = chooseDiversePositiveSeeds(details, Math.min(36, details.length));
   const profile = { watched, positives:details, featureProfile, positiveVectors, clusters, seeds, positiveCount:positives.length };
+  console.log(`Profile ${type}: library=${relevant.length} positive=${positives.length} enriched=${details.length} watched=${watched.size} gemini=${Boolean(positiveVectors?.length)}`);
   cacheSet(profileKey, profile, PROFILE_CACHE_TTL_MS);
   return profile;
 }
+function stableSeed(text) {
+  return parseInt(crypto.createHash("sha256").update(String(text)).digest("hex").slice(0, 8), 16) >>> 0;
+}
+function samplePages(seedText, count = CANDIDATE_PAGES_PER_STRATEGY) {
+  const pages = new Set();
+  let x = stableSeed(seedText) || 1;
+  while (pages.size < count) {
+    x = (1664525 * x + 1013904223) >>> 0;
+    pages.add(1 + (x % 500));
+  }
+  return [...pages];
+}
+
 async function discoverCandidates(type, config, profile) {
   const excludedGenres = new Set((config.excludeGenres || []).map(x=>cleanText(x)));
   const candidates = new Map();
   const addResults = arr => { for (const x of arr || []) if (x?.id) candidates.set(`${type}:${x.id}`, x); };
 
-  // 1) Candidate generation from the user's actual positive items.
-  // This is intentionally independent of popularity and release date.
+  // Candidate discovery deliberately avoids TMDB's popularity ranking. We use
+  // several independent entry points and sample different pages of filtered
+  // Discover results. Popularity is therefore neither the candidate gate nor a
+  // ranking signal.
   const seeds = profile.seeds || [];
-  const seedJobs = [];
-  for (const seed of seeds) {
+  const seedJobs = seeds.slice(0, 36).flatMap(seed => {
     const tmdbId = seed.details?.id;
-    if (!tmdbId) continue;
+    if (!tmdbId) return [];
     const base = type === "movie" ? `movie/${tmdbId}` : `tv/${tmdbId}`;
-    seedJobs.push(tmdb(`${base}/recommendations`, { language:"en-US", page:1 }, config.tmdbApiKey).catch(()=>null));
-    seedJobs.push(tmdb(`${base}/similar`, { language:"en-US", page:1 }, config.tmdbApiKey).catch(()=>null));
-  }
-  const seedResults = await Promise.all(seedJobs);
+    return [
+      { endpoint:`${base}/recommendations`, params:{ language:"en-US", page:1 } },
+      { endpoint:`${base}/similar`, params:{ language:"en-US", page:1 } }
+    ];
+  });
+  const seedResults = await mapLimit(seedJobs, 8, async q => tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
   for (const data of seedResults) addResults(data?.results);
 
-  // 2) Learned thematic discovery. We use multiple independent queries so one
-  // genre/keyword cannot dominate the candidate pool.
   const genreCounts = new Map(), keywordCounts = new Map();
   for (const x of profile.positives) {
     const w=x.rating === "heart" ? 3 : 1;
     for (const g of x.details.genres || []) genreCounts.set(g.id,(genreCounts.get(g.id)||0)+w);
     for (const k of x.details.keywords?.keywords || []) keywordCounts.set(k.id,(keywordCounts.get(k.id)||0)+w);
   }
-  const genres=[...genreCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8).map(x=>x[0]);
-  const keywords=[...keywordCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,16).map(x=>x[0]);
+  const genres=[...genreCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10).map(x=>x[0]);
+  const keywords=[...keywordCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,18).map(x=>x[0]);
 
   const strategies=[];
-  // Retrieval sorts are deliberately quality/reliability based, never popularity-based.
-  strategies.push({ sort_by:"vote_average.desc" });
-  strategies.push({ sort_by:"vote_count.desc" });
-  if (genres.length) {
-    for (const g of genres.slice(0,5)) strategies.push({ sort_by:"vote_average.desc", with_genres:String(g) });
+  for (const g of genres) strategies.push({ with_genres:String(g), label:`g:${g}` });
+  for (const k of keywords) strategies.push({ with_keywords:String(k), label:`k:${k}` });
+  for (const g of genres.slice(0,6)) for (const k of keywords.slice(0,5)) {
+    strategies.push({ with_genres:String(g), with_keywords:String(k), label:`gk:${g}:${k}` });
   }
-  if (keywords.length) {
-    for (const k of keywords.slice(0,8)) strategies.push({ sort_by:"vote_average.desc", with_keywords:String(k) });
-  }
-  // Pair the strongest genre/keyword combinations to capture compound tastes.
-  for (const g of genres.slice(0,4)) for (const k of keywords.slice(0,6)) {
-    strategies.push({ sort_by:"vote_average.desc", with_genres:String(g), with_keywords:String(k) });
-  }
+
+  const sortModes = type === "movie"
+    ? ["vote_average.desc", "primary_release_date.asc", "primary_release_date.desc", "vote_count.asc"]
+    : ["vote_average.desc", "first_air_date.asc", "first_air_date.desc", "vote_count.asc"];
 
   const pageJobs=[];
-  for(const strategy of strategies.slice(0,42)){
-    for(let page=1;page<=CANDIDATE_PAGES_PER_STRATEGY;page++){
-      const params={language:"en-US",include_adult:false,page,...strategy};
-      if(type==="movie"){
-        params.primary_release_date_gte=`${config.yearMin}-01-01`;
-        params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
-      } else {
-        params.first_air_date_gte=`${config.yearMin}-01-01`;
-        params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
+  for(const strategy of strategies.slice(0,CANDIDATE_DISCOVERY_STRATEGIES)){
+    for(const sort_by of sortModes){
+      for(const page of samplePages(`${type}:${strategy.label}:${sort_by}:${profile.positiveCount}`)){
+        const params={language:"en-US",include_adult:false,page,sort_by,...strategy};
+        delete params.label;
+        if(type==="movie"){
+          params.primary_release_date_gte=`${config.yearMin}-01-01`;
+          params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
+        } else {
+          params.first_air_date_gte=`${config.yearMin}-01-01`;
+          params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
+        }
+        pageJobs.push({endpoint:type==="movie"?"discover/movie":"discover/tv",params});
       }
-      pageJobs.push(tmdb(type==="movie"?"discover/movie":"discover/tv",params,config.tmdbApiKey).catch(()=>null));
     }
   }
-  const discovered=await Promise.all(pageJobs);
+  const discovered=await mapLimit(pageJobs, 8, async q => tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
   for(const data of discovered) addResults(data?.results);
 
-  // Cheap filters before details. Do not slice until after all discovery sources
-  // have contributed, otherwise an early source can starve later sources.
   const cheap=[...candidates.values()].filter(d=>{
     const rating=Number(d.vote_average), votes=Number(d.vote_count);
-    if(Number.isFinite(rating)&&(rating<config.tmdbMinRating||rating>config.tmdbMaxRating)) return false;
-    if(votes<config.tmdbMinVotes) return false;
+    if(!Number.isFinite(rating) || rating<config.tmdbMinRating || rating>config.tmdbMaxRating) return false;
+    if(!Number.isFinite(votes) || votes<config.tmdbMinVotes) return false;
     const date=d.release_date||d.first_air_date||"";
     const year=Number(String(date).slice(0,4));
     if(!year || year<config.yearMin || year>config.yearMax) return false;
@@ -759,12 +772,17 @@ async function discoverCandidates(type, config, profile) {
     return true;
   });
 
-  // Prefer candidates that came from learned seed recommendations before the
-  // generic discovery pool, but retain a large, diverse pool for the final scorer.
-  const limited=cheap.slice(0,CANDIDATE_DETAILS_LIMIT);
-  const detailed=(await mapLimit(limited,18,async c=>tmdb(`${type==="series"?"tv":"movie"}/${c.id}`,{language:"en-US",append_to_response:"keywords,external_ids,credits"},config.tmdbApiKey))).filter(Boolean);
-  return detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
+  // Never take the first N results as an implicit popularity ranking. Shuffle the
+  // eligible pool deterministically before the expensive detail stage so every
+  // discovery route has a chance to contribute.
+  const shuffledCheap = cheap.slice().sort((a,b)=>stableSeed(`${type}:${a.id}:${profile.positiveCount}`)-stableSeed(`${type}:${b.id}:${profile.positiveCount}`));
+  const limited=shuffledCheap.slice(0,CANDIDATE_DETAILS_LIMIT);
+  const detailed=(await mapLimit(limited,10,async c=>tmdb(`${type==="series"?"tv":"movie"}/${c.id}`,{language:"en-US",append_to_response:"keywords,external_ids,credits"},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);
+  const final=detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
+  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} discoveryRequests=${pageJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${final.length}`);
+  return final;
 }
+
 async function buildTop50(type, config, profile) {
   if (!profile.positiveCount) return [];
   const filtered = await discoverCandidates(type, config, profile);
@@ -795,7 +813,9 @@ async function buildTop50(type, config, profile) {
   }).filter(x=>x.imdbId);
 
   scored.sort((a,b)=>b.personalScore-a.personalScore);
-  return diversityPick(scored,Math.min(50,config.maxResults));
+  const top = diversityPick(scored,Math.min(30,config.maxResults));
+  console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);
+  return top;
 }
 function serializeAndShuffle(top50, type) {
   const shuffled = top50.slice();
@@ -843,8 +863,8 @@ function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
       if(profileFingerprint(profile)!==fingerprint || !profile.positiveVectors?.length) return;
       const rk=`result:${token}:${type}:${fingerprint}`, meta=cacheGet(resultMetaKey(token,type,fingerprint));
       if(!cacheGet(rk) || meta?.geminiUsed) return;
-      const top50=await buildTop50(type,config,profile);
-      cacheSet(rk,top50,CACHE_TTL_MS);
+      const top30=await buildTop50(type,config,profile);
+      cacheSet(rk,top30,CACHE_TTL_MS);
       cacheSet(resultMetaKey(token,type,fingerprint),{geminiUsed:true},CACHE_TTL_MS);
       console.log(`Gemini upgrade completed for ${type}`);
     }catch(e){console.warn(`Gemini upgrade failed for ${type}: ${e.message}`);}
@@ -854,8 +874,6 @@ async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
   const cached = getCatalogCached(token, type);
   if (cached) {
-    // Never make Stremio wait for Stremio/Gemini/TMDB. Serve the last known good
-    // catalog immediately and refresh it in the background when stale.
     if (cached.stale) scheduleRefresh(token, config, "stale-catalog");
     else {
       const state = stateStore.get(stateKey(token));
@@ -864,14 +882,45 @@ async function discover(type, config, token) {
     return cached.payload;
   }
 
-  // First request after a restart/configuration: kick off the expensive work.
-  // We only wait a tiny bounded interval; heavy work stays in the background.
-  const job = scheduleRefresh(token, config, "cold-start");
-  // Give a freshly warmed catalog a brief chance to become available without
-  // ever making the catalog endpoint wait on external services for seconds.
-  await Promise.race([job.catch(()=>null), new Promise(r=>setTimeout(r, 150))]);
+  // Cold start is type-specific. We do not wait for both movie and series builds,
+  // and we never intentionally return an empty catalog just because the other type
+  // is still warming.
+  let state = stateStore.get(stateKey(token));
+  if (!state || !state.library) {
+    try {
+      const library = await getLibrary(config.stremioAuthKey, { force: true });
+      state = { library, libraryFingerprint: libraryFingerprint(library), updatedAt: Date.now(), generation: 1 };
+      stateStore.set(stateKey(token), state);
+    } catch (e) {
+      console.warn(`Cold-start Stremio sync failed for ${type}: ${e.message}`);
+      // A previously cached catalog would have been returned above. With no state
+      // and no catalog, there is no honest personalized response to fabricate.
+      return { metas: [] };
+    }
+  }
+
+  const lockKey = `cold:${token}:${type}`;
+  if (!REFRESH_LOCK.has(lockKey)) {
+    const job = (async()=> {
+      try { return await buildAndStoreCatalog(type, config, token, state.library); }
+      catch(e) { console.warn(`Cold-start catalog build failed for ${type}: ${e.message}`); return null; }
+    })();
+    REFRESH_LOCK.set(lockKey, job);
+    job.finally(()=>REFRESH_LOCK.delete(lockKey));
+  }
+  const job = REFRESH_LOCK.get(lockKey);
+  if (job) await Promise.race([job.catch(()=>null), new Promise(r=>setTimeout(r, COLD_START_WAIT_MS))]);
+
   const ready = getCatalogCached(token, type);
-  if (ready) return ready.payload;
+  if (ready && ready.payload?.metas?.length) {
+    // Warm the other type separately; never hold the current catalog hostage to it.
+    const other = type === "movie" ? "series" : "movie";
+    if (!getCatalogCached(token, other)) {
+      setImmediate(()=>buildAndStoreCatalog(other, config, token, state.library).catch(e=>console.warn(`Background ${other} build failed: ${e.message}`)));
+    }
+    return ready.payload;
+  }
+  console.warn(`Catalog ${type} still warming after ${COLD_START_WAIT_MS}ms; no empty result cached.`);
   return { metas: [] };
 }
 
@@ -902,7 +951,7 @@ function configFromForm(p) {
   const genres = (p.get("excludeGenres") || "").split(",").map(x => x.trim()).filter(Boolean);
   return {
     ...DEFAULTS,
-    tmdbApiKey: p.get("tmdbApiKey") || "",
+    tmdbAccessToken: p.get("tmdbAccessToken") || "",
     stremioAuthKey: p.get("stremioAuthKey") || "",
     geminiApiKey: p.get("geminiApiKey") || "",
     tmdbMinRating: Math.max(0, Math.min(10, Number(p.get("tmdbMinRating")) || 7)),
@@ -922,12 +971,12 @@ function configFromForm(p) {
 }
 function configurePage() {
   const y = new Date().getFullYear();
-  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>50 films + 50 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="/config/save"><section><h2>Connexions</h2><label>TMDB API key *</label><input name="tmdbApiKey" type="password" required autocomplete="off"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off"><p class="muted">Gemini sert uniquement à mesurer la similarité sémantique des histoires et thèmes. La recommandation reste pilotée par tes 👍/❤️.</p></section><section><h2>Filtres TMDB — filtres uniquement</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="7"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="10"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="1000"></div><div><label>Année min.</label><input name="yearMin" type="number" value="1900"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${y}"></div><div><label>Durée min.</label><input name="runtimeMin" type="number" min="0" value="0"></div><div><label>Durée max.</label><input name="runtimeMax" type="number" min="0" value="0"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="Horror"><p class="muted">La note et le nombre de votes servent d'abord de filtres, puis ont seulement un faible poids (8 % au total) dans le classement final. L'année reste un filtre neutre.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" checked> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" checked> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" checked> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" checked> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" checked> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Le visionnage n'est jamais interprété comme un goût. Les 50 meilleurs candidats sont sélectionnés, puis seulement mélangés pour l'affichage. Un nouveau 👍/❤️ invalide automatiquement le cache.</div><br><button class="btn">Enregistrer et installer</button></form></body></html>`;
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="/config/save"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off"><p class="muted">Gemini sert uniquement à mesurer la similarité sémantique des histoires et thèmes. La recommandation reste pilotée par tes 👍/❤️.</p></section><section><h2>Filtres TMDB — filtres uniquement</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="7"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="10"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="1000"></div><div><label>Année min.</label><input name="yearMin" type="number" value="1900"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${y}"></div><div><label>Durée min.</label><input name="runtimeMin" type="number" min="0" value="0"></div><div><label>Durée max.</label><input name="runtimeMax" type="number" min="0" value="0"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="Horror"><p class="muted">La note et le nombre de votes servent d'abord de filtres, puis ont seulement un faible poids (8 % au total) dans le classement final. L'année reste un filtre neutre.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" checked> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" checked> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" checked> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" checked> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" checked> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Le visionnage n'est jamais interprété comme un goût. Les 30 meilleurs candidats sont sélectionnés, puis seulement mélangés pour l'affichage. Un nouveau 👍/❤️ invalide automatiquement le cache.</div><br><button class="btn">Enregistrer et installer</button></form></body></html>`;
 }
 async function saveConfig(req, res) {
   try {
     const config = configFromForm(new URLSearchParams(await readBody(req)));
-    if (!config.tmdbApiKey) throw new Error("TMDB API key manquante");
+    if (!config.tmdbAccessToken) throw new Error("TMDB Read Access Token manquant");
     if (!config.stremioAuthKey) throw new Error("Stremio AuthKey manquante");
     if (config.tmdbMaxRating < config.tmdbMinRating) throw new Error("La note maximale doit être ≥ à la note minimale");
     const token = packConfig(config);
@@ -935,7 +984,7 @@ async function saveConfig(req, res) {
     const manifestUrl = `${origin}/u/${token}/manifest.json`;
     ACTIVE_CONFIGS.set(token, config);
     res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" });
-    res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration terminée</h1><p>Le moteur prépare déjà tes deux catalogues en arrière-plan.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Installer dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
+    res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration terminée</h1><p>Le moteur prépare déjà tes deux catalogues en arrière-plan. La recherche n’est pas limitée à la popularité TMDB.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Installer dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
     setImmediate(() => prewarmBoth(token, config).catch(e => console.error("Prewarm failed:", e.message)));
   } catch (e) { res.writeHead(400, { "content-type":"text/plain; charset=utf-8" }); res.end(`Erreur de configuration: ${e.message}`); }
 }
@@ -962,10 +1011,10 @@ async function handle(req, res) {
           res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"private, max-age=300, stale-while-revalidate=3600" });
           return res.end(JSON.stringify(result));
         }
-        const find = await tmdb(`find/${encodeURIComponent(id)}`, { external_source:"imdb_id", language:"en-US" }, tokenConfig.tmdbApiKey);
+        const find = await tmdb(`find/${encodeURIComponent(id)}`, { external_source:"imdb_id", language:"en-US" }, tokenConfig.tmdbAccessToken);
         const hit = type === "movie" ? find.movie_results?.[0] : find.tv_results?.[0];
         if (!hit) { res.writeHead(404); return res.end(JSON.stringify({ meta:null })); }
-        const d = await tmdb(`${type === "series" ? "tv" : "movie"}/${hit.id}`, { language:"en-US" }, tokenConfig.tmdbApiKey);
+        const d = await tmdb(`${type === "series" ? "tv" : "movie"}/${hit.id}`, { language:"en-US" }, tokenConfig.tmdbAccessToken);
         res.writeHead(200, { "content-type":"application/json", "cache-control":"public, max-age=3600" });
         return res.end(JSON.stringify({ meta:{ id, type, name:d.title||d.name, poster:d.poster_path?`https://image.tmdb.org/t/p/w500${d.poster_path}`:undefined, background:d.backdrop_path?`https://image.tmdb.org/t/p/w1280${d.backdrop_path}`:undefined, description:d.overview||"", releaseInfo:String(d.release_date||d.first_air_date||"").slice(0,4), imdbRating:d.vote_average!=null?Number(d.vote_average).toFixed(1):undefined, genres:(d.genres||[]).map(g=>g.name), posterShape:"poster" } }));
       } catch (e) { console.error(e); res.writeHead(502, { "content-type":"application/json" }); return res.end(JSON.stringify({ error:"upstream_error" })); }
@@ -983,4 +1032,4 @@ http.createServer((req,res) => handle(req,res).catch(e => {
   console.error(e);
   if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
   res.end(JSON.stringify({ error:"internal_error" }));
-})).listen(PORT, HOST, () => console.log(`Antony addon v0.9.0 listening on ${HOST}:${PORT}`));
+})).listen(PORT, HOST, () => console.log(`Antony addon v1.1.0 listening on ${HOST}:${PORT}`));
