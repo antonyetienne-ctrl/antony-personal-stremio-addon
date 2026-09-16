@@ -30,7 +30,7 @@ const DEFAULTS = {
 
 const MANIFEST = {
   id: "com.antony.personalrecommendations",
-  version: "0.7.1",
+  version: "0.8.0",
   name: "🎯 Antony — Personal Recommendations",
   description: "Recommendations learned from Stremio 👍 and ❤️ only; watched items are used only for exclusion.",
   resources: ["catalog", "meta"],
@@ -52,7 +52,14 @@ const LIBRARY_CACHE_TTL_MS = 60 * 1000;
 const RATING_CACHE_TTL_MS = 60 * 1000;
 const REFRESH_LOCK = new Map();
 const ACTIVE_CONFIGS = new Map();
-const CACHE_MAX_ENTRIES = 80;
+const CACHE_MAX_ENTRIES = 220;
+const CATALOG_FRESH_MS = 12 * 60 * 60 * 1000;
+const CATALOG_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const STATE_REFRESH_MS = 15 * 60 * 1000;
+const STATE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const stateStore = new Map();
+const catalogStore = new Map();
+const refreshJobs = new Map();
 const MAX_POSITIVE_ITEMS = 100;
 const MAX_PROFILE_ITEMS = 60;
 const CANDIDATE_PAGES_PER_STRATEGY = 3;
@@ -100,17 +107,30 @@ function cacheGet(key) {
   return x.value;
 }
 
-async function jsonFetch(url, options = {}, timeoutMs = 20000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const text = await response.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return data;
-  } finally { clearTimeout(timer); }
+async function jsonFetch(url, options = {}, timeoutMs = 12000, attempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      const text = await response.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+      if (response.ok) return data;
+      const retryable = response.status === 429 || response.status >= 500;
+      lastError = new Error(`HTTP ${response.status}`);
+      if (!retryable || attempt === attempts) throw lastError;
+    } catch (e) {
+      lastError = e;
+      const retryable = e?.name === "AbortError" || /fetch failed|ECONN|ETIMEDOUT|HTTP 429|HTTP 5\d\d/i.test(String(e?.message || e));
+      if (!retryable || attempt === attempts) throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise(r => setTimeout(r, 350 * (2 ** (attempt - 1)) + crypto.randomInt(250)));
+  }
+  throw lastError || new Error("HTTP request failed");
 }
 
 async function stremioApi(method, body) {
@@ -156,11 +176,11 @@ function isWatched(item) {
   return false;
 }
 
-async function getLibrary(authKey) {
+async function getLibrary(authKey, { force = false } = {}) {
   if (!authKey) return [];
   const key = `library:${crypto.createHash("sha256").update(authKey).digest("hex").slice(0, 24)}`;
   const cached = cache.get(key);
-  if (cached && Date.now() - cached.time < PROFILE_CACHE_TTL_MS) return cached.value;
+  if (!force && cached && Date.now() - cached.time < STATE_REFRESH_MS) return cached.value;
   const meta = resultOf(await stremioApi("datastoreMeta", { authKey, collection: "libraryItem" }));
   const ids = arrayFrom(meta).map(x => typeof x === "string" ? x : x?._id || x?.id).filter(Boolean);
   let items;
@@ -171,8 +191,125 @@ async function getLibrary(authKey) {
     items = out;
   }
   const deduped = [...new Map(items.map(x => [x?._id || x?.id, x])).values()].filter(Boolean);
-  cacheSet(key, deduped, LIBRARY_CACHE_TTL_MS);
+  cacheSet(key, deduped, STATE_STALE_MS);
   return deduped;
+}
+
+function libraryFingerprint(items) {
+  return crypto.createHash("sha256").update((items || []).map(x => JSON.stringify({
+    id: x?._id || x?.id,
+    state: x?.state,
+    mtime: x?._mtime
+  })).sort().join("|")).digest("hex").slice(0, 24);
+}
+
+function watchedSetFromLibrary(library) {
+  const watched = new Set();
+  for (const item of library || []) {
+    const id = extractImdb(item);
+    if (id && isWatched(item)) {
+      watched.add(id);
+      watched.add(id.toLowerCase());
+    }
+  }
+  return watched;
+}
+
+function stateKey(token) { return `state:${token}`; }
+function catalogKey(token, type) { return `${token}:${type}`; }
+
+function getCatalogCached(token, type) {
+  const x = catalogStore.get(catalogKey(token, type));
+  if (!x) return null;
+  if (Date.now() > x.staleUntil) {
+    catalogStore.delete(catalogKey(token, type));
+    return null;
+  }
+  return { ...x, stale: Date.now() > x.freshUntil };
+}
+
+function putCatalog(token, type, payload, fingerprint, usedGemini) {
+  const now = Date.now();
+  catalogStore.set(catalogKey(token, type), {
+    payload, fingerprint, usedGemini,
+    createdAt: now,
+    freshUntil: now + CATALOG_FRESH_MS,
+    staleUntil: now + CATALOG_STALE_MS
+  });
+}
+
+function scheduleRefresh(token, config, reason = "request") {
+  const key = `refresh:${token}`;
+  if (refreshJobs.has(key)) return refreshJobs.get(key);
+  const job = (async () => {
+    try {
+      await refreshUserStateAndCatalogs(token, config, reason);
+    } catch (e) {
+      console.warn(`Background refresh failed (${reason}): ${e.message}`);
+    } finally {
+      refreshJobs.delete(key);
+    }
+  })();
+  refreshJobs.set(key, job);
+  return job;
+}
+
+async function refreshUserStateAndCatalogs(token, config, reason = "scheduled") {
+  const previous = stateStore.get(stateKey(token));
+  let library;
+  try {
+    library = await getLibrary(config.stremioAuthKey, { force: true });
+  } catch (e) {
+    if (previous?.library) {
+      console.warn(`Stremio unavailable; keeping last known library (${reason}): ${e.message}`);
+      return false;
+    }
+    throw e;
+  }
+
+  const fp = libraryFingerprint(library);
+  const changed = !previous || previous.libraryFingerprint !== fp;
+  const state = {
+    library,
+    libraryFingerprint: fp,
+    updatedAt: Date.now(),
+    generation: (previous?.generation || 0) + 1
+  };
+  stateStore.set(stateKey(token), state);
+
+  // Rebuild periodically even when the library itself is unchanged, because a
+  // 👍/❤️ can change without changing the LibraryItem record.
+  if (changed || !previous || Date.now() - (previous.rebuiltAt || 0) >= STATE_REFRESH_MS) {
+    invalidateTokenResults(token);
+    await Promise.all([buildAndStoreCatalog("movie", config, token, library), buildAndStoreCatalog("series", config, token, library)]);
+    const current = stateStore.get(stateKey(token));
+    if (current) current.rebuiltAt = Date.now();
+  }
+  return true;
+}
+
+function invalidateTokenResults(token) {
+  for (const key of [...cache.keys()]) {
+    if (key.startsWith(`result:${token}:`) || key.startsWith(`resultmeta:${token}:`) || key.startsWith(`profile:`)) {
+      cache.delete(key);
+    }
+  }
+  // Deliberately keep catalogStore: if the next rebuild fails, Stremio still
+  // receives the last known-good catalog instead of an error/empty response.
+}
+
+async function buildAndStoreCatalog(type, config, token, library) {
+  const profile = await buildProfile(config, library, type);
+  const fingerprint = profileFingerprint(profile);
+  const existing = getCatalogCached(token, type);
+  // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
+  if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
+  const top50 = await buildTop50(type, config, profile);
+  const payload = serializeAndShuffle(top50, type);
+  putCatalog(token, type, payload, fingerprint, Boolean(profile.positiveVectors?.length));
+  cacheSet(`result:${token}:${type}:${fingerprint}`, top50, CACHE_TTL_MS);
+  cacheSet(resultMetaKey(token, type, fingerprint), { geminiUsed: Boolean(profile.positiveVectors?.length) }, CACHE_TTL_MS);
+  return payload;
 }
 
 function normalizeRating(x) {
@@ -230,7 +367,7 @@ async function tmdb(endpoint, params, apiKey) {
   const cached = cacheGet(key);
   if (cached) return cached;
   const data = await jsonFetch(u);
-  cacheSet(key, data, endpoint.startsWith("discover/") ? PROFILE_CACHE_TTL_MS : TMDB_DETAIL_CACHE_TTL_MS);
+  cacheSet(key, data, endpoint.startsWith("discover/") ? CATALOG_FRESH_MS : TMDB_DETAIL_CACHE_TTL_MS);
   return data;
 }
 
@@ -607,36 +744,23 @@ function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
 }
 async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
-  const library = await getLibrary(config.stremioAuthKey);
-  // Build a fingerprint from Stremio library state + current ratings before doing any heavy work.
-  const profile = await buildProfile(config, library, type);
-  const fingerprint = profileFingerprint(profile);
-  const key = `result:${token}:${type}:${fingerprint}`;
-  const cached = cacheGet(key);
+  const cached = getCatalogCached(token, type);
   if (cached) {
-    const meta=cacheGet(resultMetaKey(token,type,fingerprint));
-    if(!meta?.geminiUsed) scheduleGeminiUpgrade(type,config,token,library,fingerprint);
-    warmOtherType(type,config,token,library).catch(()=>{});
-    return serializeAndShuffle(cached,type);
+    // Never make Stremio wait for Stremio/Gemini/TMDB. Serve the last known good
+    // catalog immediately and refresh it in the background when stale.
+    if (cached.stale) scheduleRefresh(token, config, "stale-catalog");
+    else {
+      const state = stateStore.get(stateKey(token));
+      if (!state || Date.now() - state.updatedAt > STATE_REFRESH_MS) scheduleRefresh(token, config, "state-refresh");
+    }
+    return cached.payload;
   }
-  const lockKey = `lock:${token}:${type}:${fingerprint}`;
-  if (REFRESH_LOCK.has(lockKey)) {
-    const result = await REFRESH_LOCK.get(lockKey);
-    return serializeAndShuffle(result.top50, type);
-  }
-  const job = (async () => {
-    const top50 = await buildTop50(type, config, profile);
-    cacheSet(key, top50, CACHE_TTL_MS);
-    cacheSet(resultMetaKey(token,type,fingerprint), {geminiUsed:Boolean(profile.positiveVectors?.length)}, CACHE_TTL_MS);
-    return { top50 };
-  })();
-  REFRESH_LOCK.set(lockKey, job);
-  try {
-    const result = await job;
-    return serializeAndShuffle(result.top50, type);
-  } finally {
-    REFRESH_LOCK.delete(lockKey);
-  }
+
+  // First request after a restart/configuration: kick off the expensive work but
+  // return a valid empty catalog immediately. Stremio retries catalog requests;
+  // subsequent requests receive the precomputed catalog once ready.
+  scheduleRefresh(token, config, "cold-start");
+  return { metas: [] };
 }
 
 async function warmOtherType(currentType, config, token, library) {
@@ -659,29 +783,7 @@ async function warmOtherType(currentType, config, token, library) {
 
 async function prewarmBoth(token, config) {
   ACTIVE_CONFIGS.set(token, config);
-  const library = await getLibrary(config.stremioAuthKey);
-  await Promise.all([
-    (async () => {
-      const profile = await buildProfile(config, library, "movie");
-      const fingerprint = profileFingerprint(profile);
-      const key = `result:${token}:movie:${fingerprint}`;
-      if (!cacheGet(key)) {
-        const top50=await buildTop50("movie",config,profile);
-        cacheSet(key,top50,CACHE_TTL_MS);
-        cacheSet(resultMetaKey(token,"movie",fingerprint),{geminiUsed:Boolean(profile.positiveVectors?.length)},CACHE_TTL_MS);
-      }
-    })(),
-    (async () => {
-      const profile = await buildProfile(config, library, "series");
-      const fingerprint = profileFingerprint(profile);
-      const key = `result:${token}:series:${fingerprint}`;
-      if (!cacheGet(key)) {
-        const top50=await buildTop50("series",config,profile);
-        cacheSet(key,top50,CACHE_TTL_MS);
-        cacheSet(resultMetaKey(token,"series",fingerprint),{geminiUsed:Boolean(profile.positiveVectors?.length)},CACHE_TTL_MS);
-      }
-    })()
-  ]);
+  scheduleRefresh(token, config, "configuration");
 }
 
 function configFromForm(p) {
@@ -761,13 +863,12 @@ async function handle(req, res) {
   res.writeHead(200, { "content-type":"text/plain; charset=utf-8" }); res.end("Antony Personal Recommendations — open /configure");
 }
 
-setInterval(async () => {
-  for (const [token, config] of ACTIVE_CONFIGS) {
-    try {
-      const library = await getLibrary(config.stremioAuthKey);
-      await Promise.all(["movie", "series"].map(type => warmOtherType(type === "movie" ? "series" : "movie", config, token, library)));
-    } catch (e) { console.error("Background refresh failed:", e.message); }
-  }
-}, 6 * 60 * 60 * 1000).unref();
+setInterval(() => {
+  for (const [token, config] of ACTIVE_CONFIGS) scheduleRefresh(token, config, "scheduled");
+}, STATE_REFRESH_MS).unref();
 
-http.createServer((req,res) => handle(req,res).catch(e => { console.error(e); if (!res.headersSent) res.writeHead(500); res.end("Internal server error"); })).listen(PORT, HOST, () => console.log(`Antony addon v0.7.1 listening on ${HOST}:${PORT}`));
+http.createServer((req,res) => handle(req,res).catch(e => {
+  console.error(e);
+  if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
+  res.end(JSON.stringify({ error:"internal_error" }));
+})).listen(PORT, HOST, () => console.log(`Antony addon v0.8.0 listening on ${HOST}:${PORT}`));
