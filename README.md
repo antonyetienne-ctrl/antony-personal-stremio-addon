@@ -1,8 +1,8 @@
-# 🎯 Antony — Personal Stremio Recommendations v1.1.0
+# 🎯 Antony — Personal Stremio Recommendations v1.2.0
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 👍/❤️ signals.
 
-## v1.1.0 changes
+## v1.2.0 changes
 
 - TMDB authentication uses the **API Read Access Token** (`Authorization: Bearer ...`), not the legacy API-key query parameter.
 - Candidate discovery no longer uses `popular` and does not use popularity as a final ranking signal.
@@ -11,7 +11,7 @@ Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 
 - The final ranking remains **92% taste + 5% TMDB rating + 3% vote-count reliability**. TMDB rating/vote count are hard filters first.
 - ❤️ has 3× the positive weight of 👍.
 - Watched content is an exclusion only; it is never treated as a positive preference.
-- The final 30 are selected first, diversified softly, then shuffled only for display.
+- The final 30 are selected first and diversified softly. Their display order is configurable: score order or random shuffle.
 - Gemini remains optional. A Gemini 429/timeout/error falls back to the local recommender.
 - Background refresh and last-known-good catalogs remain in place. The 20-second cold-start wait is only a response-time guard; it is **not** a cap on the background recommendation computation.
 
@@ -48,3 +48,12 @@ TMDB's daily ID exports are not used as a runtime dependency: TMDB documents the
 ## Important limitation
 
 A third-party Stremio addon cannot simply request "all of TMDB with every metadata field" in one operation. This version therefore maximizes candidate coverage within reasonable API traffic rather than pretending to exhaustively crawl the entire TMDB database.
+
+
+## v1.2.0 changes
+
+- Configuration lets you choose **best score first** or **random order**.
+- Added configurable kids-content exclusion.
+- Added configurable western-animation exclusion for series while preserving anime.
+- Existing configuration values are preserved when reopening the configuration page.
+- `/configure` redirects to the most recently used personal configuration when the server knows it.

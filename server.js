@@ -25,12 +25,15 @@ const DEFAULTS = {
   useHearts: true,
   excludeCancelledSeries: true,
   allowOngoingSeries: true,
-  maxResults: 30
+  maxResults: 30,
+  displayOrder: "random",
+  excludeKids: true,
+  excludeWesternAnimation: true
 };
 
 const MANIFEST = {
   id: "com.antony.personalrecommendations",
-  version: "1.1.0",
+  version: "1.2.0",
   name: "🎯 Antony — Personal Recommendations",
   description: "Recommendations learned from Stremio 👍 and ❤️ only; watched items are used only for exclusion.",
   resources: ["catalog", "meta"],
@@ -43,6 +46,8 @@ const MANIFEST = {
   behaviorHints: { configurable: true, configurationRequired: false }
 };
 
+let LAST_CONFIG_TOKEN = "";
+const CONFIG_ALIASES = new Map();
 const cache = new Map();
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -318,7 +323,7 @@ async function buildAndStoreCatalog(type, config, token, library) {
   // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
   if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
   const top30 = await buildTop50(type, config, profile);
-  const payload = serializeAndShuffle(top30, type);
+  const payload = serializeAndShuffle(top30, type, config);
   putCatalog(token, type, payload, fingerprint, Boolean(profile.positiveVectors?.length));
   cacheSet(`result:${token}:${type}:${fingerprint}`, top30, CACHE_TTL_MS);
   cacheSet(resultMetaKey(token, type, fingerprint), { geminiUsed: Boolean(profile.positiveVectors?.length) }, CACHE_TTL_MS);
@@ -549,10 +554,36 @@ function cosineProfileSimilarity(candidateVector, vectors) {
   if (!candidateVector || !vectors?.length) return 0;
   return vectors.reduce((best, v) => Math.max(best, Math.max(0, cosine(candidateVector, v))), 0);
 }
+function isAnimeSeries(d) {
+  if (!d) return false;
+  const lang = String(d.original_language || "").toLowerCase();
+  const countries = Array.isArray(d.origin_country) ? d.origin_country.map(x => String(x).toUpperCase()) : [];
+  const kws = (d.keywords?.keywords || []).map(k => cleanText(k.name));
+  return lang === "ja" || countries.includes("JP") || kws.some(k => ["anime", "manga", "japanese animation"].includes(k));
+}
+function isKidsContent(d) {
+  if (!d) return false;
+  const genres = new Set((d.genres || []).map(g => cleanText(g.name)));
+  const kws = (d.keywords?.keywords || []).map(k => cleanText(k.name));
+  const kidsWords = new Set(["kids", "kid", "children", "child", "children's", "preschool", "preschoolers", "toddler", "educational", "nursery", "elementary school", "for children"]);
+  const explicitKidsKeyword = kws.some(k => kidsWords.has(k));
+  const family = genres.has("family");
+  const animation = genres.has("animation");
+  return explicitKidsKeyword || (family && animation);
+}
+function isWesternAnimationSeries(d) {
+  if (!d || !(d.genres || []).some(g => cleanText(g.name) === "animation")) return false;
+  if (isAnimeSeries(d)) return false;
+  const countries = Array.isArray(d.origin_country) ? d.origin_country.map(x => String(x).toUpperCase()) : [];
+  const western = new Set(["US", "CA", "GB", "AU", "NZ", "IE", "FR", "DE", "ES", "IT", "BE", "NL"]);
+  return countries.length === 0 || countries.some(c => western.has(c));
+}
 function hardFilter(d, type, config, watched, excludedGenres) {
   const imdb = d.external_ids?.imdb_id || d.imdb_id;
   if (!imdb) return null;
   if (config.useWatchedExclusion && (watched.has(imdb) || watched.has(String(imdb).toLowerCase()))) return null;
+  if (config.excludeKids && isKidsContent(d)) return null;
+  if (type === "series" && config.excludeWesternAnimation && isWesternAnimationSeries(d)) return null;
   const rating = Number(d.vote_average);
   const votes = Number(d.vote_count);
   // TMDB rating and vote count are filters only. They never enter the recommendation score.
@@ -817,13 +848,15 @@ async function buildTop50(type, config, profile) {
   console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);
   return top;
 }
-function serializeAndShuffle(top50, type) {
-  const shuffled = top50.slice();
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+function serializeAndShuffle(top50, type, config = DEFAULTS) {
+  const ordered = top50.slice();
+  if (config.displayOrder === "random") {
+    for (let i = ordered.length - 1; i > 0; i--) {
+      const j = crypto.randomInt(i + 1);
+      [ordered[i], ordered[j]] = [ordered[j], ordered[i]];
+    }
   }
-  return { metas: shuffled.map(({ details, imdbId }) => ({
+  return { metas: ordered.map(({ details, imdbId }) => ({
     id: imdbId, type, name: details.title || details.name,
     poster: details.poster_path ? `https://image.tmdb.org/t/p/w500${details.poster_path}` : undefined,
     background: details.backdrop_path ? `https://image.tmdb.org/t/p/w1280${details.backdrop_path}` : undefined,
@@ -947,49 +980,80 @@ async function prewarmBoth(token, config) {
   scheduleRefresh(token, config, "configuration");
 }
 
-function configFromForm(p) {
+function configFromForm(p, base = DEFAULTS) {
   const genres = (p.get("excludeGenres") || "").split(",").map(x => x.trim()).filter(Boolean);
+  const keep = (name, fallback) => {
+    const v = p.get(name);
+    return v === null || v === "" ? fallback : v;
+  };
   return {
     ...DEFAULTS,
-    tmdbAccessToken: p.get("tmdbAccessToken") || "",
-    stremioAuthKey: p.get("stremioAuthKey") || "",
-    geminiApiKey: p.get("geminiApiKey") || "",
-    tmdbMinRating: Math.max(0, Math.min(10, Number(p.get("tmdbMinRating")) || 7)),
-    tmdbMaxRating: Math.max(0, Math.min(10, Number(p.get("tmdbMaxRating")) || 10)),
-    tmdbMinVotes: Math.max(0, Number(p.get("tmdbMinVotes")) || 1000),
-    yearMin: Math.max(1900, Number(p.get("yearMin")) || 1900),
-    yearMax: Math.min(2100, Number(p.get("yearMax")) || new Date().getFullYear()),
-    runtimeMin: Math.max(0, Number(p.get("runtimeMin")) || 0),
-    runtimeMax: Math.max(0, Number(p.get("runtimeMax")) || 0),
-    excludeGenres: genres,
+    ...base,
+    tmdbAccessToken: keep("tmdbAccessToken", base.tmdbAccessToken || ""),
+    stremioAuthKey: keep("stremioAuthKey", base.stremioAuthKey || ""),
+    geminiApiKey: keep("geminiApiKey", base.geminiApiKey || ""),
+    tmdbMinRating: Math.max(0, Math.min(10, Number(keep("tmdbMinRating", base.tmdbMinRating)) || 7)),
+    tmdbMaxRating: Math.max(0, Math.min(10, Number(keep("tmdbMaxRating", base.tmdbMaxRating)) || 10)),
+    tmdbMinVotes: Math.max(0, Number(keep("tmdbMinVotes", base.tmdbMinVotes)) || 1000),
+    yearMin: Math.max(1900, Number(keep("yearMin", base.yearMin)) || 1900),
+    yearMax: Math.min(2100, Number(keep("yearMax", base.yearMax)) || new Date().getFullYear()),
+    runtimeMin: Math.max(0, Number(keep("runtimeMin", base.runtimeMin)) || 0),
+    runtimeMax: Math.max(0, Number(keep("runtimeMax", base.runtimeMax)) || 0),
+    excludeGenres: p.has("excludeGenres") ? genres : (base.excludeGenres || []),
     useWatchedExclusion: p.has("useWatchedExclusion"),
     useLikes: p.has("useLikes"),
     useHearts: p.has("useHearts"),
     excludeCancelledSeries: p.has("excludeCancelledSeries"),
-    allowOngoingSeries: p.has("allowOngoingSeries")
+    allowOngoingSeries: p.has("allowOngoingSeries"),
+    displayOrder: p.get("displayOrder") === "score" ? "score" : (p.get("displayOrder") === "random" ? "random" : (base.displayOrder || DEFAULTS.displayOrder)),
+    excludeKids: p.has("excludeKids"),
+    excludeWesternAnimation: p.has("excludeWesternAnimation")
   };
 }
-function configurePage() {
-  const y = new Date().getFullYear();
-  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="/config/save"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off"><p class="muted">Gemini sert uniquement à mesurer la similarité sémantique des histoires et thèmes. La recommandation reste pilotée par tes 👍/❤️.</p></section><section><h2>Filtres TMDB — filtres uniquement</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="7"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="10"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="1000"></div><div><label>Année min.</label><input name="yearMin" type="number" value="1900"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${y}"></div><div><label>Durée min.</label><input name="runtimeMin" type="number" min="0" value="0"></div><div><label>Durée max.</label><input name="runtimeMax" type="number" min="0" value="0"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="Horror"><p class="muted">La note et le nombre de votes servent d'abord de filtres, puis ont seulement un faible poids (8 % au total) dans le classement final. L'année reste un filtre neutre.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" checked> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" checked> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" checked> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" checked> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" checked> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Le visionnage n'est jamais interprété comme un goût. Les 30 meilleurs candidats sont sélectionnés, puis seulement mélangés pour l'affichage. Un nouveau 👍/❤️ invalide automatiquement le cache.</div><br><button class="btn">Enregistrer et installer</button></form></body></html>`;
+
+function masked(v) {
+  if (!v) return "";
+  const s = String(v);
+  return s.length <= 8 ? "••••••••" : `${"•".repeat(Math.min(12, s.length - 4))}${s.slice(-4)}`;
 }
-async function saveConfig(req, res) {
+function configurePage(config = DEFAULTS, action = "/config/save") {
+  const y = new Date().getFullYear();
+  const escAttr = v => esc(v).replace(/`/g, "&#96;");
+  const checked = k => config[k] ? "checked" : "";
+  const selected = k => config.displayOrder === k ? "selected" : "";
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Durée min.</label><input name="runtimeMin" type="number" min="0" value="${config.runtimeMin}"></div><div><label>Durée max.</label><input name="runtimeMax" type="number" min="0" value="${config.runtimeMax}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement.</p></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Le visionnage n'est jamais interprété comme un goût.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
+}
+
+async function saveConfig(req, res, previousToken = "") {
   try {
-    const config = configFromForm(new URLSearchParams(await readBody(req)));
+    const previous = previousToken ? unpackConfig(previousToken) : null;
+    const config = configFromForm(new URLSearchParams(await readBody(req)), previous || DEFAULTS);
     if (!config.tmdbAccessToken) throw new Error("TMDB Read Access Token manquant");
     if (!config.stremioAuthKey) throw new Error("Stremio AuthKey manquante");
     if (config.tmdbMaxRating < config.tmdbMinRating) throw new Error("La note maximale doit être ≥ à la note minimale");
     const token = packConfig(config);
+    if (previousToken && previousToken !== token) CONFIG_ALIASES.set(previousToken, token);
+    LAST_CONFIG_TOKEN = token;
     const origin = `${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}`;
     const manifestUrl = `${origin}/u/${token}/manifest.json`;
     ACTIVE_CONFIGS.set(token, config);
     res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" });
-    res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration terminée</h1><p>Le moteur prépare déjà tes deux catalogues en arrière-plan. La recherche n’est pas limitée à la popularité TMDB.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Installer dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
+    res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration enregistrée</h1><p>Le moteur prépare tes deux catalogues en arrière-plan.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Mettre à jour dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
     setImmediate(() => prewarmBoth(token, config).catch(e => console.error("Prewarm failed:", e.message)));
   } catch (e) { res.writeHead(400, { "content-type":"text/plain; charset=utf-8" }); res.end(`Erreur de configuration: ${e.message}`); }
 }
 function readBody(req) { return new Promise((resolve, reject) => { let data = "", size = 0; req.on("data", c => { size += c.length; if (size > 200000) { reject(new Error("Formulaire trop volumineux")); req.destroy(); } else data += c; }); req.on("end", () => resolve(data)); req.on("error", reject); }); }
-function tokenFromPath(pathname) { const m = pathname.match(/^\/u\/([^/]+)(?:\/|$)/); return m ? unpackConfig(m[1]) : null; }
+function tokenFromPath(pathname) {
+  const m = pathname.match(/^\/u\/([^/]+)(?:\/|$)/);
+  if (!m) return null;
+  const raw = m[1];
+  const resolved = CONFIG_ALIASES.get(raw) || raw;
+  return unpackConfig(resolved);
+}
+function resolvedPathToken(pathname) {
+  const m = pathname.match(/^\/u\/([^/]+)(?:\/|$)/);
+  return m ? (CONFIG_ALIASES.get(m[1]) || m[1]) : "";
+}
 
 async function handle(req, res) {
   const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -997,10 +1061,21 @@ async function handle(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
   if (u.pathname === "/health") { res.writeHead(200, { "content-type":"text/plain", "cache-control":"no-store" }); return res.end("ok"); }
-  if (u.pathname === "/configure" && req.method === "GET") { res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" }); return res.end(configurePage()); }
+  if (u.pathname === "/configure" && req.method === "GET") {
+    if (LAST_CONFIG_TOKEN && unpackConfig(LAST_CONFIG_TOKEN)) { res.writeHead(302, { "location": `/u/${LAST_CONFIG_TOKEN}/configure`, "cache-control":"no-store" }); return res.end(); }
+    res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" }); return res.end(configurePage());
+  }
   if (u.pathname === "/config/save" && req.method === "POST") return saveConfig(req, res);
   const tokenConfig = tokenFromPath(u.pathname);
-  if (tokenConfig && u.pathname.endsWith("/manifest.json")) { res.writeHead(200, { "content-type":"application/json", "cache-control":"no-store" }); return res.end(JSON.stringify(MANIFEST)); }
+  const pathTokenMatch = u.pathname.match(/^\/u\/([^/]+)/);
+  const pathToken = pathTokenMatch?.[1] || "";
+  const effectiveToken = resolvedPathToken(u.pathname);
+  if (tokenConfig && u.pathname.endsWith("/manifest.json")) { LAST_CONFIG_TOKEN = effectiveToken; ACTIVE_CONFIGS.set(effectiveToken, tokenConfig); res.writeHead(200, { "content-type":"application/json", "cache-control":"no-store" }); return res.end(JSON.stringify(MANIFEST)); }
+  if (tokenConfig && u.pathname === `/u/${pathToken}/configure` && req.method === "GET") { LAST_CONFIG_TOKEN = effectiveToken; res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" }); return res.end(configurePage(tokenConfig, `/u/${effectiveToken}/config/save`)); }
+  if (tokenConfig && u.pathname === `/u/${pathToken}/config/save` && req.method === "POST") {
+    const result = await saveConfig(req, res, effectiveToken);
+    return result;
+  }
   if (tokenConfig) {
     const m = u.pathname.match(/^\/u\/[^/]+\/(catalog|meta)\/(movie|series)\/([^/]+?)(?:\/[^/]+)?(?:\.json)?$/);
     if (m) {
@@ -1032,4 +1107,4 @@ http.createServer((req,res) => handle(req,res).catch(e => {
   console.error(e);
   if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
   res.end(JSON.stringify({ error:"internal_error" }));
-})).listen(PORT, HOST, () => console.log(`Antony addon v1.1.0 listening on ${HOST}:${PORT}`));
+})).listen(PORT, HOST, () => console.log(`Antony addon v1.2.0 listening on ${HOST}:${PORT}`));

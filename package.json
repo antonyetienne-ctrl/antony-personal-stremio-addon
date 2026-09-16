@@ -1,6 +1,6 @@
 {
   "name": "antony-personal-stremio-addon",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Personal Stremio recommendations learned from Stremio likes/loves with TMDB Read Access Token authentication.",
   "main": "server.js",
