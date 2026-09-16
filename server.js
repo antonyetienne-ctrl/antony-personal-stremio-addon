@@ -4,7 +4,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "1.5.0";
+const ALGO_VERSION = "2.0.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -71,7 +71,7 @@ const CANDIDATE_PAGES_PER_STRATEGY = 3;
 const CANDIDATE_DISCOVERY_STRATEGIES = 28;
 const CANDIDATE_DETAILS_LIMIT = 850;
 const WATCHED_NEGATIVE_LIMIT = 180;
-const WATCHED_NEGATIVE_MAX_PENALTY = 0.14;
+const WATCHED_NEGATIVE_MAX_PENALTY = 0.24;
 const EMBEDDING_BATCH = 50;
 const COLD_START_WAIT_MS = 20000;
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
@@ -409,22 +409,61 @@ function textOf(d) {
   return [d.title || d.name || "", d.overview || "", genres, keywords, collection, countries, creators].join(" ");
 }
 
-function featureMap(d) {
+function deepFeatureMap(d) {
   const m = new Map();
-  for (const g of d.genres || []) addWeighted(m, `genre:${cleanText(g.name)}`, 1.0);
-  for (const k of d.keywords?.keywords || []) addWeighted(m, `kw:${cleanText(k.name)}`, 1.0);
-  if (d.belongs_to_collection?.id) addWeighted(m, `collection:${d.belongs_to_collection.id}`, 0.9);
-  for (const c of d.production_countries || []) addWeighted(m, `country:${cleanText(c.name)}`, 0.12);
-  if (d.original_language) addWeighted(m, `language:${cleanText(d.original_language)}`, 0.08);
+  const add = (k,w=1) => addWeighted(m, k, w);
+  const genres = (d.genres || []).map(x => cleanText(x.name)).filter(Boolean);
+  const keywords = (d.keywords?.keywords || []).map(x => cleanText(x.name)).filter(Boolean);
+  for (const g of genres) add(`genre:${g}`, 1.0);
+  for (const k of keywords) add(`kw:${k}`, 0.95);
+  if (d.belongs_to_collection?.id) add(`collection:${d.belongs_to_collection.id}`, 0.75);
+  for (const c of d.production_countries || []) add(`country:${cleanText(c.name)}`, 0.10);
+  if (d.original_language) add(`language:${cleanText(d.original_language)}`, 0.06);
   const runtime = Number(d.runtime || d.episode_run_time?.[0] || 0);
-  if (runtime) addWeighted(m, `runtime:${Math.round(runtime / 20) * 20}`, 0.06);
-  for (const x of (d.credits?.crew || [])) {
-    if (x.job === "Director" || x.job === "Creator") addWeighted(m, `director:${cleanText(x.name)}`, 0.08);
+  if (runtime) add(`runtime:${Math.round(runtime / 20) * 20}`, 0.04);
+  for (const x of (d.credits?.crew || [])) if (x.job === 'Director' || x.job === 'Creator') add(`director:${cleanText(x.name)}`, 0.06);
+  for (const x of (d.credits?.cast || []).slice(0,8)) add(`actor:${cleanText(x.name)}`, 0.025);
+
+  const text = cleanText([d.title || d.name || '', d.overview || '', ...keywords].join(' '));
+  const toks = tokens(text);
+  for (const t of toks) add(`word:${t}`, 0.10);
+  for (let i=0;i<toks.length-1;i++) add(`bigram:${toks[i]}_${toks[i+1]}`, 0.055);
+
+  // Generic narrative/theme dimensions. These are not user preferences: they
+  // are a vocabulary used to discover latent patterns in the user's feedback.
+  const dimensions = {
+    exploration: ['explore','exploration','discover','discovery','journey','expedition','unknown','world'],
+    survival: ['survival','survive','stranded','escape','wilderness','disaster','apocalypse','post-apocalyptic'],
+    mystery: ['mystery','mysterious','investigation','detective','secret','conspiracy','puzzle','enigma'],
+    revenge: ['revenge','vengeance','aveng','retaliation'],
+    rise: ['rise','ambition','power','king','queen','emperor','empire','reign','ascend'],
+    transformation: ['transform','identity','redemption','coming-of-age','awakening','origin'],
+    war: ['war','battle','army','soldier','military','invasion','conflict','revolt','rebellion'],
+    quest: ['quest','mission','hunt','search','journey','pursuit','objective'],
+    investigation: ['investigation','detective','case','crime','murder','police','lawyer','trial'],
+    power_struggle: ['power','political','politics','throne','rival','rivalry','succession','regime'],
+    worldbuilding: ['world','kingdom','empire','civilization','planet','galaxy','universe','colony','society'],
+    psychological: ['psychological','mind','memory','trauma','obsession','paranoia','dream','reality'],
+    friendship: ['friendship','friend','companions','brotherhood','family'],
+    romance: ['romance','romantic','love','relationship','marriage','couple'],
+    humor: ['comedy','comedic','funny','humor','humour','hilarious'],
+    dark_tone: ['dark','grim','brutal','violent','bleak','tragic','disturbing'],
+    heroic: ['hero','heroic','superhero','superpower','vigilante'],
+    science: ['science','scientist','technology','future','space','time travel','artificial intelligence','robot'],
+    fantasy: ['magic','fantasy','wizard','dragon','myth','mythology','supernatural'],
+    historical: ['historical','history','medieval','ancient','century','kingdom','dynasty'],
+    family_friendly: ['family','children','kid','kids','school','teen','teenager']
+  };
+  for (const [dim, words] of Object.entries(dimensions)) {
+    let hits=0;
+    for (const w of words) {
+      if (text.includes(w)) hits++;
+    }
+    if (hits) add(`dim:${dim}`, Math.min(1.5, 0.30 + 0.12 * hits));
   }
-  for (const x of (d.credits?.cast || []).slice(0, 8)) addWeighted(m, `actor:${cleanText(x.name)}`, 0.04);
-  for (const t of tokens(d.overview || "")) addWeighted(m, `word:${t}`, 0.20);
   return m;
 }
+function featureMap(d) { return deepFeatureMap(d); }
 
 function cosine(a, b) {
   if (!a || !b || a.length !== b.length) return 0;
@@ -487,40 +526,61 @@ async function cachedEmbeddings(apiKey, texts, namespace) {
   return result.every(Boolean) ? result : null;
 }
 
-function learnedFeatureProfile(details) {
+function buildPreferenceModel(positives, negatives) {
+  const posDf = new Map(), negDf = new Map();
+  const posTotal = positives.length || 1, negTotal = negatives.length || 1;
+  for (const item of positives) for (const f of new Set(featureMap(item.details).keys())) posDf.set(f,(posDf.get(f)||0)+1);
+  for (const item of negatives) for (const f of new Set(featureMap(item.details).keys())) negDf.set(f,(negDf.get(f)||0)+1);
   const weights = new Map();
-  const docFreq = new Map();
-  const totalDocs = details.length || 1;
-  for (const item of details) {
-    const seen = new Set(featureMap(item.details).keys());
-    for (const f of seen) docFreq.set(f, (docFreq.get(f) || 0) + 1);
+  const all = new Set([...posDf.keys(),...negDf.keys()]);
+  for (const f of all) {
+    const p=(posDf.get(f)||0)/posTotal, n=(negDf.get(f)||0)/negTotal;
+    const evidence=Math.log((p+0.035)/(n+0.035));
+    const support=Math.min(1, Math.log1p((posDf.get(f)||0)) / Math.log1p(5));
+    const posIntensity=(posDf.get(f)||0) + 2*(posDf.get(f)||0 && 0);
+    const scale = Math.min(2.2, Math.max(-2.2, evidence)) * (0.45 + 0.55*support);
+    if (Math.abs(scale) >= 0.035) weights.set(f, scale);
   }
-  let total = 0;
-  for (const item of details) {
-    const w = item.rating === "heart" ? 3 : 1;
-    for (const [f, v] of featureMap(item.details)) {
-      // Distinctive features matter more than generic ones shared by nearly
-      // every liked title (e.g. Drama, Action, Science Fiction).
-      const df = docFreq.get(f) || 1;
-      const idf = 1 + Math.log((totalDocs + 1) / (df + 1));
-      const contribution = w * Math.min(v, 1) * idf;
-      addWeighted(weights, f, contribution);
-      total += contribution;
+  // Learn pairwise interactions among the most discriminative features. This
+  // is the layer that captures "I like A when it is combined with B" rather
+  // than treating every genre/theme independently.
+  const topPositive = [...weights.entries()].filter(x=>x[1]>0.12).sort((a,b)=>b[1]-a[1]).slice(0,28).map(x=>x[0]);
+  const pairWeights = new Map();
+  const pairStats = (items, map) => {
+    for (const item of items) {
+      const fs=new Set(featureMap(item.details).keys());
+      const present=topPositive.filter(f=>fs.has(f));
+      for(let i=0;i<present.length;i++) for(let j=i+1;j<present.length;j++) {
+        const key=[present[i],present[j]].sort().join('||');
+        map.set(key,(map.get(key)||0)+1);
+      }
     }
+  };
+  const pp=new Map(), nn=new Map(); pairStats(positives,pp); pairStats(negatives,nn);
+  for(const [key,c] of pp){
+    const nc=nn.get(key)||0;
+    const p=c/posTotal, n=nc/negTotal;
+    const lift=Math.log((p+0.02)/(n+0.02));
+    if(lift>0.12 && c>=2) pairWeights.set(key, Math.min(1.8,lift)*Math.min(1,Math.log1p(c)/Math.log1p(5)));
   }
-  if (!total) return weights;
-  for (const [f, v] of weights) weights.set(f, v / total);
-  return weights;
+  return { weights, pairWeights, positiveCount:positives.length, negativeCount:negatives.length };
 }
-
-function featureSimilarity(candidate, profile) {
-  if (!profile.size) return 0;
-  let matched = 0, possible = 0;
-  for (const [f, v] of featureMap(candidate)) {
-    possible += Math.min(v, 1);
-    matched += Math.min(v, 1) * (profile.get(f) || 0);
+function preferenceFeatureScore(candidate, model) {
+  if(!model?.weights?.size) return 0;
+  const fs=new Set(featureMap(candidate).keys());
+  let pos=0, neg=0, abs=0;
+  for(const [f,w] of model.weights){ if(fs.has(f)){ if(w>0) pos+=w; else neg+=-w; abs+=Math.abs(w); } }
+  let pair=0;
+  for(const [key,w] of model.pairWeights || []){
+    const [a,b]=key.split('||'); if(fs.has(a)&&fs.has(b)) pair+=w;
   }
-  return possible ? matched / Math.max(0.0001, possible) : 0;
+  const base=abs ? (pos-neg)/abs : 0;
+  return Math.max(-1,Math.min(1,0.72*base + 0.28*Math.tanh(pair)));
+}
+function featureSimilarity(candidate, profile) {
+  if (!profile) return 0;
+  const x=preferenceFeatureScore(candidate, profile);
+  return (x+1)/2;
 }
 
 function lexicalSimilarity(candidate, positives) {
@@ -639,8 +699,11 @@ function diversityPick(scored, target) {
       let redundancy = 0;
       for (const s of selected) {
         const sem = c.semantic && s.semantic ? cosine(c.semantic, s.semantic) : 0;
-        const feat = featureSimilarity(c.details, featureMap(s.details));
-        redundancy = Math.max(redundancy, 0.65 * Math.max(0, sem) + 0.35 * Math.max(0, feat));
+        const a=new Set(featureMap(c.details).keys());
+        const b=new Set(featureMap(s.details).keys());
+        let inter=0; for(const f of a) if(b.has(f)) inter++;
+        const feat = (a.size+b.size-inter) ? inter/(a.size+b.size-inter) : 0;
+        redundancy = Math.max(redundancy, 0.65 * Math.max(0, sem) + 0.35 * feat);
       }
       // Soft diversification only. It cannot overturn a very strong personal match indefinitely.
       const value = c.personalScore - 0.18 * redundancy;
@@ -806,15 +869,16 @@ async function buildProfile(config, libraryItems, type) {
     return { details:full, rating:"watched_unrated", id:p.id };
   })).filter(Boolean);
 
-  const featureProfile = learnedFeatureProfile(details);
-  const negativeFeatureProfile = watchedNegativeFeatureProfile(negativeDetails);
+  const preferenceModel = buildPreferenceModel(details, negativeDetails);
+  const featureProfile = preferenceModel;
+  const negativeFeatureProfile = preferenceModel;
   let positiveVectors = null;
   let negativeVectors = null;
   if (geminiAvailable(config.geminiApiKey) && details.length) positiveVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x=>textOf(x.details)), "positive");
   if (geminiAvailable(config.geminiApiKey) && negativeDetails.length) negativeVectors = await cachedEmbeddings(config.geminiApiKey, negativeDetails.map(x=>textOf(x.details)), "negative");
   const clusters = buildTasteClusters(positiveVectors, details);
   const seeds = chooseDiversePositiveSeeds(details, Math.min(40, details.length));
-  const profile = { watched, positives:details, watchedUnrated:negativeDetails, featureProfile, negativeFeatureProfile, positiveVectors, negativeVectors, clusters, seeds, positiveCount:positives.length };
+  const profile = { watched, positives:details, watchedUnrated:negativeDetails, featureProfile, negativeFeatureProfile, preferenceModel, positiveVectors, negativeVectors, clusters, seeds, positiveCount:positives.length };
   console.log(`Profile ${type}: library=${relevant.length} positive=${positives.length} watchedUnrated=${negativeDetails.length} watched=${watched.size} gemini=${Boolean(positiveVectors?.length)}`);
   cacheSet(profileKey, profile, PROFILE_CACHE_TTL_MS);
   return profile;
@@ -881,13 +945,13 @@ async function discoverCandidates(type, config, profile) {
     for (const g of x.details.genres || []) genreCounts.set(g.id,(genreCounts.get(g.id)||0)+w);
     for (const k of x.details.keywords?.keywords || []) keywordCounts.set(k.id,(keywordCounts.get(k.id)||0)+w);
   }
-  const genres=[...genreCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10).map(x=>x[0]);
-  const keywords=[...keywordCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,18).map(x=>x[0]);
+  const genres=[...genreCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,12).map(x=>x[0]);
+  const keywords=[...keywordCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,24).map(x=>x[0]);
 
   const strategies=[];
   for (const g of genres) strategies.push({ with_genres:String(g), label:`g:${g}` });
   for (const k of keywords) strategies.push({ with_keywords:String(k), label:`k:${k}` });
-  for (const g of genres.slice(0,6)) for (const k of keywords.slice(0,5)) {
+  for (const g of genres.slice(0,8)) for (const k of keywords.slice(0,8)) {
     strategies.push({ with_genres:String(g), with_keywords:String(k), label:`gk:${g}:${k}` });
   }
 
@@ -950,21 +1014,22 @@ async function buildTop50(type, config, profile) {
   const scored=filtered.map((d,i)=>{
     const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;
     const feat=featureSimilarity(d,profile.featureProfile);
+    const discriminative=preferenceFeatureScore(d,profile.preferenceModel);
     const lex=lexicalSimilarity(d,profile.positives);
     const clusterFeature = profile.clusters?.length && candidateVectors?.[i]
       ? Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)) : 0;
     // The taste score is intentionally multi-signal. Gemini semantic similarity
     // is only one component; structured TMDB patterns remain significant.
     const positiveTaste=profile.positiveVectors?.length&&candidateVectors?.[i]
-      ? 0.58*sem + 0.22*feat + 0.10*clusterFeature + 0.10*lex
-      : 0.72*feat + 0.18*lex + 0.10*clusterFeature;
+      ? 0.50*sem + 0.18*feat + 0.16*Math.max(0,discriminative) + 0.08*clusterFeature + 0.08*lex
+      : 0.62*feat + 0.22*Math.max(0,discriminative) + 0.10*lex + 0.06*clusterFeature;
     const negativeSemantic = candidateVectors?.[i] ? watchedNegativeSimilarity(candidateVectors[i], profile.negativeVectors) : 0;
-    const negativeFeature = featureSimilarity(d, profile.negativeFeatureProfile);
+    const negativeFeature = Math.max(0, -discriminative);
     // Watched-without-rating is deliberately weak evidence: it can mean "I
     // forgot to rate it". It can only gently push a candidate down, never act
     // as a hard exclusion and never outweigh an explicit ❤️/👍 pattern.
     const negativeStrength = Math.min(1, Math.log1p(profile.watchedUnrated?.length || 0) / Math.log1p(30));
-    const watchedPenalty = WATCHED_NEGATIVE_MAX_PENALTY * negativeStrength * (0.70 * negativeSemantic + 0.30 * negativeFeature);
+    const watchedPenalty = WATCHED_NEGATIVE_MAX_PENALTY * negativeStrength * (0.55 * negativeSemantic + 0.45 * negativeFeature);
     // Reward convergence: a candidate supported independently by semantics,
     // learned features and a taste cluster is more trustworthy than one that
     // matches only a single broad genre.
