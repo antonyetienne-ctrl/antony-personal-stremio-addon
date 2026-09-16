@@ -1,18 +1,26 @@
-# 🎯 Antony Personal Stremio Recommendations v0.6.0
+# 🎯 Antony — Personal Stremio Recommendations v0.7.0
 
-Personal Stremio add-on with separate movie and series catalogs.
+Personal movie and series catalogs for Stremio.
 
-## Recommendation model
-- ❤️ is weighted 3× 👍.
-- Only Stremio 👍/❤️ teach the preference model.
-- Watched items are exclusion-only; watching never means liking.
-- TMDB rating and vote count are hard filters first, then weak ranking signals (8% combined).
-- TMDB popularity/release date do not drive the ranking.
-- Gemini embeddings provide semantic story/theme similarity when configured.
-- Structured signals include genres, keywords, collections, narrative text, with actors/directors kept low-weight.
-- Soft diversification is applied before selecting the final 50.
-- Exactly the selected top 50 are then shuffled for display.
-- A profile fingerprint invalidates the cache when likes/hearts or watched exclusions change.
+## Recommendation logic
+- ❤️ Loved = 3× 👍 Liked
+- Only actual 👍/❤️ feedback teaches taste
+- Watched content is exclusion-only
+- 92% personal taste, 5% TMDB rating, 3% vote-count reliability
+- TMDB rating/vote count, year, runtime and excluded genres remain hard filters
+- Exactly the best 50 candidates are selected, then shuffled for display
 
-## Deployment
-Deploy the five files to Render as a Docker service. Open `/configure`, enter TMDB and Stremio credentials, optionally Gemini, then install the generated Stremio manifest.
+## v0.7 performance and watch-state fixes
+- Long-lived in-memory caches for Stremio library, ratings, TMDB metadata and embeddings
+- Background warming of the other catalog after a cached request
+- Parallel TMDB discovery pages and detail requests
+- Cheap TMDB filters before expensive detail/embedding work
+- Robust Stremio watched detection using `timesWatched`, `flaggedWatched` and series watched state
+- Final hard exclusion of watched IMDb IDs immediately before recommendation selection
+
+## Files
+- `Dockerfile`
+- `package.json`
+- `README.md`
+- `render.yaml`
+- `server.js`

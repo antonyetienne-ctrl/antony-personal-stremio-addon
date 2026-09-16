@@ -30,7 +30,7 @@ const DEFAULTS = {
 
 const MANIFEST = {
   id: "com.antony.personalrecommendations",
-  version: "0.6.0",
+  version: "0.7.0",
   name: "🎯 Antony — Personal Recommendations",
   description: "Recommendations learned from Stremio 👍 and ❤️ only; watched items are used only for exclusion.",
   resources: ["catalog", "meta"],
@@ -44,11 +44,19 @@ const MANIFEST = {
 };
 
 const cache = new Map();
-const CACHE_TTL_MS = 2 * 60 * 1000;
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+const TMDB_DETAIL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const EMBEDDING_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const LIBRARY_CACHE_TTL_MS = 30 * 1000;
+const RATING_CACHE_TTL_MS = 60 * 1000;
+const REFRESH_LOCK = new Map();
+const ACTIVE_CONFIGS = new Map();
+const CACHE_MAX_ENTRIES = 80;
 const MAX_POSITIVE_ITEMS = 100;
 const MAX_PROFILE_ITEMS = 60;
-const CANDIDATE_PAGES_PER_STRATEGY = 5;
-const CANDIDATE_DETAILS_LIMIT = 400;
+const CANDIDATE_PAGES_PER_STRATEGY = 3;
+const CANDIDATE_DETAILS_LIMIT = 160;
 const EMBEDDING_BATCH = 80;
 
 function esc(s) {
@@ -71,6 +79,17 @@ function unpackConfig(token) {
     decipher.setAuthTag(raw.subarray(12, 28));
     return { ...DEFAULTS, ...JSON.parse(Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString("utf8")) };
   } catch { return null; }
+}
+
+function cacheSet(key, value, ttlMs = CACHE_TTL_MS) {
+  cache.set(key, { time: Date.now(), expires: Date.now() + ttlMs, value });
+  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
+}
+function cacheGet(key) {
+  const x = cache.get(key);
+  if (!x) return null;
+  if (x.expires && Date.now() > x.expires) { cache.delete(key); return null; }
+  return x.value;
 }
 
 async function jsonFetch(url, options = {}, timeoutMs = 20000) {
@@ -119,23 +138,33 @@ function itemType(item) {
 }
 function isWatched(item) {
   const s = item?.state || {};
-  if (s.watched === true || s.flaggedWatched === 1 || s.isWatched === true) return true;
-  if (typeof s.watched === "number") return s.watched > 0;
-  if (typeof s.timeWatched === "number" && typeof s.duration === "number" && s.duration > 0) return s.timeWatched / s.duration >= 0.7;
-  if (typeof s.watched === "string") return /[^:0]/.test(s.watched);
+  // Current Stremio LibraryItem has explicit counters/flags.
+  if (Number(s.timesWatched) > 0) return true;
+  if (Number(s.flaggedWatched) > 0) return true;
+  if (s.watched === true || s.isWatched === true) return true;
+  // Series use a serialized watched bitfield when individual episodes are watched.
+  if (typeof s.watched === "string" && s.watched.trim()) return true;
+  if (typeof s.timeWatched === "number" && typeof s.duration === "number" && s.duration > 0 && s.timeWatched / s.duration >= 0.7) return true;
   return false;
 }
 
 async function getLibrary(authKey) {
   if (!authKey) return [];
+  const key = `library:${crypto.createHash("sha256").update(authKey).digest("hex").slice(0, 24)}`;
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.time < PROFILE_CACHE_TTL_MS) return cached.value;
   const meta = resultOf(await stremioApi("datastoreMeta", { authKey, collection: "libraryItem" }));
   const ids = arrayFrom(meta).map(x => typeof x === "string" ? x : x?._id || x?.id).filter(Boolean);
-  if (!ids.length) return arrayFrom(await stremioApi("datastoreGet", { authKey, collection: "libraryItem", ids: [], all: true }));
-  const out = [];
-  for (let i = 0; i < ids.length; i += 100) {
-    out.push(...arrayFrom(await stremioApi("datastoreGet", { authKey, collection: "libraryItem", ids: ids.slice(i, i + 100), all: false })));
+  let items;
+  if (!ids.length) items = arrayFrom(await stremioApi("datastoreGet", { authKey, collection: "libraryItem", ids: [], all: true }));
+  else {
+    const out = [];
+    for (let i = 0; i < ids.length; i += 100) out.push(...arrayFrom(await stremioApi("datastoreGet", { authKey, collection: "libraryItem", ids: ids.slice(i, i + 100), all: false })));
+    items = out;
   }
-  return out;
+  const deduped = [...new Map(items.map(x => [x?._id || x?.id, x])).values()].filter(Boolean);
+  cacheSet(key, deduped, LIBRARY_CACHE_TTL_MS);
+  return deduped;
 }
 
 function normalizeRating(x) {
@@ -155,11 +184,21 @@ function normalizeRating(x) {
   return null;
 }
 async function getStremioRating(authKey, imdbId, type) {
+  const key = `rating:${crypto.createHash("sha256").update(`${authKey}:${type}:${imdbId}`).digest("hex").slice(0, 28)}`;
+  const cached = cacheGet(key);
+  if (cached !== null) return cached;
   const u = new URL("https://likes.stremio.com/api/get_status");
   u.searchParams.set("authToken", authKey);
   u.searchParams.set("mediaId", imdbId);
   u.searchParams.set("mediaType", type);
-  try { return normalizeRating(await jsonFetch(u, {}, 10000)); } catch { return null; }
+  try {
+    const r = normalizeRating(await jsonFetch(u, {}, 10000));
+    cacheSet(key, r || "none", RATING_CACHE_TTL_MS);
+    return r;
+  } catch {
+    cacheSet(key, "none", 10 * 60 * 1000);
+    return null;
+  }
 }
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
@@ -179,7 +218,12 @@ async function tmdb(endpoint, params, apiKey) {
   const u = new URL(`https://api.themoviedb.org/3/${endpoint}`);
   for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null && v !== "") u.searchParams.set(k, String(v));
   u.searchParams.set("api_key", apiKey);
-  return jsonFetch(u);
+  const key = `tmdb:${crypto.createHash("sha256").update(u.toString()).digest("hex").slice(0, 28)}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+  const data = await jsonFetch(u);
+  cacheSet(key, data, endpoint.startsWith("discover/") ? PROFILE_CACHE_TTL_MS : TMDB_DETAIL_CACHE_TTL_MS);
+  return data;
 }
 
 function cleanText(s) {
@@ -241,6 +285,29 @@ async function geminiEmbeddings(apiKey, texts) {
   return out.length === texts.length ? out : null;
 }
 
+async function cachedEmbeddings(apiKey, texts, namespace) {
+  if (!apiKey || !texts.length) return null;
+  const result = new Array(texts.length);
+  const missing = [];
+  const missingIndexes = [];
+  for (let i = 0; i < texts.length; i++) {
+    const hash = crypto.createHash("sha256").update(`${namespace}:${texts[i]}`).digest("hex");
+    const cached = cacheGet(`embedding:${hash}`);
+    if (cached) result[i] = cached;
+    else { missing.push(texts[i]); missingIndexes.push(i); }
+  }
+  if (missing.length) {
+    const fresh = await geminiEmbeddings(apiKey, missing);
+    if (!fresh) return result.every(Boolean) ? result : null;
+    fresh.forEach((v, j) => {
+      result[missingIndexes[j]] = v;
+      const hash = crypto.createHash("sha256").update(`${namespace}:${missing[j]}`).digest("hex");
+      cacheSet(`embedding:${hash}`, v, EMBEDDING_CACHE_TTL_MS);
+    });
+  }
+  return result.every(Boolean) ? result : null;
+}
+
 function learnedFeatureProfile(details) {
   const weights = new Map();
   let total = 0;
@@ -296,7 +363,7 @@ function semanticScore(candidateVector, positiveVectors, positives) {
 function hardFilter(d, type, config, watched, excludedGenres) {
   const imdb = d.external_ids?.imdb_id || d.imdb_id;
   if (!imdb) return null;
-  if (config.useWatchedExclusion && watched.has(imdb)) return null;
+  if (config.useWatchedExclusion && (watched.has(imdb) || watched.has(String(imdb).toLowerCase()))) return null;
   const rating = Number(d.vote_average);
   const votes = Number(d.vote_count);
   // TMDB rating and vote count are filters only. They never enter the recommendation score.
@@ -339,36 +406,48 @@ function diversityPick(scored, target) {
 }
 
 async function buildProfile(config, libraryItems, type) {
+  const libraryFingerprint = crypto.createHash("sha256").update(libraryItems.map(x => JSON.stringify({ id:x?._id||x?.id, m:x?._mtime||x?._mtime, s:x?.state })).sort().join("|")).digest("hex").slice(0, 24);
+  const profileKey = `profile:${type}:${libraryFingerprint}:${config.useLikes}:${config.useHearts}:${config.geminiApiKey ? crypto.createHash("sha256").update(config.geminiApiKey).digest("hex").slice(0, 8) : "nogemini"}`;
+  const cachedProfile = cacheGet(profileKey);
+  if (cachedProfile) return cachedProfile;
   const watched = new Set();
   const positives = [];
   const relevant = libraryItems.filter(x => itemType(x) === type);
-  const rated = await mapLimit(relevant, 16, async item => {
+  // IMPORTANT: watched is built from Stremio's LibraryItem state, not from ratings.
+  // Stremio's current model exposes timesWatched/flaggedWatched and a watched bitfield for series.
+  for (const item of relevant) {
+    const id = extractImdb(item);
+    if (!id) continue;
+    if (config.useWatchedExclusion && isWatched(item)) {
+      watched.add(id);
+      watched.add(id.toLowerCase());
+    }
+  }
+  const rated = await mapLimit(relevant, 24, async item => {
     const id = extractImdb(item);
     if (!id) return null;
-    if (config.useWatchedExclusion && isWatched(item)) watched.add(id);
     const rating = await getStremioRating(config.stremioAuthKey, id, type);
     if ((rating === "heart" && config.useHearts) || (rating === "like" && config.useLikes)) return { id, rating, type };
     return null;
   });
   for (const x of rated) if (x) positives.push(x);
 
-  // Only actual 👍/❤️ feedback teaches the profile. Watch state is not a positive signal.
-  const details = (await mapLimit(positives.slice(0, MAX_PROFILE_ITEMS), 10, async p => {
+  const details = (await mapLimit(positives.slice(0, MAX_PROFILE_ITEMS), 16, async p => {
     const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source: "imdb_id", language: "en-US" }, config.tmdbApiKey);
     const d = type === "movie" ? found.movie_results?.[0] : found.tv_results?.[0];
     if (!d) return null;
-    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, {
-      language: "en-US", append_to_response: "keywords,external_ids,credits"
-    }, config.tmdbApiKey);
+    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language: "en-US", append_to_response: "keywords,external_ids,credits" }, config.tmdbApiKey);
     return { details: full, rating: p.rating, id: p.id };
   })).filter(Boolean);
 
   const featureProfile = learnedFeatureProfile(details);
   let positiveVectors = null;
   if (config.geminiApiKey && details.length) {
-    positiveVectors = await geminiEmbeddings(config.geminiApiKey, details.map(x => textOf(x.details))).catch(() => null);
+    positiveVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x => textOf(x.details)), "positive");
   }
-  return { watched, positives: details, featureProfile, positiveVectors, positiveCount: positives.length };
+  const profile = { watched, positives: details, featureProfile, positiveVectors, positiveCount: positives.length };
+  cacheSet(profileKey, profile, PROFILE_CACHE_TTL_MS);
+  return profile;
 }
 
 async function discoverCandidates(type, config, profile) {
@@ -376,39 +455,42 @@ async function discoverCandidates(type, config, profile) {
   const genreCounts = new Map();
   for (const x of profile.positives) for (const g of (x.details.genres || [])) genreCounts.set(g.id, (genreCounts.get(g.id) || 0) + (x.rating === "heart" ? 3 : 1));
   const learnedGenreIds = [...genreCounts.entries()].filter(([id]) => id).sort((a,b) => b[1]-a[1]).slice(0, 4).map(([id]) => id);
-  const learnedKeywords = profile.positives.flatMap(x => (x.details.keywords?.keywords || []).map(k => k.id)).filter(Boolean);
   const keywordCounts = new Map();
-  for (const id of learnedKeywords) keywordCounts.set(id, (keywordCounts.get(id) || 0) + 1);
-  const topKeywordIds = [...keywordCounts.entries()].sort((a,b) => b[1]-a[1]).slice(0, 12).map(x => x[0]);
+  for (const x of profile.positives) for (const k of (x.details.keywords?.keywords || [])) if (k.id) keywordCounts.set(k.id, (keywordCounts.get(k.id) || 0) + (x.rating === "heart" ? 3 : 1));
+  const topKeywordIds = [...keywordCounts.entries()].sort((a,b) => b[1]-a[1]).slice(0, 8).map(x => x[0]);
 
-  const strategies = [];
-  // Broad coverage. These are retrieval strategies only; their ordering is never used in scoring.
-  strategies.push({ sort_by: "popularity.desc" });
-  strategies.push({ sort_by: "vote_count.desc" });
-  strategies.push({ sort_by: "vote_average.desc" });
-  strategies.push({ sort_by: "original_title.asc" });
+  const strategies = [
+    { sort_by: "vote_average.desc" },
+    { sort_by: "vote_count.desc" },
+    { sort_by: "popularity.desc" }
+  ];
   if (learnedGenreIds.length) strategies.push({ sort_by: "vote_count.desc", with_genres: learnedGenreIds.slice(0, 2).join(",") });
-  if (topKeywordIds.length) strategies.push({ sort_by: "vote_count.desc", with_keywords: topKeywordIds.slice(0, 5).join(",") });
+  if (topKeywordIds.length) strategies.push({ sort_by: "vote_count.desc", with_keywords: topKeywordIds.slice(0, 4).join(",") });
 
   const candidates = [];
   for (const strategy of strategies) {
-    for (let page = 1; page <= CANDIDATE_PAGES_PER_STRATEGY; page++) {
-      const params = { language: "en-US", include_adult: false, page, ...strategy };
-      if (type === "movie") {
-        params.primary_release_date_gte = `${config.yearMin}-01-01`;
-        params.primary_release_date_lte = `${config.yearMax}-12-31`;
-      } else {
-        params.first_air_date_gte = `${config.yearMin}-01-01`;
-        params.first_air_date_lte = `${config.yearMax}-12-31`;
-      }
-      const data = await tmdb(type === "movie" ? "discover/movie" : "discover/tv", params, config.tmdbApiKey).catch(() => null);
-      candidates.push(...(data?.results || []));
-    }
+    const pages = await Promise.all(Array.from({ length: CANDIDATE_PAGES_PER_STRATEGY }, (_, i) => {
+      const params = { language: "en-US", include_adult: false, page: i + 1, ...strategy };
+      if (type === "movie") { params.primary_release_date_gte = `${config.yearMin}-01-01`; params.primary_release_date_lte = `${config.yearMax}-12-31`; }
+      else { params.first_air_date_gte = `${config.yearMin}-01-01`; params.first_air_date_lte = `${config.yearMax}-12-31`; }
+      return tmdb(type === "movie" ? "discover/movie" : "discover/tv", params, config.tmdbApiKey).catch(() => null);
+    }));
+    for (const data of pages) candidates.push(...(data?.results || []));
   }
-  const unique = [...new Map(candidates.map(x => [x.id, x])).values()].slice(0, CANDIDATE_DETAILS_LIMIT);
-  const detailed = (await mapLimit(unique, 12, async c => tmdb(`${type === "series" ? "tv" : "movie"}/${c.id}`, {
-    language: "en-US", append_to_response: "keywords,external_ids,credits"
-  }, config.tmdbApiKey))).filter(Boolean);
+  const unique = [...new Map(candidates.map(x => [x.id, x])).values()];
+  // Apply cheap filters before expensive detail calls. This removes most candidates immediately.
+  const cheap = unique.filter(d => {
+    const rating = Number(d.vote_average);
+    const votes = Number(d.vote_count);
+    if (Number.isFinite(rating) && (rating < config.tmdbMinRating || rating > config.tmdbMaxRating)) return false;
+    if (votes < config.tmdbMinVotes) return false;
+    const date = d.release_date || d.first_air_date || "";
+    const year = Number(String(date).slice(0,4));
+    if (year && (year < config.yearMin || year > config.yearMax)) return false;
+    if (type === "series" && config.excludeCancelledSeries && String(d.status || "").toLowerCase() === "canceled") return false;
+    return true;
+  }).slice(0, CANDIDATE_DETAILS_LIMIT);
+  const detailed = (await mapLimit(cheap, 24, async c => tmdb(`${type === "series" ? "tv" : "movie"}/${c.id}`, { language: "en-US", append_to_response: "keywords,external_ids,credits" }, config.tmdbApiKey))).filter(Boolean);
   return detailed.filter(d => hardFilter(d, type, config, profile.watched, excludedGenres));
 }
 
@@ -470,19 +552,83 @@ function profileFingerprint(profile) {
   return crypto.createHash("sha256").update(`${positives}##${watched}`).digest("hex").slice(0, 20);
 }
 
-async function discover(type, config, token) {
-  const library = await getLibrary(config.stremioAuthKey);
+async function computeRecommendations(type, config, token, library) {
   const profile = await buildProfile(config, library, type);
   const fingerprint = profileFingerprint(profile);
-  const cacheKey = `${token}:${type}:${fingerprint}`;
-  const cached = cache.get(cacheKey);
-  if (cached && Date.now() - cached.time < CACHE_TTL_MS) return serializeAndShuffle(cached.top50, type);
-
+  const key = `result:${token}:${type}:${fingerprint}`;
+  const cached = cacheGet(key);
+  if (cached) return { top50: cached, fingerprint, profile };
   const top50 = await buildTop50(type, config, profile);
-  cache.set(cacheKey, { time: Date.now(), top50 });
-  // Keep cache bounded on the Render free instance.
-  if (cache.size > 20) cache.delete(cache.keys().next().value);
-  return serializeAndShuffle(top50, type);
+  cacheSet(key, top50, CACHE_TTL_MS);
+  return { top50, fingerprint, profile };
+}
+
+async function discover(type, config, token) {
+  ACTIVE_CONFIGS.set(token, config);
+  const library = await getLibrary(config.stremioAuthKey);
+  // Build a fingerprint from Stremio library state + current ratings before doing any heavy work.
+  const profile = await buildProfile(config, library, type);
+  const fingerprint = profileFingerprint(profile);
+  const key = `result:${token}:${type}:${fingerprint}`;
+  const cached = cacheGet(key);
+  if (cached) {
+    // Refresh the other catalog in the background without delaying this response.
+    warmOtherType(type, config, token, library).catch(() => {});
+    return serializeAndShuffle(cached, type);
+  }
+  const lockKey = `lock:${token}:${type}:${fingerprint}`;
+  if (REFRESH_LOCK.has(lockKey)) {
+    const result = await REFRESH_LOCK.get(lockKey);
+    return serializeAndShuffle(result.top50, type);
+  }
+  const job = (async () => {
+    const top50 = await buildTop50(type, config, profile);
+    cacheSet(key, top50, CACHE_TTL_MS);
+    return { top50 };
+  })();
+  REFRESH_LOCK.set(lockKey, job);
+  try {
+    const result = await job;
+    return serializeAndShuffle(result.top50, type);
+  } finally {
+    REFRESH_LOCK.delete(lockKey);
+  }
+}
+
+async function warmOtherType(currentType, config, token, library) {
+  const other = currentType === "movie" ? "series" : "movie";
+  const profile = await buildProfile(config, library, other);
+  const fingerprint = profileFingerprint(profile);
+  const key = `result:${token}:${other}:${fingerprint}`;
+  if (cacheGet(key)) return;
+  const lockKey = `lock:${token}:${other}:${fingerprint}`;
+  if (REFRESH_LOCK.has(lockKey)) return;
+  const job = (async () => {
+    const top50 = await buildTop50(other, config, profile);
+    cacheSet(key, top50, CACHE_TTL_MS);
+  })();
+  REFRESH_LOCK.set(lockKey, job);
+  try { await job; } finally { REFRESH_LOCK.delete(lockKey); }
+}
+
+
+async function prewarmBoth(token, config) {
+  ACTIVE_CONFIGS.set(token, config);
+  const library = await getLibrary(config.stremioAuthKey);
+  await Promise.all([
+    (async () => {
+      const profile = await buildProfile(config, library, "movie");
+      const fingerprint = profileFingerprint(profile);
+      const key = `result:${token}:movie:${fingerprint}`;
+      if (!cacheGet(key)) cacheSet(key, await buildTop50("movie", config, profile), CACHE_TTL_MS);
+    })(),
+    (async () => {
+      const profile = await buildProfile(config, library, "series");
+      const fingerprint = profileFingerprint(profile);
+      const key = `result:${token}:series:${fingerprint}`;
+      if (!cacheGet(key)) cacheSet(key, await buildTop50("series", config, profile), CACHE_TTL_MS);
+    })()
+  ]);
 }
 
 function configFromForm(p) {
@@ -520,8 +666,10 @@ async function saveConfig(req, res) {
     const token = packConfig(config);
     const origin = `${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}`;
     const manifestUrl = `${origin}/u/${token}/manifest.json`;
+    ACTIVE_CONFIGS.set(token, config);
     res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" });
-    res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration terminée</h1><p>Installe le nouveau catalogue dans Stremio.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Installer dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
+    res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration terminée</h1><p>Le moteur prépare déjà tes deux catalogues en arrière-plan.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Installer dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
+    setImmediate(() => prewarmBoth(token, config).catch(e => console.error("Prewarm failed:", e.message)));
   } catch (e) { res.writeHead(400, { "content-type":"text/plain; charset=utf-8" }); res.end(`Erreur de configuration: ${e.message}`); }
 }
 function readBody(req) { return new Promise((resolve, reject) => { let data = "", size = 0; req.on("data", c => { size += c.length; if (size > 200000) { reject(new Error("Formulaire trop volumineux")); req.destroy(); } else data += c; }); req.on("end", () => resolve(data)); req.on("error", reject); }); }
@@ -544,7 +692,7 @@ async function handle(req, res) {
       try {
         if (resource === "catalog") {
           const result = await discover(type, tokenConfig, u.pathname.split("/")[2]);
-          res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"no-store" });
+          res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"private, max-age=300, stale-while-revalidate=3600" });
           return res.end(JSON.stringify(result));
         }
         const find = await tmdb(`find/${encodeURIComponent(id)}`, { external_source:"imdb_id", language:"en-US" }, tokenConfig.tmdbApiKey);
@@ -560,4 +708,13 @@ async function handle(req, res) {
   res.writeHead(200, { "content-type":"text/plain; charset=utf-8" }); res.end("Antony Personal Recommendations — open /configure");
 }
 
-http.createServer((req,res) => handle(req,res).catch(e => { console.error(e); if (!res.headersSent) res.writeHead(500); res.end("Internal server error"); })).listen(PORT, HOST, () => console.log(`Antony addon v0.6.0 listening on ${HOST}:${PORT}`));
+setInterval(async () => {
+  for (const [token, config] of ACTIVE_CONFIGS) {
+    try {
+      const library = await getLibrary(config.stremioAuthKey);
+      await Promise.all(["movie", "series"].map(type => warmOtherType(type === "movie" ? "series" : "movie", config, token, library)));
+    } catch (e) { console.error("Background refresh failed:", e.message); }
+  }
+}, 6 * 60 * 60 * 1000).unref();
+
+http.createServer((req,res) => handle(req,res).catch(e => { console.error(e); if (!res.headersSent) res.writeHead(500); res.end("Internal server error"); })).listen(PORT, HOST, () => console.log(`Antony addon v0.7.0 listening on ${HOST}:${PORT}`));
