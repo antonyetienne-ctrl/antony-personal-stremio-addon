@@ -4,7 +4,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "2.0.0";
+const ALGO_VERSION = "3.0.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -67,9 +67,11 @@ const catalogStore = new Map();
 const refreshJobs = new Map();
 const MAX_POSITIVE_ITEMS = Infinity;
 const MAX_PROFILE_ITEMS = Infinity;
-const CANDIDATE_PAGES_PER_STRATEGY = 3;
-const CANDIDATE_DISCOVERY_STRATEGIES = 28;
-const CANDIDATE_DETAILS_LIMIT = 850;
+const CANDIDATE_PAGES_PER_STRATEGY = 2;
+const CANDIDATE_DISCOVERY_STRATEGIES = 42;
+const CANDIDATE_DETAILS_LIMIT = 1100;
+const POSITIVE_SEED_LIMIT = 80;
+const SEED_NEIGHBOR_PAGES = 2;
 const WATCHED_NEGATIVE_LIMIT = 180;
 const WATCHED_NEGATIVE_MAX_PENALTY = 0.24;
 const EMBEDDING_BATCH = 50;
@@ -527,56 +529,23 @@ async function cachedEmbeddings(apiKey, texts, namespace) {
 }
 
 function buildPreferenceModel(positives, negatives) {
-  const posDf = new Map(), negDf = new Map();
-  const posTotal = positives.length || 1, negTotal = negatives.length || 1;
-  for (const item of positives) for (const f of new Set(featureMap(item.details).keys())) posDf.set(f,(posDf.get(f)||0)+1);
-  for (const item of negatives) for (const f of new Set(featureMap(item.details).keys())) negDf.set(f,(negDf.get(f)||0)+1);
-  const weights = new Map();
-  const all = new Set([...posDf.keys(),...negDf.keys()]);
-  for (const f of all) {
-    const p=(posDf.get(f)||0)/posTotal, n=(negDf.get(f)||0)/negTotal;
-    const evidence=Math.log((p+0.035)/(n+0.035));
-    const support=Math.min(1, Math.log1p((posDf.get(f)||0)) / Math.log1p(5));
-    const posIntensity=(posDf.get(f)||0) + 2*(posDf.get(f)||0 && 0);
-    const scale = Math.min(2.2, Math.max(-2.2, evidence)) * (0.45 + 0.55*support);
-    if (Math.abs(scale) >= 0.035) weights.set(f, scale);
-  }
-  // Learn pairwise interactions among the most discriminative features. This
-  // is the layer that captures "I like A when it is combined with B" rather
-  // than treating every genre/theme independently.
-  const topPositive = [...weights.entries()].filter(x=>x[1]>0.12).sort((a,b)=>b[1]-a[1]).slice(0,28).map(x=>x[0]);
-  const pairWeights = new Map();
-  const pairStats = (items, map) => {
-    for (const item of items) {
-      const fs=new Set(featureMap(item.details).keys());
-      const present=topPositive.filter(f=>fs.has(f));
-      for(let i=0;i<present.length;i++) for(let j=i+1;j<present.length;j++) {
-        const key=[present[i],present[j]].sort().join('||');
-        map.set(key,(map.get(key)||0)+1);
-      }
-    }
-  };
-  const pp=new Map(), nn=new Map(); pairStats(positives,pp); pairStats(negatives,nn);
-  for(const [key,c] of pp){
-    const nc=nn.get(key)||0;
-    const p=c/posTotal, n=nc/negTotal;
-    const lift=Math.log((p+0.02)/(n+0.02));
-    if(lift>0.12 && c>=2) pairWeights.set(key, Math.min(1.8,lift)*Math.min(1,Math.log1p(c)/Math.log1p(5)));
-  }
-  return { weights, pairWeights, positiveCount:positives.length, negativeCount:negatives.length };
+  const posDf=new Map(),negDf=new Map(),posIntensity=new Map();
+  const posTotal=Math.max(1,positives.length),negTotal=Math.max(1,negatives.length);
+  for(const item of positives){const w=item.rating==="heart"?3:1;for(const f of new Set(featureMap(item.details).keys())){posDf.set(f,(posDf.get(f)||0)+1);posIntensity.set(f,(posIntensity.get(f)||0)+w);}}
+  for(const item of negatives)for(const f of new Set(featureMap(item.details).keys()))negDf.set(f,(negDf.get(f)||0)+1);
+  const weights=new Map(),all=new Set([...posDf.keys(),...negDf.keys()]);
+  for(const f of all){const pc=posDf.get(f)||0,nc=negDf.get(f)||0;const p=(pc+.75)/(posTotal+1.5),n=(nc+.75)/(negTotal+1.5);const lift=Math.log(p/n);const support=Math.min(1,Math.log1p(pc)/Math.log1p(7));const intensity=Math.min(1,(posIntensity.get(f)||0)/Math.max(3,posTotal));const credibility=.25+.45*support+.30*intensity;const scale=Math.max(-3,Math.min(3,lift))*credibility;if(Math.abs(scale)>=.045)weights.set(f,scale);}
+  const positiveFeatures=[...weights.entries()].filter(([,w])=>w>.08).sort((a,b)=>b[1]-a[1]).slice(0,42).map(([f])=>f);
+  const pairPos=new Map(),pairNeg=new Map(),triplePos=new Map(),tripleNeg=new Map();
+  const collect=(items,pm,tm)=>{for(const item of items){const fs=new Set(featureMap(item.details).keys());const present=positiveFeatures.filter(f=>fs.has(f)).slice(0,14);for(let i=0;i<present.length;i++)for(let j=i+1;j<present.length;j++){const k=[present[i],present[j]].sort().join('||');pm.set(k,(pm.get(k)||0)+1);for(let z=j+1;z<present.length;z++){const t=[present[i],present[j],present[z]].sort().join('||');tm.set(t,(tm.get(t)||0)+1);}}}};
+  collect(positives,pairPos,triplePos);collect(negatives,pairNeg,tripleNeg);
+  const pairWeights=new Map(),tripleWeights=new Map();
+  for(const [key,c] of pairPos){if(c<2)continue;const n=pairNeg.get(key)||0;const lift=Math.log(((c+.7)/(posTotal+1))/((n+.7)/(negTotal+1)));if(lift>.10)pairWeights.set(key,Math.min(2.4,lift)*Math.min(1,Math.log1p(c)/Math.log1p(6)));}
+  for(const [key,c] of triplePos){if(c<2)continue;const n=tripleNeg.get(key)||0;const lift=Math.log(((c+.5)/(posTotal+1))/((n+.5)/(negTotal+1)));if(lift>.18)tripleWeights.set(key,Math.min(3,lift)*Math.min(1,Math.log1p(c)/Math.log1p(5)));}
+  return {weights,pairWeights,tripleWeights,positiveCount:positives.length,negativeCount:negatives.length};
 }
-function preferenceFeatureScore(candidate, model) {
-  if(!model?.weights?.size) return 0;
-  const fs=new Set(featureMap(candidate).keys());
-  let pos=0, neg=0, abs=0;
-  for(const [f,w] of model.weights){ if(fs.has(f)){ if(w>0) pos+=w; else neg+=-w; abs+=Math.abs(w); } }
-  let pair=0;
-  for(const [key,w] of model.pairWeights || []){
-    const [a,b]=key.split('||'); if(fs.has(a)&&fs.has(b)) pair+=w;
-  }
-  const base=abs ? (pos-neg)/abs : 0;
-  return Math.max(-1,Math.min(1,0.72*base + 0.28*Math.tanh(pair)));
-}
+function preferenceFeatureScore(candidate,model){if(!model?.weights?.size)return 0;const fs=new Set(featureMap(candidate).keys());let signed=0,abs=0;for(const [f,w] of model.weights)if(fs.has(f)){signed+=w;abs+=Math.abs(w);}let pair=0;for(const [key,w] of model.pairWeights||[]){const [a,b]=key.split('||');if(fs.has(a)&&fs.has(b))pair+=w;}let triple=0;for(const [key,w] of model.tripleWeights||[]){const [a,b,c]=key.split('||');if(fs.has(a)&&fs.has(b)&&fs.has(c))triple+=w;}const base=abs?signed/abs:0;return Math.max(-1,Math.min(1,.56*base+.26*Math.tanh(pair)+.18*Math.tanh(triple)));}
+
 function featureSimilarity(candidate, profile) {
   if (!profile) return 0;
   const x=preferenceFeatureScore(candidate, profile);
@@ -897,157 +866,34 @@ function samplePages(seedText, count = CANDIDATE_PAGES_PER_STRATEGY) {
   return [...pages];
 }
 
-async function discoverCandidates(type, config, profile) {
-  const excludedGenres = new Set((config.excludeGenres || []).map(x=>cleanText(x)));
-  const candidates = new Map();
-  const addResults = arr => { for (const x of arr || []) if (x?.id) candidates.set(`${type}:${x.id}`, x); };
-
-  // Candidate discovery deliberately avoids TMDB's popularity ranking. We use
-  // several independent entry points and sample different pages of filtered
-  // Discover results. Popularity is therefore neither the candidate gate nor a
-  // ranking signal.
-  const seeds = profile.seeds || [];
-  const seedJobs = seeds.slice(0, 36).flatMap(seed => {
-    const tmdbId = seed.details?.id;
-    if (!tmdbId) return [];
-    const base = type === "movie" ? `movie/${tmdbId}` : `tv/${tmdbId}`;
-    return [
-      { endpoint:`${base}/recommendations`, params:{ language:"en-US", page:1 } },
-      { endpoint:`${base}/similar`, params:{ language:"en-US", page:1 } }
-    ];
-  });
-  const seedResults = await mapLimit(seedJobs, 8, async q => tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
-  for (const data of seedResults) addResults(data?.results);
-
-  // Explicitly sample each learned taste cluster through several of its most
-  // representative positive seeds. This helps discovery stay plural instead
-  // of over-representing whichever genre happens to have the most metadata.
-  const clusterSeedIndexes = new Set();
-  for (const cluster of (profile.clusters || [])) {
-    const ranked = profile.positives.map((p, i) => ({ i, s: profile.positiveVectors?.[i] ? cosine(profile.positiveVectors[i], cluster.vector) : 0 }))
-      .sort((a,b)=>b.s-a.s).slice(0, 3);
-    for (const r of ranked) clusterSeedIndexes.add(r.i);
-  }
-  const clusterJobs = [...clusterSeedIndexes].map(i => profile.positives[i]).filter(Boolean).flatMap(seed => {
-    const tmdbId = seed.details?.id; if (!tmdbId) return [];
-    const base = type === "movie" ? `movie/${tmdbId}` : `tv/${tmdbId}`;
-    return [
-      { endpoint:`${base}/recommendations`, params:{ language:"en-US", page:1 } },
-      { endpoint:`${base}/similar`, params:{ language:"en-US", page:1 } }
-    ];
-  });
-  const clusterResults = await mapLimit(clusterJobs, 8, async q => tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
-  for (const data of clusterResults) addResults(data?.results);
-
-  const genreCounts = new Map(), keywordCounts = new Map();
-  for (const x of profile.positives) {
-    const w=x.rating === "heart" ? 3 : 1;
-    for (const g of x.details.genres || []) genreCounts.set(g.id,(genreCounts.get(g.id)||0)+w);
-    for (const k of x.details.keywords?.keywords || []) keywordCounts.set(k.id,(keywordCounts.get(k.id)||0)+w);
-  }
-  const genres=[...genreCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,12).map(x=>x[0]);
-  const keywords=[...keywordCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,24).map(x=>x[0]);
-
-  const strategies=[];
-  for (const g of genres) strategies.push({ with_genres:String(g), label:`g:${g}` });
-  for (const k of keywords) strategies.push({ with_keywords:String(k), label:`k:${k}` });
-  for (const g of genres.slice(0,8)) for (const k of keywords.slice(0,8)) {
-    strategies.push({ with_genres:String(g), with_keywords:String(k), label:`gk:${g}:${k}` });
-  }
-
-  const sortModes = type === "movie"
-    ? ["vote_average.desc", "primary_release_date.asc", "primary_release_date.desc", "vote_count.asc"]
-    : ["vote_average.desc", "first_air_date.asc", "first_air_date.desc", "vote_count.asc"];
-
-  const pageJobs=[];
-  for(const strategy of strategies.slice(0,CANDIDATE_DISCOVERY_STRATEGIES)){
-    for(const sort_by of sortModes){
-      for(const page of samplePages(`${type}:${strategy.label}:${sort_by}:${profile.positiveCount}`)){
-        const params={language:"en-US",include_adult:false,page,sort_by,...strategy};
-        delete params.label;
-        if(type==="movie"){
-          params.primary_release_date_gte=`${config.yearMin}-01-01`;
-          params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
-        } else {
-          params.first_air_date_gte=`${config.yearMin}-01-01`;
-          params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;
-        }
-        pageJobs.push({endpoint:type==="movie"?"discover/movie":"discover/tv",params});
-      }
-    }
-  }
-  const discovered=await mapLimit(pageJobs, 8, async q => tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
-  for(const data of discovered) addResults(data?.results);
-
-  const cheap=[...candidates.values()].filter(d=>{
-    const rating=Number(d.vote_average), votes=Number(d.vote_count);
-    if(!Number.isFinite(rating) || rating<config.tmdbMinRating || rating>config.tmdbMaxRating) return false;
-    if(!Number.isFinite(votes) || votes<config.tmdbMinVotes) return false;
-    const date=d.release_date||d.first_air_date||"";
-    const year=Number(String(date).slice(0,4));
-    if(!year || year<config.yearMin || year>config.yearMax) return false;
-    if(type==="series"&&config.excludeCancelledSeries&&String(d.status||"").toLowerCase()==="canceled") return false;
-    return true;
-  });
-
-  // Never take the first N results as an implicit popularity ranking. Shuffle the
-  // eligible pool deterministically before the expensive detail stage so every
-  // discovery route has a chance to contribute.
-  const shuffledCheap = cheap.slice().sort((a,b)=>stableSeed(`${type}:${a.id}:${profile.positiveCount}`)-stableSeed(`${type}:${b.id}:${profile.positiveCount}`));
-  const limited=shuffledCheap.slice(0,CANDIDATE_DETAILS_LIMIT);
-  const detailed=(await mapLimit(limited,10,async c=>tmdb(`${type==="series"?"tv":"movie"}/${c.id}`,{language:"en-US",append_to_response:"keywords,external_ids,credits"},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);
-  const final=detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
-  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} discoveryRequests=${pageJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${final.length}`);
-  return final;
+async function discoverCandidates(type,config,profile){
+  const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));const candidates=new Map();const addResults=arr=>{for(const x of arr||[])if(x?.id)candidates.set(`${type}:${x.id}`,x);};const media=type==='movie'?'movie':'tv';
+  const seeds=chooseDiversePositiveSeeds(profile.positives,Math.min(POSITIVE_SEED_LIMIT,profile.positives.length));
+  const seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];const base=`${media}/${id}`,jobs=[];for(let page=1;page<=SEED_NEIGHBOR_PAGES;page++){jobs.push({endpoint:`${base}/recommendations`,params:{language:'en-US',page}},{endpoint:`${base}/similar`,params:{language:'en-US',page}});}return jobs;});
+  const seedResults=await mapLimit(seedJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of seedResults)addResults(data?.results);
+  const genreScore=new Map(),keywordScore=new Map(),negGenre=new Map(),negKeyword=new Map();
+  for(const x of profile.positives){const w=x.rating==='heart'?3:1;for(const g of x.details.genres||[])genreScore.set(g.id,(genreScore.get(g.id)||0)+w);for(const k of x.details.keywords?.keywords||[])keywordScore.set(k.id,(keywordScore.get(k.id)||0)+w);}
+  for(const x of profile.watchedUnrated||[]){for(const g of x.details.genres||[])negGenre.set(g.id,(negGenre.get(g.id)||0)+1);for(const k of x.details.keywords?.keywords||[])negKeyword.set(k.id,(negKeyword.get(k.id)||0)+1);}
+  const rank=(pos,neg,tp,tn)=>[...pos.entries()].map(([id,v])=>({id,score:Math.log(((v+.6)/(tp+1.2))/(((neg.get(id)||0)+.6)/(tn+1.2)))})).sort((a,b)=>b.score-a.score);
+  const genres=rank(genreScore,negGenre,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,14).map(x=>x.id);
+  const keywords=rank(keywordScore,negKeyword,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,32).map(x=>x.id);
+  const strategies=[];for(const g of genres)strategies.push({with_genres:String(g),label:`g:${g}`});for(const k of keywords)strategies.push({with_keywords:String(k),label:`k:${k}`});
+  for(let i=0;i<genres.length;i++)for(let j=i+1;j<genres.length&&j<i+4;j++)strategies.push({with_genres:`${genres[i]},${genres[j]}`,label:`gg:${genres[i]}:${genres[j]}`});
+  for(let i=0;i<keywords.length;i++)for(let j=i+1;j<keywords.length&&j<i+5;j++)strategies.push({with_keywords:`${keywords[i]},${keywords[j]}`,label:`kk:${keywords[i]}:${keywords[j]}`});
+  for(const g of genres.slice(0,10))for(const k of keywords.slice(0,12))strategies.push({with_genres:String(g),with_keywords:String(k),label:`gk:${g}:${k}`});
+  for(const item of seeds.slice(0,24)){const gs=(item.details.genres||[]).map(x=>x.id).slice(0,2),ks=(item.details.keywords?.keywords||[]).map(x=>x.id).slice(0,3);for(const g of gs)for(const k of ks)strategies.push({with_genres:String(g),with_keywords:String(k),label:`seedgk:${g}:${k}`});}
+  const dedup=new Map();for(const x of strategies)dedup.set(x.label,x);const strategyList=[...dedup.values()].slice(0,CANDIDATE_DISCOVERY_STRATEGIES);
+  const sortModes=type==='movie'?['vote_average.desc','vote_count.desc','primary_release_date.desc','primary_release_date.asc']:['vote_average.desc','vote_count.desc','first_air_date.desc','first_air_date.asc'];
+  const pageJobs=[];for(const strategy of strategyList)for(const sort_by of sortModes)for(const page of [1,2]){const params={language:'en-US',include_adult:false,page,sort_by,...strategy};delete params.label;if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}else{params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}pageJobs.push({endpoint:type==='movie'?'discover/movie':'discover/tv',params});}
+  const discovered=await mapLimit(pageJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of discovered)addResults(data?.results);
+  const cheap=[...candidates.values()].filter(d=>{const rating=Number(d.vote_average),votes=Number(d.vote_count);if(!Number.isFinite(rating)||rating<config.tmdbMinRating||rating>config.tmdbMaxRating)return false;if(!Number.isFinite(votes)||votes<config.tmdbMinVotes)return false;const date=d.release_date||d.first_air_date||'',year=Number(String(date).slice(0,4));return year&&year>=config.yearMin&&year<=config.yearMax;});
+  const shuffled=cheap.slice().sort((a,b)=>stableSeed(`${ALGO_VERSION}:${type}:${a.id}:${profile.positiveCount}`)-stableSeed(`${ALGO_VERSION}:${type}:${b.id}:${profile.positiveCount}`));
+  const limited=shuffled.slice(0,CANDIDATE_DETAILS_LIMIT);const detailed=(await mapLimit(limited,12,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);const final=detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
+  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} seedRequests=${seedJobs.length} discoveryRequests=${pageJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${final.length}`);return final;
 }
 
-async function buildTop50(type, config, profile) {
-  if (!profile.positiveCount) return [];
-  const filtered = await discoverCandidates(type, config, profile);
-  if (!filtered.length) return [];
+async function buildTop50(type,config,profile){if(!profile.positiveCount)return[];const filtered=await discoverCandidates(type,config,profile);if(!filtered.length)return[];let candidateVectors=null;if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length)candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);const scored=filtered.map((d,i)=>{const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;const feat=featureSimilarity(d,profile.featureProfile);const discriminative=preferenceFeatureScore(d,profile.preferenceModel);const lex=lexicalSimilarity(d,profile.positives);const clusterFit=candidateVectors?.[i]&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)):0;const negativeSemantic=candidateVectors?.[i]?watchedNegativeSimilarity(candidateVectors[i],profile.negativeVectors):0;const negativeFeature=Math.max(0,-discriminative);const negCount=profile.watchedUnrated?.length||0;const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);const positiveTaste=.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex;const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(x=>x>=.25).length/5);const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;const votes=Math.max(0,Number(d.vote_count)||0);const voteReliability=Math.min(1,Math.log10(1+votes)/5);const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:candidateVectors?.[i]||null};}).filter(x=>x.imdbId);scored.sort((a,b)=>b.personalScore-a.personalScore);const top=diversityPick(scored,Math.min(30,config.maxResults));console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);return top;}
 
-  let candidateVectors=null;
-  if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length){
-    candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${type}`).catch(()=>null);
-  }
-
-  const scored=filtered.map((d,i)=>{
-    const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;
-    const feat=featureSimilarity(d,profile.featureProfile);
-    const discriminative=preferenceFeatureScore(d,profile.preferenceModel);
-    const lex=lexicalSimilarity(d,profile.positives);
-    const clusterFeature = profile.clusters?.length && candidateVectors?.[i]
-      ? Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)) : 0;
-    // The taste score is intentionally multi-signal. Gemini semantic similarity
-    // is only one component; structured TMDB patterns remain significant.
-    const positiveTaste=profile.positiveVectors?.length&&candidateVectors?.[i]
-      ? 0.50*sem + 0.18*feat + 0.16*Math.max(0,discriminative) + 0.08*clusterFeature + 0.08*lex
-      : 0.62*feat + 0.22*Math.max(0,discriminative) + 0.10*lex + 0.06*clusterFeature;
-    const negativeSemantic = candidateVectors?.[i] ? watchedNegativeSimilarity(candidateVectors[i], profile.negativeVectors) : 0;
-    const negativeFeature = Math.max(0, -discriminative);
-    // Watched-without-rating is deliberately weak evidence: it can mean "I
-    // forgot to rate it". It can only gently push a candidate down, never act
-    // as a hard exclusion and never outweigh an explicit ❤️/👍 pattern.
-    const negativeStrength = Math.min(1, Math.log1p(profile.watchedUnrated?.length || 0) / Math.log1p(30));
-    const watchedPenalty = WATCHED_NEGATIVE_MAX_PENALTY * negativeStrength * (0.55 * negativeSemantic + 0.45 * negativeFeature);
-    // Reward convergence: a candidate supported independently by semantics,
-    // learned features and a taste cluster is more trustworthy than one that
-    // matches only a single broad genre.
-    const convergence = Math.min(1, [sem, feat, clusterFeature, lex].filter(x => x >= 0.20).length / 4);
-    const tasteScore = Math.max(0, Math.min(1, positiveTaste + 0.06 * convergence - watchedPenalty));
-    const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
-    const votes=Math.max(0,Number(d.vote_count)||0);
-    const voteReliability=Math.min(1,Math.log10(1+votes)/5);
-    const tmdbWeak=0.05*rating+0.03*voteReliability;
-    const personalScore=0.92*tasteScore+tmdbWeak;
-    return {details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,tmdbWeak,semantic:candidateVectors?.[i]||null};
-  }).filter(x=>x.imdbId);
-
-  scored.sort((a,b)=>b.personalScore-a.personalScore);
-  const top = diversityPick(scored,Math.min(30,config.maxResults));
-  console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);
-  return top;
-}
 function serializeAndShuffle(top50, type, config = DEFAULTS) {
   const ordered = top50.slice();
   if (config.displayOrder === "random") {
@@ -1070,7 +916,8 @@ function serializeAndShuffle(top50, type, config = DEFAULTS) {
 function profileFingerprint(profile) {
   const positives = profile.positives.map(x => `${x.id}:${x.rating}`).sort().join("|");
   const watched = [...profile.watched].sort().join("|");
-  return crypto.createHash("sha256").update(`${positives}##${watched}`).digest("hex").slice(0, 20);
+  const negatives = (profile.watchedUnrated || []).map(x => x.id || x.details?.id || "").sort().join("|");
+  return crypto.createHash("sha256").update(`${positives}##${watched}##${negatives}##${ALGO_VERSION}`).digest("hex").slice(0, 20);
 }
 
 async function computeRecommendations(type, config, token, library) {
