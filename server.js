@@ -4,7 +4,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "1.4.0";
+const ALGO_VERSION = "1.5.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -35,13 +35,13 @@ const MANIFEST = {
   id: "com.antony.personalrecommendations",
   version: ALGO_VERSION,
   name: "🎯 Antony — Personal Recommendations",
-  description: "Recommendations learned primarily from Stremio 👍 and ❤️, with watched-without-rating used only as weak negative/neutral evidence; watched items remain excluded from results.",
+  description: "Recommendations learned primarily from Stremio 👍 and ❤️, with watched-without-rating used as cautious negative evidence with repetition confidence; watched items remain excluded from results.",
   resources: ["catalog", "meta"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
   catalogs: [
-    { type: "movie", id: "antony_movies", name: "🎯 Antony — Films" },
-    { type: "series", id: "antony_series", name: "🎯 Antony — Séries" }
+    { type: "movie", id: "antony_movies", name: "🎯 Recommandations selon vos Goûts" },
+    { type: "series", id: "antony_series", name: "🎯 Recommandations selon vos Goûts" }
   ],
   behaviorHints: { configurable: true, configurationRequired: false }
 };
@@ -68,9 +68,10 @@ const refreshJobs = new Map();
 const MAX_POSITIVE_ITEMS = Infinity;
 const MAX_PROFILE_ITEMS = Infinity;
 const CANDIDATE_PAGES_PER_STRATEGY = 3;
-const CANDIDATE_DISCOVERY_STRATEGIES = 20;
-const CANDIDATE_DETAILS_LIMIT = 700;
-const WATCHED_NEGATIVE_LIMIT = 140;
+const CANDIDATE_DISCOVERY_STRATEGIES = 28;
+const CANDIDATE_DETAILS_LIMIT = 850;
+const WATCHED_NEGATIVE_LIMIT = 180;
+const WATCHED_NEGATIVE_MAX_PENALTY = 0.14;
 const EMBEDDING_BATCH = 50;
 const COLD_START_WAIT_MS = 20000;
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
@@ -672,62 +673,64 @@ function chooseDiversePositiveSeeds(positives, count) {
 
 function buildTasteClusters(positiveVectors, positives) {
   if (!positiveVectors?.length) return [];
-  // Multi-cluster taste model: each sufficiently distinct loved item can seed a
-  // taste center, then all positives are softly assigned to their nearest center.
-  const anchors = [];
-  const maxClusters = Math.min(8, Math.max(3, Math.round(Math.sqrt(positiveVectors.length / 5))));
+  // Discover several independent taste poles. A positive can contribute to
+  // more than one pole when it sits between them; this avoids forcing a title
+  // into one genre-shaped bucket.
+  const maxClusters = Math.min(10, Math.max(3, Math.round(Math.sqrt(positiveVectors.length / 4))));
   const orderedIndexes = positives.map((p, i) => ({ i, w: p.rating === "heart" ? 3 : 1 }))
     .sort((a, b) => b.w - a.w);
+  const anchors = [];
   for (const { i } of orderedIndexes) {
     if (anchors.length >= maxClusters) break;
     const v = positiveVectors[i];
     if (!v) continue;
-    if (anchors.every(a => cosine(v, a.vector) < 0.76)) {
-      anchors.push({ vector: v, seedWeight: positives[i]?.rating === "heart" ? 1 : 0.7 });
-    }
+    if (anchors.every(a => cosine(v, a.vector) < 0.70)) anchors.push({ vector: v });
   }
   if (!anchors.length) return [];
   const sums = anchors.map(() => ({ v: new Array(positiveVectors[0].length).fill(0), w: 0 }));
   for (let i = 0; i < positiveVectors.length; i++) {
     const v = positiveVectors[i]; if (!v) continue;
-    let best = 0, bestSim = -Infinity;
-    for (let j = 0; j < anchors.length; j++) {
-      const c = cosine(v, anchors[j].vector);
-      if (c > bestSim) { bestSim = c; best = j; }
+    const sims = anchors.map(a => Math.max(0, cosine(v, a.vector)));
+    const eligible = sims.map((sim, j) => ({ sim, j })).filter(x => x.sim >= 0.55).sort((a,b) => b.sim - a.sim).slice(0, 3);
+    const chosen = eligible.length ? eligible : [{ sim: Math.max(...sims), j: sims.indexOf(Math.max(...sims)) }];
+    const baseW = positives[i]?.rating === "heart" ? 3 : 1;
+    const norm = chosen.reduce((a, x) => a + Math.max(0.05, x.sim), 0);
+    for (const x of chosen) {
+      const w = baseW * Math.max(0.05, x.sim) / norm;
+      sums[x.j].w += w;
+      for (let k = 0; k < v.length; k++) sums[x.j].v[k] += v[k] * w;
     }
-    const w = positives[i]?.rating === "heart" ? 3 : 1;
-    sums[best].w += w;
-    for (let k = 0; k < v.length; k++) sums[best].v[k] += v[k] * w;
   }
-  return sums.map((x, j) => {
+  return sums.map(x => {
     const n = Math.sqrt(x.v.reduce((a, b) => a + b * b, 0)) || 1;
-    return {
-      vector: x.v.map(v => v / n),
-      weight: Math.min(1, x.w / Math.max(1, positiveVectors.length * 0.28)),
-      seedWeight: anchors[j].seedWeight
-    };
+    return { vector: x.v.map(v => v / n), weight: Math.min(1, x.w / Math.max(1, positiveVectors.length * 0.22)) };
   }).filter(x => x.vector.length);
 }
-
 function watchedNegativeSimilarity(candidateVector, negativeVectors) {
   if (!candidateVector || !negativeVectors?.length) return 0;
   const sims = negativeVectors.map(v => Math.max(0, cosine(candidateVector, v))).sort((a, b) => b - a);
   if (!sims.length) return 0;
-  const top = sims.slice(0, Math.min(8, sims.length));
+  const top = sims.slice(0, Math.min(12, sims.length));
   const avg = top.reduce((a, b) => a + b, 0) / top.length;
-  return 0.35 * top[0] + 0.65 * avg;
+  const repetitionConfidence = Math.min(1, Math.log1p(negativeVectors.length) / Math.log1p(30));
+  return repetitionConfidence * (0.30 * top[0] + 0.70 * avg);
 }
-
 function watchedNegativeFeatureProfile(details) {
   if (!details?.length) return new Map();
   const weights = new Map();
   const df = new Map();
-  for (const item of details) for (const f of featureMap(item.details).keys()) df.set(f, (df.get(f) || 0) + 1);
+  for (const item of details) {
+    for (const f of new Set(featureMap(item.details).keys())) df.set(f, (df.get(f) || 0) + 1);
+  }
   let total = 0;
   for (const item of details) {
     for (const [f, v] of featureMap(item.details)) {
-      const idf = 1 + Math.log((details.length + 1) / ((df.get(f) || 1) + 1));
-      const contribution = Math.min(v, 1) * idf;
+      const count = df.get(f) || 1;
+      // One forgotten rating should barely matter. Repetition across watched
+      // unrated titles makes the negative evidence progressively credible.
+      const confidence = Math.min(1, Math.log1p(count) / Math.log1p(15));
+      const idf = 1 + Math.log((details.length + 1) / (count + 1));
+      const contribution = confidence * Math.min(v, 1) * idf;
       addWeighted(weights, f, contribution);
       total += contribution;
     }
@@ -735,7 +738,6 @@ function watchedNegativeFeatureProfile(details) {
   if (total) for (const [f, v] of weights) weights.set(f, v / total);
   return weights;
 }
-
 function chooseDiverseWatchedSeeds(items, count) {
   if (items.length <= count) return items;
   const ordered = items.slice().sort((a, b) => stableSeed(a.id || a.details?.id) - stableSeed(b.id || b.details?.id));
@@ -961,8 +963,13 @@ async function buildTop50(type, config, profile) {
     // Watched-without-rating is deliberately weak evidence: it can mean "I
     // forgot to rate it". It can only gently push a candidate down, never act
     // as a hard exclusion and never outweigh an explicit ❤️/👍 pattern.
-    const watchedPenalty = 0.06 * (0.70 * negativeSemantic + 0.30 * negativeFeature);
-    const tasteScore = Math.max(0, positiveTaste - watchedPenalty);
+    const negativeStrength = Math.min(1, Math.log1p(profile.watchedUnrated?.length || 0) / Math.log1p(30));
+    const watchedPenalty = WATCHED_NEGATIVE_MAX_PENALTY * negativeStrength * (0.70 * negativeSemantic + 0.30 * negativeFeature);
+    // Reward convergence: a candidate supported independently by semantics,
+    // learned features and a taste cluster is more trustworthy than one that
+    // matches only a single broad genre.
+    const convergence = Math.min(1, [sem, feat, clusterFeature, lex].filter(x => x >= 0.20).length / 4);
+    const tasteScore = Math.max(0, Math.min(1, positiveTaste + 0.06 * convergence - watchedPenalty));
     const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
     const votes=Math.max(0,Number(d.vote_count)||0);
     const voteReliability=Math.min(1,Math.log10(1+votes)/5);
@@ -1148,7 +1155,7 @@ function configurePage(config = DEFAULTS, action = "/config/save") {
   const escAttr = v => esc(v).replace(/`/g, "&#96;");
   const checked = k => config[k] ? "checked" : "";
   const selected = k => config.displayOrder === k ? "selected" : "";
-  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Films : durée minimale (minutes)</label><input name="runtimeMinMovie" type="number" min="0" value="${config.runtimeMinMovie}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement. La durée minimale ci-dessus concerne uniquement les films.</p></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Un contenu vu sans 👍/❤️ peut seulement produire un très léger signal négatif : il ne vaut jamais un vrai rejet.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Films : durée minimale (minutes)</label><input name="runtimeMinMovie" type="number" min="0" value="${config.runtimeMinMovie}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement. La durée minimale ci-dessus concerne uniquement les films.</p></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Un contenu vu sans 👍/❤️ produit un signal négatif prudent : un seul oubli pèse presque rien, mais un motif répété sur plusieurs contenus similaires pèse davantage. Cela ne devient jamais une exclusion.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
 }
 
 async function saveConfig(req, res, previousToken = "") {
