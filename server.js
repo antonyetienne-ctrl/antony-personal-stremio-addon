@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "5.3.0";
+const ALGO_VERSION = "5.4.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -1244,26 +1244,13 @@ function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
     }catch(e){console.warn(`Gemini upgrade failed for ${type}: ${e.message}`);}
   });
 }
-async function buildBootstrapCatalog(type, config, token) {
-  const media = type === "movie" ? "movie" : "tv";
-  const endpoint = type === "movie" ? "discover/movie" : "discover/tv";
-  const pages=[1,2,3];
-  const raw=[];
-  for(const page of pages){
-    const params={language:"en-US",include_adult:false,page,sort_by:"vote_count.desc",vote_count_gte:config.tmdbMinVotes,vote_average_gte:config.tmdbMinRating,vote_average_lte:config.tmdbMaxRating};
-    if(type==="movie"){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
-    else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
-    const data=await tmdb(endpoint,params,config.tmdbAccessToken).catch(()=>null);
-    raw.push(...(data?.results||[]));
-  }
-  const state=stateStore.get(stateKey(token));
-  const watched=state?.library?watchedSetFromLibrary(state.library):new Set();
-  const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));
-  const details=await mapLimit([...new Map(raw.map(x=>[x.id,x])).values()].slice(0,90),6,async c=>tmdb(`${media}/${c.id}`,{language:"en-US",append_to_response:"keywords,external_ids,credits"},config.tmdbAccessToken).catch(()=>null));
-  const eligible=details.filter(Boolean).filter(d=>hardFilter(d,type,config,watched,excludedGenres));
-  const usable=eligible.filter(d=>d.external_ids?.imdb_id||d.imdb_id).slice(0,Math.min(30,config.maxResults));
-  return serializeAndShuffle(usable.map(d=>({details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore:0,semantic:null})),type,{...config,displayOrder:"score"});
-}
+// IMPORTANT: never return a generic TMDB bootstrap catalog.
+// The old bootstrap used vote_count.desc and produced the same small set of
+// popular titles (often only 5-8 after filters), which could remain visible in
+// Stremio while the real personalized build was still running. A catalog
+// endpoint must return only the last complete personalized catalog. On a true
+// first-ever build there is no safe personalized result, so return an empty
+// catalog and let the background build populate it atomically.
 
 async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
@@ -1305,13 +1292,11 @@ async function discover(type, config, token) {
     job.finally(() => REFRESH_LOCK.delete(lockKey));
   }
 
-  // First-ever install only: there is no last-known-good personalized catalog.
-  // Return a temporary bootstrap immediately; never wait 12 seconds on Stremio.
-  try { return await buildBootstrapCatalog(type, config, token); }
-  catch (e) {
-    console.warn(`Temporary bootstrap failed for ${type}: ${e.message}`);
-    return { metas: [] };
-  }
+  // There is no last-known-good personalized catalog yet. Never substitute a
+  // generic popularity-based bootstrap: that was the source of the recurring
+  // 5-8-card list seen for long periods in Stremio. The real build continues in
+  // the background and is published atomically only when complete.
+  return { metas: [] };
 }
 
 async function warmOtherType(currentType, config, token, library) {
