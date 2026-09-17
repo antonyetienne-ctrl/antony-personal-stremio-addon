@@ -1,8 +1,8 @@
 {
   "name": "antony-personal-stremio-addon",
-  "version": "6.0.0",
+  "version": "5.3.0",
   "private": true,
-  "description": "Personal Stremio recommendations learned jointly from Stremio hearts, likes and watched-without-rating negatives.",
+  "description": "Personal Stremio recommendations learned from Stremio likes/loves with TMDB Read Access Token authentication.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

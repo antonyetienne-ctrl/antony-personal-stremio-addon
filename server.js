@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "6.0.0";
+const ALGO_VERSION = "5.3.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -42,7 +42,7 @@ function buildManifest(config = DEFAULTS) {
     id: "com.antony.personalrecommendations",
     version: ALGO_VERSION,
     name: "🎯 Antony — Personal Recommendations",
-    description: "Recommendations learned jointly from Films + Séries: ❤️ = loved, 👍 = liked, and watched without a rating = negative evidence. Repeated negative patterns are learned as rejection families and anti-patterns; watched items remain excluded from results.",
+    description: "Recommendations learned primarily from Stremio 👍 and ❤️, with watched-without-rating used as cautious negative evidence with repetition confidence; watched items remain excluded from results.",
     resources: ["catalog", "meta"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
@@ -57,7 +57,7 @@ const cache = new Map();
 const UPSTASH_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
 const UPSTASH_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || "");
 const UPSTASH_ENABLED = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
-const PERSIST_PREFIX = "antony:v6:p:";
+const PERSIST_PREFIX = "antony:v5:p:";
 const PERSIST_CATALOG_TTL_SEC = 30 * 24 * 60 * 60;
 const PERSIST_STATE_TTL_SEC = 7 * 24 * 60 * 60;
 const PERSIST_TMDB_TTL_SEC = 90 * 24 * 60 * 60;
@@ -90,12 +90,13 @@ const CANDIDATE_DETAIL_CONCURRENCY = 10;
 const MIN_RECOMMENDATIONS_TARGET = 30;
 const POSITIVE_SEED_LIMIT = 80;
 const SEED_NEIGHBOR_PAGES = 1;
-const WATCHED_NEGATIVE_LIMIT = 300;
-const WATCHED_NEGATIVE_MAX_PENALTY = 0.58;
-const NEGATIVE_QUASI_EXCLUSION_THRESHOLD = 0.78;
-const NEGATIVE_HARD_RISK_THRESHOLD = 0.92;
+const WATCHED_NEGATIVE_LIMIT = 180;
+const WATCHED_NEGATIVE_MAX_PENALTY = 0.24;
 const EMBEDDING_BATCH = 50;
-const COLD_START_WAIT_MS = 12000;
+const COLD_START_WAIT_MS = 0;
+const BACKGROUND_DETAIL_CONCURRENCY = 4;
+const BACKGROUND_DISCOVERY_CONCURRENCY = 4;
+const BACKGROUND_SEED_CONCURRENCY = 4;
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
 let geminiCooldownUntil = 0;
 let geminiTail = Promise.resolve();
@@ -187,6 +188,8 @@ function cacheGet(key) {
   if (x.expires && Date.now() > x.expires) { cache.delete(key); return null; }
   return x.value;
 }
+
+async function yieldEventLoop() { await new Promise(resolve => setImmediate(resolve)); }
 
 async function jsonFetch(url, options = {}, timeoutMs = 12000, attempts = 3) {
   let lastError = null;
@@ -330,7 +333,7 @@ async function hydrateCatalogFromPersistent(token, type) {
   const local = getCatalogCached(token, type);
   if (local) return local;
   const record = await persistentGet(persistKey(`catalog:${type}`, token));
-  if (!record?.payload?.metas?.length) return null;
+  if (!record?.payload?.metas?.length || record.payload.metas.length < Math.min(MIN_RECOMMENDATIONS_TARGET, DEFAULTS.maxResults)) return null;
   catalogStore.set(catalogKey(token, type), record);
   return getCatalogCached(token, type);
 }
@@ -402,12 +405,16 @@ async function buildAndStoreCatalog(type, config, token, library) {
   const lockKey = `build:${token}:${type}`;
   if (typeBuildLocks.has(lockKey)) return typeBuildLocks.get(lockKey);
   const job = (async () => {
+    await yieldEventLoop();
     const profile = await buildProfile(config, library, type);
+    await yieldEventLoop();
     const fingerprint = profileFingerprint(profile);
     const existing = await hydrateCatalogFromPersistent(token, type);
     // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
     if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
+    await yieldEventLoop();
     const top30 = await buildTop50(type, config, profile);
+    await yieldEventLoop();
     if (top30.length < Math.min(MIN_RECOMMENDATIONS_TARGET, config.maxResults)) {
       console.warn(`Only ${top30.length} recommendations produced for ${type}; preserving previous catalog instead of storing a partial catalog.`);
       return existing?.payload || null;
@@ -463,6 +470,7 @@ async function mapLimit(items, limit, fn) {
       const i = next++;
       if (i >= items.length) return;
       try { out[i] = await fn(items[i], i); } catch { out[i] = null; }
+      await yieldEventLoop();
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
@@ -852,104 +860,6 @@ function watchedNegativeFeatureProfile(details) {
   if (total) for (const [f, v] of weights) weights.set(f, v / total);
   return weights;
 }
-
-function buildNegativeRejectionModel(positiveDetails, negativeDetails) {
-  const model = { weights:new Map(), pairWeights:new Map(), tripleWeights:new Map(), count:negativeDetails?.length||0, evidence:0 };
-  if (!negativeDetails?.length) return model;
-  const pos = new Map(), neg = new Map(), negCount = new Map();
-  for (const item of positiveDetails || []) {
-    const pw = item.rating === "heart" ? 3 : 1;
-    for (const f of new Set(featureMap(item.details).keys())) pos.set(f,(pos.get(f)||0)+pw);
-  }
-  for (const item of negativeDetails) {
-    for (const f of new Set(featureMap(item.details).keys())) { neg.set(f,(neg.get(f)||0)+1); negCount.set(f,(negCount.get(f)||0)+1); }
-  }
-  const n = negativeDetails.length, p = Math.max(1,(positiveDetails||[]).length);
-  const evidence = Math.min(1, Math.log1p(n)/Math.log1p(12));
-  model.evidence = evidence;
-  for (const f of new Set([...neg.keys(),...pos.keys()])) {
-    const nc=neg.get(f)||0, pc=pos.get(f)||0;
-    if (!nc) continue;
-    const nr=(nc+0.45)/(n+0.9), pr=(pc+0.75)/(p+1.5);
-    const specificity=Math.max(0,Math.log(nr/pr));
-    const support=Math.min(1,Math.log1p(nc)/Math.log1p(8));
-    const concentration=Math.min(1,nc/Math.max(1,n*0.45));
-    const w=Math.min(1, specificity/2.5) * (0.35+0.65*support) * (0.55+0.45*concentration);
-    if (w>=0.035) model.weights.set(f,w);
-  }
-  const keys=[...model.weights.keys()].sort((a,b)=>(model.weights.get(b)||0)-(model.weights.get(a)||0)).slice(0,70);
-  const collect = (items, map, size) => {
-    for (const item of items) {
-      const fs=[...new Set(featureMap(item.details).keys())].filter(f=>keys.includes(f));
-      for(let i=0;i<fs.length;i++) for(let j=i+1;j<fs.length;j++) {
-        const k=[fs[i],fs[j]].sort().join('||'); map.set(k,(map.get(k)||0)+1);
-      }
-    }
-  };
-  const negPairs=new Map(), negTriples=new Map();
-  collect(negativeDetails,negPairs,2);
-  for (const item of negativeDetails) {
-    const fs=[...new Set(featureMap(item.details).keys())].filter(f=>keys.includes(f)).slice(0,24);
-    for(let i=0;i<fs.length;i++) for(let j=i+1;j<fs.length;j++) for(let k=j+1;k<fs.length;k++) {
-      const key=[fs[i],fs[j],fs[k]].sort().join('||'); negTriples.set(key,(negTriples.get(key)||0)+1);
-    }
-  }
-  for (const [k,c] of negPairs) {
-    if(c<2) continue;
-    const [a,b]=k.split('||');
-    const wa=model.weights.get(a)||0, wb=model.weights.get(b)||0;
-    const support=Math.min(1,Math.log1p(c)/Math.log1p(6));
-    model.pairWeights.set(k,Math.min(1.25,Math.sqrt(wa*wb)*1.8)*support);
-  }
-  for (const [k,c] of negTriples) {
-    if(c<2) continue;
-    const [a,b,d]=k.split('||');
-    const wa=model.weights.get(a)||0, wb=model.weights.get(b)||0, wd=model.weights.get(d)||0;
-    if(Math.min(wa,wb,wd)<=0) continue;
-    const support=Math.min(1,Math.log1p(c)/Math.log1p(5));
-    model.tripleWeights.set(k,Math.min(1.4,Math.cbrt(wa*wb*wd)*2.6)*support);
-  }
-  return model;
-}
-function negativeRejectionRisk(candidate, model) {
-  if (!model?.weights?.size) return 0;
-  const fs=new Set(featureMap(candidate).keys());
-  let mass=0, hit=0;
-  for(const [f,w] of model.weights){ mass+=w; if(fs.has(f)) hit+=w; }
-  const base=mass?hit/mass:0;
-  let pair=0, pairMass=0;
-  for(const [k,w] of model.pairWeights||[]){
-    pairMass+=w;
-    const [a,b]=k.split('||'); if(fs.has(a)&&fs.has(b)) pair+=w;
-  }
-  let triple=0, tripleMass=0;
-  for(const [k,w] of model.tripleWeights||[]){
-    tripleMass+=w;
-    const [a,b,c]=k.split('||'); if(fs.has(a)&&fs.has(b)&&fs.has(c)) triple+=w;
-  }
-  const pairRisk=pairMass?pair/pairMass:0, tripleRisk=tripleMass?triple/tripleMass:0;
-  const evidence=model.evidence||0;
-  return Math.max(0,Math.min(1, evidence*(0.50*base+0.32*pairRisk+0.18*tripleRisk)));
-}
-function negativeSemanticRisk(candidateVector, negativeVectors, model) {
-  if (!candidateVector || !negativeVectors?.length) return 0;
-  const sims=negativeVectors.map(v=>Math.max(0,cosine(candidateVector,v))).sort((a,b)=>b-a);
-  const top=sims.slice(0,Math.min(10,sims.length));
-  if(!top.length) return 0;
-  const avg=top.reduce((a,b)=>a+b,0)/top.length;
-  const evidence=model?.evidence||Math.min(1,Math.log1p(negativeVectors.length)/Math.log1p(12));
-  return Math.min(1,evidence*(0.55*top[0]+0.45*avg));
-}
-function combinedNegativeRisk(candidate, candidateVector, profile, global) {
-  const local=negativeRejectionRisk(candidate,profile?.negativeModel);
-  const globalRisk=negativeRejectionRisk(candidate,global?.negativeModel);
-  const localSem=negativeSemanticRisk(candidateVector,profile?.negativeVectors,profile?.negativeModel);
-  const globalSem=negativeSemanticRisk(candidateVector,global?.negativeVectors,global?.negativeModel);
-  const structural=0.62*local+0.38*globalRisk;
-  const semantic=0.62*localSem+0.38*globalSem;
-  return Math.min(1,0.58*structural+0.42*semantic);
-}
-
 function chooseDiverseWatchedSeeds(items, count) {
   if (items.length <= count) return items;
   const ordered = items.slice().sort((a, b) => stableSeed(a.id || a.details?.id) - stableSeed(b.id || b.details?.id));
@@ -1011,11 +921,10 @@ async function buildUnifiedProfile(config, libraryItems) {
   }
 
   const details = await enrich(positives);
-  const negativeSeeds = watchedUnrated.slice(0, Math.min(WATCHED_NEGATIVE_LIMIT, watchedUnrated.length));
+  const negativeSeeds = chooseDiverseWatchedSeeds(watchedUnrated, Math.min(WATCHED_NEGATIVE_LIMIT, watchedUnrated.length));
   const negativeDetails = await enrich(negativeSeeds);
 
   const globalModel = buildPreferenceModel(details, negativeDetails);
-  const globalNegativeModel = buildNegativeRejectionModel(details, negativeDetails);
   const globalGenreAffinity = buildGenreAffinity(details, negativeDetails);
   let globalVectors = null, negativeVectors = null;
   if (geminiAvailable(config.geminiApiKey) && details.length) globalVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x=>textOf(x.details)), "positive");
@@ -1032,7 +941,6 @@ async function buildUnifiedProfile(config, libraryItems) {
     const localModel = buildPreferenceModel(pos, neg);
     const localGenre = buildGenreAffinity(pos, neg);
     const featureProfile = mergePreferenceModels(globalModel, localModel, 0.62, 0.38);
-    const negativeModel = buildNegativeRejectionModel(pos, neg);
     const genreAffinity = mergeAffinityMaps(globalGenreAffinity, localGenre, 0.62, 0.38);
     const localClusters = buildTasteClusters(pv, pos);
     const watched = watchedByType[type];
@@ -1042,7 +950,6 @@ async function buildUnifiedProfile(config, libraryItems) {
       watchedUnrated: neg,
       featureProfile,
       negativeFeatureProfile: buildNegativeFeatureProfile(neg),
-      negativeModel,
       preferenceModel: featureProfile,
       positiveVectors: pv,
       negativeVectors: nv,
@@ -1060,7 +967,6 @@ async function buildUnifiedProfile(config, libraryItems) {
         clusters: globalClusters,
         genreAffinity: globalGenreAffinity,
         negativeFeatureProfile: buildNegativeFeatureProfile(negativeDetails),
-        negativeModel: globalNegativeModel,
         positiveCount: details.length
       }
     };
@@ -1143,7 +1049,7 @@ async function discoverCandidates(type,config,profile){
   const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));const candidates=new Map();const addResults=arr=>{for(const x of arr||[])if(x?.id)candidates.set(`${type}:${x.id}`,x);};const media=type==='movie'?'movie':'tv';
   const seeds=chooseDiversePositiveSeeds(profile.positives,Math.min(POSITIVE_SEED_LIMIT,profile.positives.length));
   const seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];const base=`${media}/${id}`,jobs=[];for(let page=1;page<=SEED_NEIGHBOR_PAGES;page++){jobs.push({endpoint:`${base}/recommendations`,params:{language:'en-US',page}},{endpoint:`${base}/similar`,params:{language:'en-US',page}});}return jobs;});
-  const seedResults=await mapLimit(seedJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of seedResults)addResults(data?.results);
+  const seedResults=await mapLimit(seedJobs,BACKGROUND_SEED_CONCURRENCY,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of seedResults)addResults(data?.results);
   const genreScore=new Map(),keywordScore=new Map(),negGenre=new Map(),negKeyword=new Map();
   const addDiscovery=(items,mG,mK,scale=1)=>{for(const x of items||[]){const w=(x.rating==='heart'?3:1)*scale;for(const g of x.details.genres||[])mG.set(g.id,(mG.get(g.id)||0)+w);for(const k of x.details.keywords?.keywords||[])mK.set(k.id,(mK.get(k.id)||0)+w);}};
   addDiscovery(profile.global?.positives,genreScore,keywordScore,0.62);
@@ -1160,7 +1066,7 @@ async function discoverCandidates(type,config,profile){
   for(const g of genres.slice(0,10))for(const k of keywords.slice(0,12))strategies.push({with_genres:String(g),with_keywords:String(k),label:`gk:${g}:${k}`});
   for(const item of seeds.slice(0,24)){const gs=(item.details.genres||[]).map(x=>x.id).slice(0,2),ks=(item.details.keywords?.keywords||[]).map(x=>x.id).slice(0,3);for(const g of gs)for(const k of ks)strategies.push({with_genres:String(g),with_keywords:String(k),label:`seedgk:${g}:${k}`});}
   const dedup=new Map();for(const x of strategies)dedup.set(x.label,x);const strategyList=[...dedup.values()].slice(0,CANDIDATE_DISCOVERY_STRATEGIES);
-  const sortModes=['vote_average.desc'];
+  const sortModes=['vote_average.desc','vote_count.desc'];
   const pageJobs=[];
   for(const strategy of strategyList) for(const sort_by of sortModes) for(const page of [1,2]) {
     const params={language:'en-US',include_adult:false,page,sort_by,...strategy}; delete params.label;
@@ -1169,13 +1075,13 @@ async function discoverCandidates(type,config,profile){
     else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
     pageJobs.push({endpoint:type==='movie'?'discover/movie':'discover/tv',params});
   }
-  const discovered=await mapLimit(pageJobs,8,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
+  const discovered=await mapLimit(pageJobs,BACKGROUND_DISCOVERY_CONCURRENCY,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
   for(const data of discovered)addResults(data?.results);
 
   // A broad fallback is intentional: the personalized model decides what is
   // good later. This prevents a narrow TMDB strategy from starving the movie
   // pool and producing only a couple of usable titles.
-  const fallbackJobs=[1,2].flatMap(page=>sortModes.map(sort_by=>{
+  const fallbackJobs=[1,2,3].flatMap(page=>sortModes.map(sort_by=>{
     const params={language:'en-US',include_adult:false,page,sort_by,vote_count_gte:config.tmdbMinVotes,vote_average_gte:config.tmdbMinRating,vote_average_lte:config.tmdbMaxRating};
     if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
     else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
@@ -1213,14 +1119,11 @@ async function discoverCandidates(type,config,profile){
   const eligible=[];
   for(let start=0; start<limited.length && start< CANDIDATE_DETAILS_LIMIT; start+=CANDIDATE_DETAIL_BATCH){
     const batch=limited.slice(start,start+CANDIDATE_DETAIL_BATCH);
-    const rows=await mapLimit(batch,CANDIDATE_DETAIL_CONCURRENCY,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null));
+    const rows=await mapLimit(batch,BACKGROUND_DETAIL_CONCURRENCY,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null));
     for(const d of rows){
       if(!d) continue;
       detailed.push(d);
-      if(hardFilter(d,type,config,profile.watched,excludedGenres)) {
-        const preRisk=combinedNegativeRisk(d,null,profile,profile.global||profile);
-        if(preRisk < NEGATIVE_QUASI_EXCLUSION_THRESHOLD) eligible.push(d);
-      }
+      if(hardFilter(d,type,config,profile.watched,excludedGenres)) eligible.push(d);
     }
     // Once we have a healthy pool, stop making expensive detail requests.
     if(eligible.length>=Math.max(MIN_RECOMMENDATIONS_TARGET*6,180)) break;
@@ -1251,16 +1154,28 @@ async function buildTop50(type,config,profile){
     const globalLex=lexicalSimilarity(d,global.positives);
     const lexical=0.45*globalLex+0.55*lex;
     const clusterFit=vec&&global.clusters?.length?Math.max(...global.clusters.map(c=>Math.max(0,cosine(vec,c.vector))*c.weight)):0;
-    const negativeRisk=combinedNegativeRisk(d,vec,profile,global);
-    // A repeated rejection family is not just a small discount: once confidence
-    // is high, candidates matching it are treated as near-exclusions. This is
-    // learned separately from the positive model, so generic positive traits
-    // such as action/adventure cannot wash out a strong rejection pattern.
-    if (negativeRisk >= NEGATIVE_HARD_RISK_THRESHOLD) return null;
-    const positiveTaste=0.46*sem+0.22*feat+0.16*Math.max(0,discriminative)+0.10*clusterFit+0.06*lexical;
+    const negativeLocal=vec&&profile.negativeVectors?.length?watchedNegativeSimilarity(vec,profile.negativeVectors):0;
+    const negativeGlobal=vec&&global.negativeVectors?.length?watchedNegativeSimilarity(vec,global.negativeVectors):0;
+    const negativeSemantic=0.40*negativeGlobal+0.60*negativeLocal;
+    const candidateFeatures = new Set(featureMap(d).keys());
+    let explicitNegativeFeature = 0;
+    let negativeFeatureMass = 0;
+    for (const [f,w] of profile.negativeFeatureProfile || []) {
+      negativeFeatureMass += w;
+      if (candidateFeatures.has(f)) explicitNegativeFeature += w;
+    }
+    const globalNegativeProfile = global.negativeFeatureProfile || new Map();
+    for (const [f,w] of globalNegativeProfile) {
+      negativeFeatureMass += 0.62 * w;
+      if (candidateFeatures.has(f)) explicitNegativeFeature += 0.62 * w;
+    }
+    const negativeFeature = negativeFeatureMass ? Math.min(1, explicitNegativeFeature / negativeFeatureMass) : 0;
+    const negCount=(profile.watchedUnrated?.length||0)+(global.watchedUnrated?.length||0);
+    const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(36));
+    const watchedPenalty=WATCHED_NEGATIVE_MAX_PENALTY*negativeStrength*(0.45*negativeSemantic+0.55*negativeFeature);
+    const positiveTaste=0.43*sem+0.23*feat+0.18*Math.max(0,discriminative)+0.10*clusterFit+0.06*lexical;
     const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lexical].filter(x=>x>=0.25).length/5);
-    const rejectionPenalty=WATCHED_NEGATIVE_MAX_PENALTY*Math.pow(negativeRisk,1.15);
-    const tasteScore=Math.max(0,Math.min(1,positiveTaste+0.06*convergence-rejectionPenalty));
+    const tasteScore=Math.max(0,Math.min(1,positiveTaste+0.08*convergence-watchedPenalty));
     const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
     const votes=Math.max(0,Number(d.vote_count)||0);
     const voteReliability=Math.min(1,Math.log10(1+votes)/5);
@@ -1354,6 +1269,8 @@ async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
   const cached = await hydrateCatalogFromPersistent(token, type);
   if (cached) {
+    // Never wait for a rebuild from the HTTP request. The last complete
+    // catalog is the response; refresh is strictly background work.
     if (cached.stale) scheduleRefresh(token, config, "stale-catalog");
     else {
       const state = stateStore.get(stateKey(token));
@@ -1370,9 +1287,6 @@ async function discover(type, config, token) {
       stateStore.set(stateKey(token), state);
     } catch (e) {
       console.warn(`Cold-start Stremio sync failed for ${type}: ${e.message}`);
-      // No personalized state yet: return a small valid TMDB bootstrap instead
-      // of ever returning { metas: [] }. The full personalized build continues
-      // only when the account state becomes available.
       try { return await buildBootstrapCatalog(type, config, token); }
       catch (bootError) {
         console.warn(`Bootstrap catalog failed for ${type}: ${bootError.message}`);
@@ -1390,26 +1304,11 @@ async function discover(type, config, token) {
     REFRESH_LOCK.set(lockKey, job);
     job.finally(() => REFRESH_LOCK.delete(lockKey));
   }
-  const job = REFRESH_LOCK.get(lockKey);
-  if (job) await Promise.race([job.catch(() => null), new Promise(r => setTimeout(r, COLD_START_WAIT_MS))]);
 
-  const ready = getCatalogCached(token, type);
-  if (ready?.payload?.metas?.length) {
-    const other = type === "movie" ? "series" : "movie";
-    if (!getCatalogCached(token, other)) {
-      setImmediate(() => buildAndStoreCatalog(other, config, token, state.library).catch(e => console.warn(`Background ${other} build failed: ${e.message}`)));
-    }
-    return ready.payload;
-  }
-
-  // The personalized build may legitimately still be running. Give Stremio a
-  // valid temporary catalog rather than an empty response; it is never cached
-  // by HTTP and therefore cannot poison the client for five minutes.
-  try {
-    const bootstrap = await buildBootstrapCatalog(type, config, token);
-    console.warn(`Catalog ${type} still warming; serving temporary bootstrap (${bootstrap.metas?.length || 0} items).`);
-    return bootstrap;
-  } catch (e) {
+  // First-ever install only: there is no last-known-good personalized catalog.
+  // Return a temporary bootstrap immediately; never wait 12 seconds on Stremio.
+  try { return await buildBootstrapCatalog(type, config, token); }
+  catch (e) {
     console.warn(`Temporary bootstrap failed for ${type}: ${e.message}`);
     return { metas: [] };
   }
@@ -1480,7 +1379,7 @@ function configurePage(config = DEFAULTS, action = "/config/save") {
   const escAttr = v => esc(v).replace(/`/g, "&#96;");
   const checked = k => config[k] ? "checked" : "";
   const selected = k => config.displayOrder === k ? "selected" : "";
-  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris ensemble à partir de tes ❤️, 👍 et de tous les contenus vus sans notation (négatifs).</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Films : durée minimale (minutes)</label><input name="runtimeMinMovie" type="number" min="0" value="${config.runtimeMinMovie}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement. La durée minimale ci-dessus concerne uniquement les films.</p></section><section><h2>Affichage des catalogues</h2><p class="muted">Stremio ne permet pas à un addon de séparer indépendamment Board (catalogue) et Discover (découverte) pour un même catalogue : un catalogue standard apparaît dans les deux. Ces cases activent ou désactivent donc chaque catalogue.</p><label class="check"><input name="movieCatalogEnabled" type="checkbox" ${checked("movieCatalogEnabled")}> Films — afficher le catalogue</label><label class="check"><input name="seriesCatalogEnabled" type="checkbox" ${checked("seriesCatalogEnabled")}> Séries — afficher le catalogue</label></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ = adoré / recommandé / potentiellement revu. 👍 = aimé mais généralement suffisant en un visionnage. Vu sans 👍/❤️ = négatif, de « bof » à « vraiment pas aimé ». Les motifs négatifs répétés forment des familles de rejet et peuvent quasi-exclure les candidats correspondants.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Films : durée minimale (minutes)</label><input name="runtimeMinMovie" type="number" min="0" value="${config.runtimeMinMovie}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement. La durée minimale ci-dessus concerne uniquement les films.</p></section><section><h2>Affichage des catalogues</h2><p class="muted">Stremio ne permet pas à un addon de séparer indépendamment Board (catalogue) et Discover (découverte) pour un même catalogue : un catalogue standard apparaît dans les deux. Ces cases activent ou désactivent donc chaque catalogue.</p><label class="check"><input name="movieCatalogEnabled" type="checkbox" ${checked("movieCatalogEnabled")}> Films — afficher le catalogue</label><label class="check"><input name="seriesCatalogEnabled" type="checkbox" ${checked("seriesCatalogEnabled")}> Séries — afficher le catalogue</label></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Un contenu vu sans 👍/❤️ produit un signal négatif prudent : un seul oubli pèse presque rien, mais un motif répété sur plusieurs contenus similaires pèse davantage. Cela ne devient jamais une exclusion.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
 }
 
 async function saveConfig(req, res, previousToken = "") {
