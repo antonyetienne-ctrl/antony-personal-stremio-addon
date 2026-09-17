@@ -59,5 +59,5 @@ A third-party Stremio addon cannot simply request "all of TMDB with every metada
 - `/configure` redirects to the most recently used personal configuration when the server knows it.
 
 
-## v3.0.0
+## v4.0.0
 Candidate generation was substantially expanded: many more positive seeds, multi-page TMDB recommendations/similar, contrastive genre/keyword discovery, pair/triple preference interactions, stronger watched-unrated contrast, and negative-state-aware catalog fingerprints.
