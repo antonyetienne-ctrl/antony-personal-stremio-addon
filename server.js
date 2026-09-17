@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "4.1.0";
+const ALGO_VERSION = "5.0.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -53,7 +53,7 @@ const cache = new Map();
 const UPSTASH_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
 const UPSTASH_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || "");
 const UPSTASH_ENABLED = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
-const PERSIST_PREFIX = "antony:v4:p:";
+const PERSIST_PREFIX = "antony:v5:p:";
 const PERSIST_CATALOG_TTL_SEC = 30 * 24 * 60 * 60;
 const PERSIST_STATE_TTL_SEC = 7 * 24 * 60 * 60;
 const PERSIST_TMDB_TTL_SEC = 90 * 24 * 60 * 60;
@@ -890,79 +890,138 @@ function chooseDiverseWatchedSeeds(items, count) {
   return selected;
 }
 
-async function buildProfile(config, libraryItems, type) {
+async function buildUnifiedProfile(config, libraryItems) {
   const libraryFingerprint = crypto.createHash("sha256").update(libraryItems.map(x => JSON.stringify({ id:x?._id||x?.id, m:x?._mtime, s:x?.state })).sort().join("|")).digest("hex").slice(0, 24);
-  const profileKey = `profile:${ALGO_VERSION}:${type}:${libraryFingerprint}:${config.useLikes}:${config.useHearts}:${config.geminiApiKey ? crypto.createHash("sha256").update(config.geminiApiKey).digest("hex").slice(0, 8) : "nogemini"}`;
-  const cachedProfile = cacheGet(profileKey);
-  if (cachedProfile) return cachedProfile;
-  const watched = new Set();
-  const positives = [];
-  const watchedUnrated = [];
-  const relevant = libraryItems.filter(x => itemType(x) === type);
+  const key = `unified-profile:${ALGO_VERSION}:${libraryFingerprint}:${config.useLikes}:${config.useHearts}:${config.geminiApiKey ? crypto.createHash("sha256").update(config.geminiApiKey).digest("hex").slice(0, 8) : "nogemini"}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
 
+  const relevant = libraryItems.filter(x => itemType(x) === "movie" || itemType(x) === "series");
+  const watchedByType = { movie:new Set(), series:new Set() };
+  const positives = [], watchedUnrated = [];
   for (const item of relevant) {
-    const id = extractImdb(item); if (!id) continue;
-    if (config.useWatchedExclusion && isWatched(item)) { watched.add(id); watched.add(id.toLowerCase()); }
+    const type = itemType(item), id = extractImdb(item);
+    if (!type || !id) continue;
+    if (config.useWatchedExclusion && isWatched(item)) {
+      watchedByType[type].add(id); watchedByType[type].add(id.toLowerCase());
+    }
   }
 
-  // Complete library scan for explicit 👍/❤️. A watched item with no rating is
-  // NOT treated as a real negative label; it is only a weak "maybe not a love"
-  // signal, because the user may simply have forgotten to rate it.
-  const rated = await mapLimit(relevant, 16, async item => {
-    const id = extractImdb(item); if (!id) return null;
+  // One complete rating scan feeds both movie and series profiles. This removes
+  // the duplicate per-item status requests that existed when the two models
+  // were built independently.
+  const rated = await mapLimit(relevant, 20, async item => {
+    const type = itemType(item), id = extractImdb(item); if (!type || !id) return null;
     const rating = await getStremioRating(config.stremioAuthKey, id, type);
     if ((rating === "heart" && config.useHearts) || (rating === "like" && config.useLikes)) return { id, rating, type };
-    if (rating === "none" && isWatched(item)) return { id, rating: "watched_unrated", type };
+    if (rating === "none" && isWatched(item)) return { id, rating:"watched_unrated", type };
     return null;
   });
   for (const x of rated) {
     if (!x) continue;
-    if (x.rating === "watched_unrated") watchedUnrated.push(x); else positives.push(x);
+    (x.rating === "watched_unrated" ? watchedUnrated : positives).push(x);
   }
 
-  const details = (await mapLimit(positives, 16, async p => {
-    const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source:"imdb_id", language:"en-US" }, config.tmdbAccessToken);
-    const d = type === "movie" ? found.movie_results?.[0] : found.tv_results?.[0];
-    if (!d) return null;
-    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language:"en-US", append_to_response:"keywords,external_ids,credits" }, config.tmdbAccessToken);
-    return { details:full, rating:p.rating, id:p.id };
-  })).filter(Boolean);
+  async function enrich(rows) {
+    return (await mapLimit(rows, 20, async p => {
+      const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source:"imdb_id", language:"en-US" }, config.tmdbAccessToken);
+      const d = p.type === "movie" ? found.movie_results?.[0] : found.tv_results?.[0];
+      if (!d) return null;
+      const full = await tmdb(`${p.type === "series" ? "tv" : "movie"}/${d.id}`, { language:"en-US", append_to_response:"keywords,external_ids,credits" }, config.tmdbAccessToken);
+      return { details:full, rating:p.rating, id:p.id, type:p.type };
+    })).filter(Boolean);
+  }
 
-  // Weak negative/neutral evidence: only a bounded, diversified sample of
-  // watched-but-unrated items is enriched. This keeps it cheap and prevents a
-  // forgotten watch from overpowering explicit likes/loves.
+  const details = await enrich(positives);
   const negativeSeeds = chooseDiverseWatchedSeeds(watchedUnrated, Math.min(WATCHED_NEGATIVE_LIMIT, watchedUnrated.length));
-  const negativeDetails = (await mapLimit(negativeSeeds, 12, async p => {
-    const found = await tmdb(`find/${encodeURIComponent(p.id)}`, { external_source:"imdb_id", language:"en-US" }, config.tmdbAccessToken);
-    const d = type === "movie" ? found.movie_results?.[0] : found.tv_results?.[0];
-    if (!d) return null;
-    const full = await tmdb(`${type === "series" ? "tv" : "movie"}/${d.id}`, { language:"en-US", append_to_response:"keywords,external_ids,credits" }, config.tmdbAccessToken);
-    return { details:full, rating:"watched_unrated", id:p.id };
-  })).filter(Boolean);
+  const negativeDetails = await enrich(negativeSeeds);
 
-  const preferenceModel = buildPreferenceModel(details, negativeDetails);
-  const genrePositive = new Map();
-  const genreNegative = new Map();
-  for (const x of details) for (const g of x.details.genres || []) genrePositive.set(g.id, (genrePositive.get(g.id) || 0) + (x.rating === "heart" ? 3 : 1));
-  for (const x of negativeDetails) for (const g of x.details.genres || []) genreNegative.set(g.id, (genreNegative.get(g.id) || 0) + 1);
-  const genreAffinity = new Map();
-  for (const [id, pos] of genrePositive) {
-    const neg = genreNegative.get(id) || 0;
-    const lift = Math.log(((pos + 0.7) / (Math.max(1, details.length) + 1.4)) / ((neg + 0.7) / (Math.max(1, negativeDetails.length) + 1.4)));
-    genreAffinity.set(id, Math.max(-1, Math.min(1, lift)));
-  }
-  const featureProfile = preferenceModel;
-  const negativeFeatureProfile = preferenceModel;
-  let positiveVectors = null;
-  let negativeVectors = null;
-  if (geminiAvailable(config.geminiApiKey) && details.length) positiveVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x=>textOf(x.details)), "positive");
+  const globalModel = buildPreferenceModel(details, negativeDetails);
+  const globalGenreAffinity = buildGenreAffinity(details, negativeDetails);
+  let globalVectors = null, negativeVectors = null;
+  if (geminiAvailable(config.geminiApiKey) && details.length) globalVectors = await cachedEmbeddings(config.geminiApiKey, details.map(x=>textOf(x.details)), "positive");
   if (geminiAvailable(config.geminiApiKey) && negativeDetails.length) negativeVectors = await cachedEmbeddings(config.geminiApiKey, negativeDetails.map(x=>textOf(x.details)), "negative");
-  const clusters = buildTasteClusters(positiveVectors, details);
-  const seeds = chooseDiversePositiveSeeds(details, Math.min(40, details.length));
-  const profile = { watched, positives:details, watchedUnrated:negativeDetails, featureProfile, negativeFeatureProfile, preferenceModel, positiveVectors, negativeVectors, clusters, seeds, genreAffinity, positiveCount:positives.length };
-  console.log(`Profile ${type}: library=${relevant.length} positive=${positives.length} watchedUnrated=${negativeDetails.length} watched=${watched.size} gemini=${Boolean(positiveVectors?.length)}`);
-  cacheSet(profileKey, profile, PROFILE_CACHE_TTL_MS);
-  return profile;
+  const globalClusters = buildTasteClusters(globalVectors, details);
+
+  const byType = {};
+  for (const type of ["movie","series"]) {
+    const pos = details.filter(x=>x.type===type), neg = negativeDetails.filter(x=>x.type===type);
+    const posIndexes = details.map((x,i)=>x.type===type?i:-1).filter(i=>i>=0);
+    const negIndexes = negativeDetails.map((x,i)=>x.type===type?i:-1).filter(i=>i>=0);
+    const pv = globalVectors ? posIndexes.map(i=>globalVectors[i]).filter(Boolean) : null;
+    const nv = negativeVectors ? negIndexes.map(i=>negativeVectors[i]).filter(Boolean) : null;
+    const localModel = buildPreferenceModel(pos, neg);
+    const localGenre = buildGenreAffinity(pos, neg);
+    const featureProfile = mergePreferenceModels(globalModel, localModel, 0.62, 0.38);
+    const genreAffinity = mergeAffinityMaps(globalGenreAffinity, localGenre, 0.62, 0.38);
+    const localClusters = buildTasteClusters(pv, pos);
+    const watched = watchedByType[type];
+    const profile = {
+      watched,
+      positives: pos,
+      watchedUnrated: neg,
+      featureProfile,
+      negativeFeatureProfile: featureProfile,
+      preferenceModel: featureProfile,
+      positiveVectors: pv,
+      negativeVectors: nv,
+      clusters: localClusters,
+      seeds: chooseDiversePositiveSeeds(pos, Math.min(40, pos.length)),
+      genreAffinity,
+      positiveCount: pos.length,
+      global: {
+        positives: details,
+        watchedUnrated: negativeDetails,
+        preferenceModel: globalModel,
+        featureProfile: globalModel,
+        positiveVectors: globalVectors,
+        negativeVectors,
+        clusters: globalClusters,
+        genreAffinity: globalGenreAffinity,
+        positiveCount: details.length
+      }
+    };
+    byType[type] = profile;
+  }
+  console.log(`Unified profile: library=${relevant.length} positive=${details.length} watchedUnrated=${negativeDetails.length} movie=${byType.movie.positiveCount} series=${byType.series.positiveCount} gemini=${Boolean(globalVectors?.length)}`);
+  const out = { libraryFingerprint, byType };
+  cacheSet(key, out, PROFILE_CACHE_TTL_MS);
+  return out;
+}
+
+function buildGenreAffinity(positiveDetails, negativeDetails) {
+  const pos = new Map(), neg = new Map();
+  for (const x of positiveDetails) for (const g of x.details.genres || []) pos.set(g.id, (pos.get(g.id)||0) + (x.rating === "heart" ? 3 : 1));
+  for (const x of negativeDetails) for (const g of x.details.genres || []) neg.set(g.id, (neg.get(g.id)||0) + 1);
+  const out = new Map();
+  for (const id of new Set([...pos.keys(), ...neg.keys()])) {
+    const lift = Math.log(((pos.get(id)||0)+0.7)/(Math.max(1,positiveDetails.length)+1.4) / (((neg.get(id)||0)+0.7)/(Math.max(1,negativeDetails.length)+1.4)));
+    out.set(id, Math.max(-1, Math.min(1, lift)));
+  }
+  return out;
+}
+function mergeAffinityMaps(a,b,wa,wb) {
+  const out=new Map();
+  for(const k of new Set([...a.keys(),...b.keys()])) out.set(k,Math.max(-1,Math.min(1,wa*(a.get(k)||0)+wb*(b.get(k)||0))));
+  return out;
+}
+function mergePreferenceModels(globalModel, localModel, wg, wl) {
+  const weights=new Map(), pairWeights=new Map(), tripleWeights=new Map();
+  for(const f of new Set([...globalModel.weights.keys(),...localModel.weights.keys()])) {
+    const v=wg*(globalModel.weights.get(f)||0)+wl*(localModel.weights.get(f)||0); if(Math.abs(v)>=.035) weights.set(f,v);
+  }
+  for(const f of new Set([...globalModel.pairWeights.keys(),...localModel.pairWeights.keys()])) {
+    const v=wg*(globalModel.pairWeights.get(f)||0)+wl*(localModel.pairWeights.get(f)||0); if(Math.abs(v)>=.03) pairWeights.set(f,v);
+  }
+  for(const f of new Set([...globalModel.tripleWeights.keys(),...localModel.tripleWeights.keys()])) {
+    const v=wg*(globalModel.tripleWeights.get(f)||0)+wl*(localModel.tripleWeights.get(f)||0); if(Math.abs(v)>=.03) tripleWeights.set(f,v);
+  }
+  return {weights,pairWeights,tripleWeights,positiveCount:localModel.positiveCount,negativeCount:localModel.negativeCount};
+}
+
+async function buildProfile(config, libraryItems, type) {
+  const unified = await buildUnifiedProfile(config, libraryItems);
+  return unified.byType[type];
 }
 
 function stableSeed(text) {
@@ -984,11 +1043,15 @@ async function discoverCandidates(type,config,profile){
   const seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];const base=`${media}/${id}`,jobs=[];for(let page=1;page<=SEED_NEIGHBOR_PAGES;page++){jobs.push({endpoint:`${base}/recommendations`,params:{language:'en-US',page}},{endpoint:`${base}/similar`,params:{language:'en-US',page}});}return jobs;});
   const seedResults=await mapLimit(seedJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of seedResults)addResults(data?.results);
   const genreScore=new Map(),keywordScore=new Map(),negGenre=new Map(),negKeyword=new Map();
-  for(const x of profile.positives){const w=x.rating==='heart'?3:1;for(const g of x.details.genres||[])genreScore.set(g.id,(genreScore.get(g.id)||0)+w);for(const k of x.details.keywords?.keywords||[])keywordScore.set(k.id,(keywordScore.get(k.id)||0)+w);}
-  for(const x of profile.watchedUnrated||[]){for(const g of x.details.genres||[])negGenre.set(g.id,(negGenre.get(g.id)||0)+1);for(const k of x.details.keywords?.keywords||[])negKeyword.set(k.id,(negKeyword.get(k.id)||0)+1);}
+  const addDiscovery=(items,mG,mK,scale=1)=>{for(const x of items||[]){const w=(x.rating==='heart'?3:1)*scale;for(const g of x.details.genres||[])mG.set(g.id,(mG.get(g.id)||0)+w);for(const k of x.details.keywords?.keywords||[])mK.set(k.id,(mK.get(k.id)||0)+w);}};
+  addDiscovery(profile.global?.positives,genreScore,keywordScore,0.62);
+  addDiscovery(profile.positives,genreScore,keywordScore,0.38);
+  for(const x of profile.global?.watchedUnrated||[]){for(const g of x.details.genres||[])negGenre.set(g.id,(negGenre.get(g.id)||0)+1);for(const k of x.details.keywords?.keywords||[])negKeyword.set(k.id,(negKeyword.get(k.id)||0)+1);}
   const rank=(pos,neg,tp,tn)=>[...pos.entries()].map(([id,v])=>({id,score:Math.log(((v+.6)/(tp+1.2))/(((neg.get(id)||0)+.6)/(tn+1.2)))})).sort((a,b)=>b.score-a.score);
-  const genres=rank(genreScore,negGenre,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,14).map(x=>x.id);
-  const keywords=rank(keywordScore,negKeyword,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,32).map(x=>x.id);
+  const discoveryPositiveCount=Math.max(1,profile.global?.positiveCount||profile.positiveCount||0);
+  const discoveryNegativeCount=Math.max(1,profile.global?.watchedUnrated?.length||profile.watchedUnrated?.length||0);
+  const genres=rank(genreScore,negGenre,discoveryPositiveCount,discoveryNegativeCount).filter(x=>x.score>0).slice(0,14).map(x=>x.id);
+  const keywords=rank(keywordScore,negKeyword,discoveryPositiveCount,discoveryNegativeCount).filter(x=>x.score>0).slice(0,32).map(x=>x.id);
   const strategies=[];for(const g of genres)strategies.push({with_genres:String(g),label:`g:${g}`});for(const k of keywords)strategies.push({with_keywords:String(k),label:`k:${k}`});
   for(let i=0;i<genres.length;i++)for(let j=i+1;j<genres.length&&j<i+4;j++)strategies.push({with_genres:`${genres[i]},${genres[j]}`,label:`gg:${genres[i]}:${genres[j]}`});
   for(let i=0;i<keywords.length;i++)for(let j=i+1;j<keywords.length&&j<i+5;j++)strategies.push({with_keywords:`${keywords[i]},${keywords[j]}`,label:`kk:${keywords[i]}:${keywords[j]}`});
@@ -1055,11 +1118,49 @@ async function discoverCandidates(type,config,profile){
   return eligible;
 }
 
-async function buildTop50(type,config,profile){if(!profile.positiveCount)return[];const filtered=await discoverCandidates(type,config,profile);if(!filtered.length)return[];let candidateVectors=null;if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length)candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);const scored=filtered.map((d,i)=>{const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;const feat=featureSimilarity(d,profile.featureProfile);const discriminative=preferenceFeatureScore(d,profile.preferenceModel);const lex=lexicalSimilarity(d,profile.positives);const clusterFit=candidateVectors?.[i]&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)):0;const negativeSemantic=candidateVectors?.[i]?watchedNegativeSimilarity(candidateVectors[i],profile.negativeVectors):0;const negativeFeature=Math.max(0,-discriminative);const negCount=profile.watchedUnrated?.length||0;const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);const positiveTaste=.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex;const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(x=>x>=.25).length/5);const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;const votes=Math.max(0,Number(d.vote_count)||0);const voteReliability=Math.min(1,Math.log10(1+votes)/5);const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:candidateVectors?.[i]||null};}).filter(x=>x.imdbId);scored.sort((a,b)=>b.personalScore-a.personalScore);// The user explicitly wants the actual best 30, without genre quotas or a
-// diversity tax. Diversity is already learned through multiple taste poles;
-// it must not displace a stronger personalized match merely to make the list
-// look varied.
-const top=scored.slice(0,Math.min(30,config.maxResults));console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);return top;}
+async function buildTop50(type,config,profile){
+  if(!profile.positiveCount && !profile.global?.positiveCount)return[];
+  const filtered=await discoverCandidates(type,config,profile);
+  if(!filtered.length)return[];
+  const global=profile.global || profile;
+  let candidateVectors=null;
+  if(geminiAvailable(config.geminiApiKey) && global.positiveVectors?.length)
+    candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}`).catch(()=>null);
+
+  const scored=filtered.map((d,i)=>{
+    const vec=candidateVectors?.[i]||null;
+    const localSem=vec&&profile.positiveVectors?.length?semanticScore(vec,profile.positiveVectors,profile.positives,profile.clusters):0;
+    const globalSem=vec&&global.positiveVectors?.length?semanticScore(vec,global.positiveVectors,global.positives,global.clusters):0;
+    const sem=0.38*globalSem+0.62*localSem;
+    const localDisc=preferenceFeatureScore(d,profile.preferenceModel);
+    const globalDisc=preferenceFeatureScore(d,global.preferenceModel);
+    const discriminative=Math.max(-1,Math.min(1,0.42*globalDisc+0.58*localDisc));
+    const feat=(discriminative+1)/2;
+    const lex=lexicalSimilarity(d,profile.positives);
+    const globalLex=lexicalSimilarity(d,global.positives);
+    const lexical=0.45*globalLex+0.55*lex;
+    const clusterFit=vec&&global.clusters?.length?Math.max(...global.clusters.map(c=>Math.max(0,cosine(vec,c.vector))*c.weight)):0;
+    const negativeLocal=vec&&profile.negativeVectors?.length?watchedNegativeSimilarity(vec,profile.negativeVectors):0;
+    const negativeGlobal=vec&&global.negativeVectors?.length?watchedNegativeSimilarity(vec,global.negativeVectors):0;
+    const negativeSemantic=0.40*negativeGlobal+0.60*negativeLocal;
+    const negativeFeature=Math.max(0,-discriminative);
+    const negCount=(profile.watchedUnrated?.length||0)+(global.watchedUnrated?.length||0);
+    const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(36));
+    const watchedPenalty=0.30*negativeStrength*(0.60*negativeSemantic+0.40*negativeFeature);
+    const positiveTaste=0.43*sem+0.23*feat+0.18*Math.max(0,discriminative)+0.10*clusterFit+0.06*lexical;
+    const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lexical].filter(x=>x>=0.25).length/5);
+    const tasteScore=Math.max(0,Math.min(1,positiveTaste+0.08*convergence-watchedPenalty));
+    const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
+    const votes=Math.max(0,Number(d.vote_count)||0);
+    const voteReliability=Math.min(1,Math.log10(1+votes)/5);
+    const personalScore=0.92*tasteScore+0.05*rating+0.03*voteReliability;
+    return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:vec};
+  }).filter(x=>x.imdbId);
+  scored.sort((a,b)=>b.personalScore-a.personalScore);
+  const top=scored.slice(0,Math.min(30,config.maxResults));
+  console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length} globalTaste=true`);
+  return top;
+}
 
 function serializeAndShuffle(top50, type, config = DEFAULTS) {
   const ordered = top50.slice();

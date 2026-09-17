@@ -1,8 +1,8 @@
-# 🎯 Antony — Personal Stremio Recommendations v4.1.0
+# 🎯 Antony — Personal Stremio Recommendations v5.0.0
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 👍/❤️ signals.
 
-## v4.1.0 — quality + persistent cache + robust refresh
+## v5.0.0 — quality + persistent cache + robust refresh
 
 - Keeps the learned multi-signal recommendation model: ❤️ = 3× 👍.
 - Watched-without-rating is cautious negative evidence with repetition confidence; watched titles remain excluded.
@@ -58,3 +58,12 @@ Render addon
           ├── reusable TMDB responses
           └── reusable semantic embeddings
 ```
+
+
+## v5.0.0 — Unified Taste Model
+- One unified preference model learns from films and series together.
+- Separate movie/series models remain active for format-specific preferences.
+- Global and local semantic embeddings, feature interactions, clusters, and cautious negative evidence are combined at ranking time.
+- The library rating scan is shared across both catalogs to avoid duplicate Stremio status requests.
+- Public-derived embeddings remain persistently cached in Upstash; private library/rating state is not persisted there.
+- Final selection remains the true top 30 by personalized score; no artificial diversity quota or popularity ranking.
