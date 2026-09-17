@@ -1,38 +1,39 @@
-# 🎯 Antony — Personal Stremio Recommendations v4.0.3
+# 🎯 Antony — Personal Stremio Recommendations v4.1.0
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 👍/❤️ signals.
 
-## v4.0.3 — persistent cache + reliable refresh
+## v4.1.0 — quality + persistent cache + robust refresh
 
-- Keeps the v3 recommendation model and learned taste logic.
-- Stores the **last valid Top 30 Films and last valid Top 30 Series** in Upstash Redis when the two `UPSTASH_REDIS_REST_*` environment variables are configured.
-- On Render restart, the previous catalogs can be restored immediately from Upstash while the new personalized calculation runs in the background.
-- TMDB responses already obtained by the addon are also cached persistently in Upstash for long-term reuse; eviction is enabled on the database so the cache can use the available capacity without making stale entries fatal.
-- The local Render RAM cache remains the fast L1 cache; Upstash is the persistent L2 cache.
+- Keeps the learned multi-signal recommendation model: ❤️ = 3× 👍.
+- Watched-without-rating is cautious negative evidence with repetition confidence; watched titles remain excluded.
+- Uses several learned taste poles rather than genre quotas.
+- Final Top 30 is the actual highest personalized scores; no artificial diversity tax or genre quota can displace a stronger match.
+- Semantic embeddings focus on narrative content, genres, keywords and collections; actor/director/country/language are deliberately kept at low influence elsewhere rather than becoming semantic shortcuts.
+- Candidate discovery uses both positive-seed neighborhoods and contrastive genre/keyword strategies, then uses learned genre affinity to prioritize which candidates receive expensive detail enrichment.
+- TMDB rating/vote thresholds are hard filters; rating and vote reliability remain weak final signals.
+- Last valid Top 30 Films and Top 30 Series are stored in Upstash Redis and survive Render restarts.
+- TMDB responses and embeddings are cached persistently in Upstash and locally in RAM.
 - A rebuild never replaces a valid 30-item catalog with a partial result.
-- Movie and series builds are serialized per user to avoid CPU/network contention on Render Free.
-- Discovery remains broad, while expensive TMDB detail enrichment is applied only after cheap eligibility filters.
-- The first request never deliberately returns an empty catalog merely because personalization is still calculating.
-- If no personalized catalog exists yet, a temporary TMDB bootstrap can be returned while the full build continues.
-- Gemini remains optional; failures fall back to the local recommender.
+- Movie and series builds are serialized per user to avoid resource contention on Render Free.
+- Gemini is optional. If unavailable, the local feature/interaction model continues to work.
 
 ## Persistent cache
 
-Set these Render environment variables to the Upstash REST credentials:
+Set these Render environment variables:
 
 - `UPSTASH_REDIS_REST_URL`
 - `UPSTASH_REDIS_REST_TOKEN`
 
-The addon stores public TMDB metadata and the two last-known-good recommendation catalogs. It does **not** persist raw Stremio Likes/Loves/library records in Redis. The current Stremio account data remains sourced from Stremio.
+The addon stores public-derived TMDB metadata, embeddings and the two last-known-good recommendation catalogs. It does not persist raw Stremio library/rating records in Redis.
 
 ## Recommendation model
 
-- ❤️ has 3× the positive weight of 👍.
-- Watched-without-rating is cautious negative evidence, not a hard dislike.
+- ❤️ = 3× 👍.
+- Watched-without-rating is weak negative evidence; one forgotten rating has little effect, repeated patterns have more.
 - Already-watched titles are excluded.
-- Candidate ranking remains 92% taste + 5% TMDB rating + 3% vote-count reliability.
-- No artificial genre quotas are imposed.
-- The final Top 30 is selected before optional random display ordering.
+- No artificial genre quotas.
+- No popularity ranking: TMDB rating and vote reliability are weak signals after hard filters.
+- Top 30 is selected before optional random display ordering.
 
 ## Configuration
 
@@ -42,7 +43,7 @@ Open `/configure` and provide:
 2. **Stremio AuthKey** — required.
 3. **Gemini API key** — optional.
 
-The TMDB Read Access Token is stored encrypted inside the generated manifest token and sent to TMDB only as an HTTP Bearer token.
+Secrets are stored encrypted inside the generated manifest token and are not included in the ZIP.
 
 ## Cache architecture
 
@@ -50,11 +51,10 @@ The TMDB Read Access Token is stored encrypted inside the generated manifest tok
 Stremio
    ↓
 Render addon
-   ├── L1: RAM cache (fast)
-   └── L2: Upstash Redis (persistent)
-          ├── last Top 30 Films
-          ├── last Top 30 Series
-          └── reusable TMDB responses
+   ├── L1: RAM
+   └── L2: Upstash Redis
+          ├── latest Top 30 Films
+          ├── latest Top 30 Series
+          ├── reusable TMDB responses
+          └── reusable semantic embeddings
 ```
-
-Render Free's local filesystem is ephemeral; the persistent cache therefore lives in Upstash rather than `/tmp`.

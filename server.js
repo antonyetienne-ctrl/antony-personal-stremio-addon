@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "4.0.3";
+const ALGO_VERSION = "4.1.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -79,10 +79,10 @@ const typeBuildLocks = new Map();
 const MAX_POSITIVE_ITEMS = Infinity;
 const MAX_PROFILE_ITEMS = Infinity;
 const CANDIDATE_PAGES_PER_STRATEGY = 2;
-const CANDIDATE_DISCOVERY_STRATEGIES = 36;
-const CANDIDATE_DETAILS_LIMIT = 360;
+const CANDIDATE_DISCOVERY_STRATEGIES = 44;
+const CANDIDATE_DETAILS_LIMIT = 480;
 const CANDIDATE_DETAIL_BATCH = 60;
-const CANDIDATE_DETAIL_CONCURRENCY = 6;
+const CANDIDATE_DETAIL_CONCURRENCY = 10;
 const MIN_RECOMMENDATIONS_TARGET = 30;
 const POSITIVE_SEED_LIMIT = 80;
 const SEED_NEIGHBOR_PAGES = 1;
@@ -486,15 +486,13 @@ function tokens(s) { return cleanText(s).split(/\s+/).filter(x => x.length >= 4 
 function addWeighted(map, key, value) { if (!key) return; map.set(key, (map.get(key) || 0) + value); }
 
 function textOf(d) {
+  // The embedding should represent the kind of story the user likes, not
+  // accidentally learn actor/country/director identity as a shortcut. Those
+  // attributes remain available elsewhere with deliberately tiny weights.
   const genres = (d.genres || []).map(x => x.name).join(" ");
   const keywords = (d.keywords?.keywords || []).map(x => x.name).join(" ");
   const collection = d.belongs_to_collection?.name || "";
-  const countries = (d.production_countries || []).map(x => x.name).join(" ");
-  const creators = [
-    ...(d.credits?.crew || []).filter(x => ["Director", "Creator", "Executive Producer", "Screenplay", "Writer"].includes(x.job)).slice(0, 6).map(x => x.name),
-    ...(d.credits?.cast || []).slice(0, 8).map(x => x.name)
-  ].join(" ");
-  return [d.title || d.name || "", d.overview || "", genres, keywords, collection, countries, creators].join(" ");
+  return [d.overview || "", genres, keywords, collection].join(" ");
 }
 
 function deepFeatureMap(d) {
@@ -504,13 +502,13 @@ function deepFeatureMap(d) {
   const keywords = (d.keywords?.keywords || []).map(x => cleanText(x.name)).filter(Boolean);
   for (const g of genres) add(`genre:${g}`, 1.0);
   for (const k of keywords) add(`kw:${k}`, 0.95);
-  if (d.belongs_to_collection?.id) add(`collection:${d.belongs_to_collection.id}`, 0.75);
-  for (const c of d.production_countries || []) add(`country:${cleanText(c.name)}`, 0.10);
-  if (d.original_language) add(`language:${cleanText(d.original_language)}`, 0.06);
+  if (d.belongs_to_collection?.id) add(`collection:${d.belongs_to_collection.id}`, 0.55);
+  for (const c of d.production_countries || []) add(`country:${cleanText(c.name)}`, 0.035);
+  if (d.original_language) add(`language:${cleanText(d.original_language)}`, 0.025);
   const runtime = Number(d.runtime || d.episode_run_time?.[0] || 0);
   if (runtime) add(`runtime:${Math.round(runtime / 20) * 20}`, 0.04);
-  for (const x of (d.credits?.crew || [])) if (x.job === 'Director' || x.job === 'Creator') add(`director:${cleanText(x.name)}`, 0.06);
-  for (const x of (d.credits?.cast || []).slice(0,8)) add(`actor:${cleanText(x.name)}`, 0.025);
+  for (const x of (d.credits?.crew || [])) if (x.job === 'Director' || x.job === 'Creator') add(`director:${cleanText(x.name)}`, 0.035);
+  for (const x of (d.credits?.cast || []).slice(0,8)) add(`actor:${cleanText(x.name)}`, 0.012);
 
   const text = cleanText([d.title || d.name || '', d.overview || '', ...keywords].join(' '));
   const toks = tokens(text);
@@ -596,24 +594,42 @@ async function geminiEmbeddings(apiKey, texts) {
 
 async function cachedEmbeddings(apiKey, texts, namespace) {
   if (!geminiAvailable(apiKey) || !texts.length) return null;
-  const result = new Array(texts.length), missing = [], missingIndexes = [];
-  for (let i=0;i<texts.length;i++) {
-    const hash=crypto.createHash("sha256").update(`${namespace}:${texts[i]}`).digest("hex");
-    const cached=cacheGet(`embedding:${hash}`);
-    if (cached) result[i]=cached; else { missing.push(texts[i]); missingIndexes.push(i); }
+  const result = new Array(texts.length);
+  const missing = [], missingIndexes = [];
+
+  // L1 first, then L2. Embeddings are public-derived TMDB text representations,
+  // so they can safely be shared across configs and survive Render restarts.
+  const persisted = await mapLimit(texts, 20, async (text, i) => {
+    const hash = crypto.createHash("sha256").update(`${namespace}:${text}`).digest("hex");
+    const local = cacheGet(`embedding:${hash}`);
+    if (local) return { i, value: local };
+    const remote = await persistentGet(persistKey("embedding", "", hash));
+    if (remote) {
+      cacheSet(`embedding:${hash}`, remote, EMBEDDING_CACHE_TTL_MS);
+      return { i, value: remote };
+    }
+    return { i, value: null };
+  });
+  for (const row of persisted) {
+    if (row.value) result[row.i] = row.value;
+    else { missing.push(texts[row.i]); missingIndexes.push(row.i); }
   }
+
   if (missing.length) {
-    const fresh=await geminiEmbeddings(apiKey, missing);
+    const fresh = await geminiEmbeddings(apiKey, missing);
     if (!fresh) return null;
-    fresh.forEach((v,j)=>{
-      result[missingIndexes[j]]=v;
-      const hash=crypto.createHash("sha256").update(`${namespace}:${missing[j]}`).digest("hex");
-      cacheSet(`embedding:${hash}`,v,EMBEDDING_CACHE_TTL_MS);
+    const writes = [];
+    fresh.forEach((v, j) => {
+      const idx = missingIndexes[j];
+      result[idx] = v;
+      const hash = crypto.createHash("sha256").update(`${namespace}:${missing[j]}`).digest("hex");
+      cacheSet(`embedding:${hash}`, v, EMBEDDING_CACHE_TTL_MS);
+      writes.push(persistentSet(persistKey("embedding", "", hash), v, PERSIST_TMDB_TTL_SEC));
     });
+    await Promise.allSettled(writes);
   }
   return result.every(Boolean) ? result : null;
 }
-
 function buildPreferenceModel(positives, negatives) {
   const posDf=new Map(),negDf=new Map(),posIntensity=new Map();
   const posTotal=Math.max(1,positives.length),negTotal=Math.max(1,negatives.length);
@@ -925,6 +941,16 @@ async function buildProfile(config, libraryItems, type) {
   })).filter(Boolean);
 
   const preferenceModel = buildPreferenceModel(details, negativeDetails);
+  const genrePositive = new Map();
+  const genreNegative = new Map();
+  for (const x of details) for (const g of x.details.genres || []) genrePositive.set(g.id, (genrePositive.get(g.id) || 0) + (x.rating === "heart" ? 3 : 1));
+  for (const x of negativeDetails) for (const g of x.details.genres || []) genreNegative.set(g.id, (genreNegative.get(g.id) || 0) + 1);
+  const genreAffinity = new Map();
+  for (const [id, pos] of genrePositive) {
+    const neg = genreNegative.get(id) || 0;
+    const lift = Math.log(((pos + 0.7) / (Math.max(1, details.length) + 1.4)) / ((neg + 0.7) / (Math.max(1, negativeDetails.length) + 1.4)));
+    genreAffinity.set(id, Math.max(-1, Math.min(1, lift)));
+  }
   const featureProfile = preferenceModel;
   const negativeFeatureProfile = preferenceModel;
   let positiveVectors = null;
@@ -933,7 +959,7 @@ async function buildProfile(config, libraryItems, type) {
   if (geminiAvailable(config.geminiApiKey) && negativeDetails.length) negativeVectors = await cachedEmbeddings(config.geminiApiKey, negativeDetails.map(x=>textOf(x.details)), "negative");
   const clusters = buildTasteClusters(positiveVectors, details);
   const seeds = chooseDiversePositiveSeeds(details, Math.min(40, details.length));
-  const profile = { watched, positives:details, watchedUnrated:negativeDetails, featureProfile, negativeFeatureProfile, preferenceModel, positiveVectors, negativeVectors, clusters, seeds, positiveCount:positives.length };
+  const profile = { watched, positives:details, watchedUnrated:negativeDetails, featureProfile, negativeFeatureProfile, preferenceModel, positiveVectors, negativeVectors, clusters, seeds, genreAffinity, positiveCount:positives.length };
   console.log(`Profile ${type}: library=${relevant.length} positive=${positives.length} watchedUnrated=${negativeDetails.length} watched=${watched.size} gemini=${Boolean(positiveVectors?.length)}`);
   cacheSet(profileKey, profile, PROFILE_CACHE_TTL_MS);
   return profile;
@@ -1001,8 +1027,17 @@ async function discoverCandidates(type,config,profile){
     return year&&year>=config.yearMin&&year<=config.yearMax;
   });
 
-  const shuffled=cheap.slice().sort((a,b)=>stableSeed(`${ALGO_VERSION}:${type}:${a.id}:${profile.positiveCount}`)-stableSeed(`${ALGO_VERSION}:${type}:${b.id}:${profile.positiveCount}`));
-  const limited=shuffled.slice(0,CANDIDATE_DETAILS_LIMIT);
+  const rankedCheap = cheap.map(d => {
+    const gs = new Set((d.genre_ids || []).map(Number));
+    let affinity = 0, matched = 0;
+    for (const [gid, w] of profile.genreAffinity || []) if (gs.has(Number(gid))) { affinity += w; matched++; }
+    const exploration = (stableSeed(`${ALGO_VERSION}:${type}:${d.id}:${profile.positiveCount}`) / 0xffffffff);
+    return { d, cheapScore: 0.72 * affinity + 0.28 * exploration, exploration };
+  }).sort((a,b)=>b.cheapScore-a.cheapScore);
+  // Preserve exploration, but spend most expensive detail calls on candidates
+  // that already share genres with explicit positives. This is only a recall
+  // optimization; the final ranking still uses the full enriched profile.
+  const limited=rankedCheap.slice(0,CANDIDATE_DETAILS_LIMIT).map(x=>x.d);
   const detailed=[];
   const eligible=[];
   for(let start=0; start<limited.length && start< CANDIDATE_DETAILS_LIMIT; start+=CANDIDATE_DETAIL_BATCH){
@@ -1020,7 +1055,11 @@ async function discoverCandidates(type,config,profile){
   return eligible;
 }
 
-async function buildTop50(type,config,profile){if(!profile.positiveCount)return[];const filtered=await discoverCandidates(type,config,profile);if(!filtered.length)return[];let candidateVectors=null;if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length)candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);const scored=filtered.map((d,i)=>{const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;const feat=featureSimilarity(d,profile.featureProfile);const discriminative=preferenceFeatureScore(d,profile.preferenceModel);const lex=lexicalSimilarity(d,profile.positives);const clusterFit=candidateVectors?.[i]&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)):0;const negativeSemantic=candidateVectors?.[i]?watchedNegativeSimilarity(candidateVectors[i],profile.negativeVectors):0;const negativeFeature=Math.max(0,-discriminative);const negCount=profile.watchedUnrated?.length||0;const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);const positiveTaste=.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex;const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(x=>x>=.25).length/5);const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;const votes=Math.max(0,Number(d.vote_count)||0);const voteReliability=Math.min(1,Math.log10(1+votes)/5);const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:candidateVectors?.[i]||null};}).filter(x=>x.imdbId);scored.sort((a,b)=>b.personalScore-a.personalScore);const top=diversityPick(scored,Math.min(30,config.maxResults));console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);return top;}
+async function buildTop50(type,config,profile){if(!profile.positiveCount)return[];const filtered=await discoverCandidates(type,config,profile);if(!filtered.length)return[];let candidateVectors=null;if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length)candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);const scored=filtered.map((d,i)=>{const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;const feat=featureSimilarity(d,profile.featureProfile);const discriminative=preferenceFeatureScore(d,profile.preferenceModel);const lex=lexicalSimilarity(d,profile.positives);const clusterFit=candidateVectors?.[i]&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)):0;const negativeSemantic=candidateVectors?.[i]?watchedNegativeSimilarity(candidateVectors[i],profile.negativeVectors):0;const negativeFeature=Math.max(0,-discriminative);const negCount=profile.watchedUnrated?.length||0;const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);const positiveTaste=.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex;const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(x=>x>=.25).length/5);const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;const votes=Math.max(0,Number(d.vote_count)||0);const voteReliability=Math.min(1,Math.log10(1+votes)/5);const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:candidateVectors?.[i]||null};}).filter(x=>x.imdbId);scored.sort((a,b)=>b.personalScore-a.personalScore);// The user explicitly wants the actual best 30, without genre quotas or a
+// diversity tax. Diversity is already learned through multiple taste poles;
+// it must not displace a stronger personalized match merely to make the list
+// look varied.
+const top=scored.slice(0,Math.min(30,config.maxResults));console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);return top;}
 
 function serializeAndShuffle(top50, type, config = DEFAULTS) {
   const ordered = top50.slice();
@@ -1316,4 +1355,4 @@ http.createServer((req,res) => handle(req,res).catch(e => {
   console.error(e);
   if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
   res.end(JSON.stringify({ error:"internal_error" }));
-})).listen(PORT, HOST, () => console.log(`Antony addon v4.0.3 listening on ${HOST}:${PORT}`));
+})).listen(PORT, HOST, () => console.log(`Antony addon v4.1.0 listening on ${HOST}:${PORT}`));
