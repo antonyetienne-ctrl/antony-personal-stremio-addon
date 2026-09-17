@@ -1,19 +1,28 @@
-# 🎯 Antony — Personal Stremio Recommendations v1.2.0
+# 🎯 Antony — Personal Stremio Recommendations v4.0.1
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 👍/❤️ signals.
 
-## v1.2.0 changes
+## v4.0.1 — reliability + performance
 
-- TMDB authentication uses the **API Read Access Token** (`Authorization: Bearer ...`), not the legacy API-key query parameter.
-- Candidate discovery no longer uses `popular` and does not use popularity as a final ranking signal.
-- Candidates are gathered from the user's positive items through TMDB `similar` and `recommendations`, then broadened with profile-derived genre/keyword combinations through TMDB `discover`.
-- Discovery samples multiple pages and multiple non-popularity sort orders, including rating, release-date sweeps and low-vote-count sweeps, so old/less-popular qualifying works can enter the candidate pool.
-- The final ranking remains **92% taste + 5% TMDB rating + 3% vote-count reliability**. TMDB rating/vote count are hard filters first.
+- Keeps the v3 recommendation model and its learned taste logic.
+- Discovery remains broad, but expensive TMDB detail enrichment is capped after cheap eligibility filtering.
+- Candidate discovery uses positive seeds, TMDB similar/recommendations, and profile-derived genre/keyword combinations.
+- The first request never deliberately returns an empty catalog merely because personalization is still calculating.
+- If no personalized catalog exists yet, a small temporary TMDB bootstrap catalog is returned while the personalized build continues in the background.
+- Empty catalog responses are sent with `Cache-Control: no-store` so a transient failure cannot poison Stremio's cache for minutes.
+- Movie and series builds are serialized per user to avoid CPU/network contention on Render Free.
+- Duplicate builds for the same user/type are locked and coalesced.
+- A previously valid personalized catalog is retained if a rebuild produces no eligible results or fails.
+- Gemini remains optional; failures fall back to the local recommender.
+
+## Recommendation model
+
 - ❤️ has 3× the positive weight of 👍.
-- Watched content is an exclusion only; it is never treated as a positive preference.
-- The final 30 are selected first and diversified softly. Their display order is configurable: score order or random shuffle.
-- Gemini remains optional. A Gemini 429/timeout/error falls back to the local recommender.
-- Background refresh and last-known-good catalogs remain in place. The 20-second cold-start wait is only a response-time guard; it is **not** a cap on the background recommendation computation.
+- Watched-without-rating is cautious negative evidence, not a hard dislike.
+- Already-watched titles are excluded.
+- Candidate ranking remains 92% taste + 5% TMDB rating + 3% vote-count reliability.
+- No artificial genre quotas are imposed.
+- The final Top 30 is selected before optional random display ordering.
 
 ## Configuration
 
@@ -25,39 +34,6 @@ Open `/configure` and provide:
 
 The TMDB Read Access Token is stored encrypted inside the generated manifest token and sent to TMDB only as an HTTP Bearer token.
 
-## Candidate discovery philosophy
+## Important Render Free limitation
 
-The addon cannot download every TMDB title with full metadata on every request. Instead it uses several independent discovery routes so candidate eligibility is not determined by TMDB's popularity ranking:
-
-- recommendations from positive seeds;
-- similar titles from positive seeds;
-- genre-driven discovery learned from 👍/❤️;
-- keyword-driven discovery learned from 👍/❤️;
-- genre + keyword combinations;
-- sampled pages across several non-popularity sorts.
-
-TMDB's daily ID exports are not used as a runtime dependency: TMDB documents them as ID lists with limited higher-level attributes rather than full metadata exports. This keeps the Render Free deployment small and avoids turning the addon into a data warehouse.
-
-## Resilience
-
-- Stremio state is cached and a last-known-good catalog is retained.
-- Expensive recommendation work is performed in the background when possible.
-- TMDB calls use retries, timeouts and the Bearer token.
-- Gemini is optional and non-blocking for correctness.
-
-## Important limitation
-
-A third-party Stremio addon cannot simply request "all of TMDB with every metadata field" in one operation. This version therefore maximizes candidate coverage within reasonable API traffic rather than pretending to exhaustively crawl the entire TMDB database.
-
-
-## v1.2.0 changes
-
-- Configuration lets you choose **best score first** or **random order**.
-- Added configurable kids-content exclusion.
-- Added configurable western-animation exclusion for series while preserving anime.
-- Existing configuration values are preserved when reopening the configuration page.
-- `/configure` redirects to the most recently used personal configuration when the server knows it.
-
-
-## v4.0.0
-Candidate generation was substantially expanded: many more positive seeds, multi-page TMDB recommendations/similar, contrastive genre/keyword discovery, pair/triple preference interactions, stronger watched-unrated contrast, and negative-state-aware catalog fingerprints.
+Render Free web services have an ephemeral filesystem and can spin down after inactivity. Therefore this addon does not pretend that a local disk cache is persistent across restarts. The last-known-good catalog is kept in memory while the instance is alive; after a cold restart, the temporary bootstrap prevents an empty catalog while the personalized catalog is rebuilt. Render documents that persistent disks require paid services.

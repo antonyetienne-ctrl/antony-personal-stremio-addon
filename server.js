@@ -2,11 +2,9 @@
 
 const http = require("http");
 const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "4.0.0";
+const ALGO_VERSION = "4.0.1";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -67,22 +65,18 @@ const STATE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const stateStore = new Map();
 const catalogStore = new Map();
 const refreshJobs = new Map();
-const catalogQueues = new Map();
-const DISK_CACHE_DIR = process.env.ANTONY_CACHE_DIR || "/tmp/antony-personal-cache";
-try { fs.mkdirSync(DISK_CACHE_DIR, { recursive: true }); } catch {}
+const typeBuildLocks = new Map();
 const MAX_POSITIVE_ITEMS = Infinity;
 const MAX_PROFILE_ITEMS = Infinity;
 const CANDIDATE_PAGES_PER_STRATEGY = 2;
-const CANDIDATE_DISCOVERY_STRATEGIES = 42;
-const CANDIDATE_DETAILS_LIMIT = 600;
-const POSITIVE_SEED_LIMIT = 32;
+const CANDIDATE_DISCOVERY_STRATEGIES = 30;
+const CANDIDATE_DETAILS_LIMIT = 700;
+const POSITIVE_SEED_LIMIT = 80;
 const SEED_NEIGHBOR_PAGES = 1;
-const GEMINI_COMPETITIVE_LIMIT = 220;
 const WATCHED_NEGATIVE_LIMIT = 180;
 const WATCHED_NEGATIVE_MAX_PENALTY = 0.24;
 const EMBEDDING_BATCH = 50;
 const COLD_START_WAIT_MS = 12000;
-const CACHE_DIR = process.env.CACHE_DIR || "/tmp/antony-stremio-cache";
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
 let geminiCooldownUntil = 0;
 let geminiTail = Promise.resolve();
@@ -123,28 +117,6 @@ function cacheGet(key) {
   if (!x) return null;
   if (x.expires && Date.now() > x.expires) { cache.delete(key); return null; }
   return x.value;
-}
-
-function diskCatalogPath(token, type) {
-  const id = crypto.createHash("sha256").update(`${token}:${type}`).digest("hex").slice(0, 32);
-  return path.join(CACHE_DIR, `${id}.json`);
-}
-function persistCatalog(token, type, entry) {
-  try {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-    fs.writeFileSync(diskCatalogPath(token, type), JSON.stringify(entry), "utf8");
-  } catch (e) { console.warn(`Disk cache write failed (${type}): ${e.message}`); }
-}
-function loadCatalogFromDisk(token, type) {
-  try {
-    const file = diskCatalogPath(token, type);
-    if (!fs.existsSync(file)) return null;
-    const x = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!x?.payload?.metas?.length || Date.now() > Number(x.staleUntil || 0)) return null;
-    catalogStore.set(catalogKey(token, type), x);
-    console.log(`Loaded disk cache ${type}: metas=${x.payload.metas.length}`);
-    return { ...x, stale: Date.now() > x.freshUntil };
-  } catch (e) { console.warn(`Disk cache read failed (${type}): ${e.message}`); return null; }
 }
 
 async function jsonFetch(url, options = {}, timeoutMs = 12000, attempts = 3) {
@@ -269,31 +241,8 @@ function watchedSetFromLibrary(library) {
 function stateKey(token) { return `state:${token}`; }
 function catalogKey(token, type) { return `${token}:${type}`; }
 
-function diskCatalogPath(token, type) {
-  const id = crypto.createHash("sha256").update(`${ALGO_VERSION}:${token}:${type}`).digest("hex").slice(0, 40);
-  return path.join(DISK_CACHE_DIR, `${id}.json`);
-}
-function persistCatalog(token, type, entry) {
-  try {
-    const file = diskCatalogPath(token, type);
-    const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(entry), "utf8");
-    fs.renameSync(tmp, file);
-  } catch (e) {
-    console.warn(`Catalog disk cache write failed (${type}): ${e.message}`);
-  }
-}
-function loadCatalogFromDisk(token, type) {
-  try {
-    const entry = JSON.parse(fs.readFileSync(diskCatalogPath(token, type), "utf8"));
-    if (!entry?.payload?.metas?.length || Date.now() > Number(entry.staleUntil || 0)) return null;
-    catalogStore.set(catalogKey(token, type), entry);
-    return { ...entry, stale: Date.now() > entry.freshUntil };
-  } catch { return null; }
-}
 function getCatalogCached(token, type) {
-  let x = catalogStore.get(catalogKey(token, type));
-  if (!x) x = loadCatalogFromDisk(token, type);
+  const x = catalogStore.get(catalogKey(token, type));
   if (!x) return null;
   if (Date.now() > x.staleUntil) {
     catalogStore.delete(catalogKey(token, type));
@@ -304,22 +253,12 @@ function getCatalogCached(token, type) {
 
 function putCatalog(token, type, payload, fingerprint, usedGemini) {
   const now = Date.now();
-  const entry = {
+  catalogStore.set(catalogKey(token, type), {
     payload, fingerprint, usedGemini,
     createdAt: now,
     freshUntil: now + CATALOG_FRESH_MS,
     staleUntil: now + CATALOG_STALE_MS
-  };
-  catalogStore.set(catalogKey(token, type), entry);
-  persistCatalog(token, type, entry);
-}
-
-function enqueueCatalogBuild(token, type, task) {
-  const key = `queue:${token}`;
-  const previous = catalogQueues.get(key) || Promise.resolve();
-  const job = previous.catch(() => null).then(task);
-  catalogQueues.set(key, job.finally(() => { if (catalogQueues.get(key) === job) catalogQueues.delete(key); }));
-  return job;
+  });
 }
 
 function scheduleRefresh(token, config, reason = "request") {
@@ -361,12 +300,13 @@ async function refreshUserStateAndCatalogs(token, config, reason = "scheduled") 
   };
   stateStore.set(stateKey(token), state);
 
-  // Rebuild periodically even when the library itself is unchanged, because a
-  // 👍/❤️ can change without changing the LibraryItem record.
   if (changed || !previous || Date.now() - (previous.rebuiltAt || 0) >= STATE_REFRESH_MS) {
     invalidateTokenResults(token);
-    await enqueueCatalogBuild(token, "movie", () => buildAndStoreCatalog("movie", config, token, library));
-    await enqueueCatalogBuild(token, "series", () => buildAndStoreCatalog("series", config, token, library));
+    // One heavy recommendation build at a time. This prevents movie and series
+    // from competing for the same small Render instance and makes latency more
+    // predictable.
+    await buildAndStoreCatalog("movie", config, token, library);
+    await buildAndStoreCatalog("series", config, token, library);
     const current = stateStore.get(stateKey(token));
     if (current) current.rebuiltAt = Date.now();
   }
@@ -384,17 +324,27 @@ function invalidateTokenResults(token) {
 }
 
 async function buildAndStoreCatalog(type, config, token, library) {
-  const profile = await buildProfile(config, library, type);
-  const fingerprint = profileFingerprint(profile);
-  const existing = getCatalogCached(token, type);
-  // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
-  if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
-  const top30 = await buildTop50(type, config, profile);
-  const payload = serializeAndShuffle(top30, type, config);
-  putCatalog(token, type, payload, fingerprint, Boolean(profile.positiveVectors?.length));
-  cacheSet(`result:${token}:${type}:${fingerprint}`, top30, CACHE_TTL_MS);
-  cacheSet(resultMetaKey(token, type, fingerprint), { geminiUsed: Boolean(profile.positiveVectors?.length) }, CACHE_TTL_MS);
-  return payload;
+  const lockKey = `build:${token}:${type}`;
+  if (typeBuildLocks.has(lockKey)) return typeBuildLocks.get(lockKey);
+  const job = (async () => {
+    const profile = await buildProfile(config, library, type);
+    const fingerprint = profileFingerprint(profile);
+    const existing = getCatalogCached(token, type);
+    // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
+    if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
+    const top30 = await buildTop50(type, config, profile);
+    if (!top30.length) {
+      console.warn(`No eligible recommendations produced for ${type}; preserving any previous catalog.`);
+      return existing?.payload || null;
+    }
+    const payload = serializeAndShuffle(top30, type, config);
+    putCatalog(token, type, payload, fingerprint, Boolean(profile.positiveVectors?.length));
+    cacheSet(`result:${token}:${type}:${fingerprint}`, top30, CACHE_TTL_MS);
+    cacheSet(resultMetaKey(token, type, fingerprint), { geminiUsed: Boolean(profile.positiveVectors?.length) }, CACHE_TTL_MS);
+    return payload;
+  })();
+  typeBuildLocks.set(lockKey, job);
+  try { return await job; } finally { typeBuildLocks.delete(lockKey); }
 }
 
 function normalizeRating(x) {
@@ -930,111 +880,32 @@ function samplePages(seedText, count = CANDIDATE_PAGES_PER_STRATEGY) {
 }
 
 async function discoverCandidates(type,config,profile){
-  const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));
-  const candidates=new Map();
-  const addResults=arr=>{for(const x of arr||[])if(x?.id)candidates.set(`${type}:${x.id}`,x);};
-  const media=type==='movie'?'movie':'tv';
+  const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));const candidates=new Map();const addResults=arr=>{for(const x of arr||[])if(x?.id)candidates.set(`${type}:${x.id}`,x);};const media=type==='movie'?'movie':'tv';
   const seeds=chooseDiversePositiveSeeds(profile.positives,Math.min(POSITIVE_SEED_LIMIT,profile.positives.length));
-
-  // Wide but cheap discovery: lots of IDs/basic metadata, very few expensive detail calls.
-  const seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];return [{endpoint:`${media}/${id}/recommendations`,params:{language:'en-US',page:1}},{endpoint:`${media}/${id}/similar`,params:{language:'en-US',page:1}}];});
-  const seedResults=await mapLimit(seedJobs,DISCOVERY_CONCURRENCY,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
-  for(const data of seedResults)addResults(data?.results);
-
+  const seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];const base=`${media}/${id}`,jobs=[];for(let page=1;page<=SEED_NEIGHBOR_PAGES;page++){jobs.push({endpoint:`${base}/recommendations`,params:{language:'en-US',page}},{endpoint:`${base}/similar`,params:{language:'en-US',page}});}return jobs;});
+  const seedResults=await mapLimit(seedJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of seedResults)addResults(data?.results);
   const genreScore=new Map(),keywordScore=new Map(),negGenre=new Map(),negKeyword=new Map();
   for(const x of profile.positives){const w=x.rating==='heart'?3:1;for(const g of x.details.genres||[])genreScore.set(g.id,(genreScore.get(g.id)||0)+w);for(const k of x.details.keywords?.keywords||[])keywordScore.set(k.id,(keywordScore.get(k.id)||0)+w);}
   for(const x of profile.watchedUnrated||[]){for(const g of x.details.genres||[])negGenre.set(g.id,(negGenre.get(g.id)||0)+1);for(const k of x.details.keywords?.keywords||[])negKeyword.set(k.id,(negKeyword.get(k.id)||0)+1);}
   const rank=(pos,neg,tp,tn)=>[...pos.entries()].map(([id,v])=>({id,score:Math.log(((v+.6)/(tp+1.2))/(((neg.get(id)||0)+.6)/(tn+1.2)))})).sort((a,b)=>b.score-a.score);
-  const genres=rank(genreScore,negGenre,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,12).map(x=>x.id);
-  const keywords=rank(keywordScore,negKeyword,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,24).map(x=>x.id);
-  const strategies=[];
-  for(const g of genres)strategies.push({with_genres:String(g),label:`g:${g}`});
-  for(const k of keywords)strategies.push({with_keywords:String(k),label:`k:${k}`});
-  for(let i=0;i<genres.length;i++)for(let j=i+1;j<genres.length&&j<i+3;j++)strategies.push({with_genres:`${genres[i]},${genres[j]}`,label:`gg:${genres[i]}:${genres[j]}`});
-  for(let i=0;i<keywords.length;i++)for(let j=i+1;j<keywords.length&&j<i+4;j++)strategies.push({with_keywords:`${keywords[i]},${keywords[j]}`,label:`kk:${keywords[i]}:${keywords[j]}`});
-  for(const g of genres.slice(0,8))for(const k of keywords.slice(0,8))strategies.push({with_genres:String(g),with_keywords:String(k),label:`gk:${g}:${k}`});
-  for(const item of seeds.slice(0,16)){const gs=(item.details.genres||[]).map(x=>x.id).slice(0,2),ks=(item.details.keywords?.keywords||[]).map(x=>x.id).slice(0,2);for(const g of gs)for(const k of ks)strategies.push({with_genres:String(g),with_keywords:String(k),label:`seedgk:${g}:${k}`});}
+  const genres=rank(genreScore,negGenre,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,14).map(x=>x.id);
+  const keywords=rank(keywordScore,negKeyword,profile.positiveCount,profile.watchedUnrated?.length||0).filter(x=>x.score>0).slice(0,32).map(x=>x.id);
+  const strategies=[];for(const g of genres)strategies.push({with_genres:String(g),label:`g:${g}`});for(const k of keywords)strategies.push({with_keywords:String(k),label:`k:${k}`});
+  for(let i=0;i<genres.length;i++)for(let j=i+1;j<genres.length&&j<i+4;j++)strategies.push({with_genres:`${genres[i]},${genres[j]}`,label:`gg:${genres[i]}:${genres[j]}`});
+  for(let i=0;i<keywords.length;i++)for(let j=i+1;j<keywords.length&&j<i+5;j++)strategies.push({with_keywords:`${keywords[i]},${keywords[j]}`,label:`kk:${keywords[i]}:${keywords[j]}`});
+  for(const g of genres.slice(0,10))for(const k of keywords.slice(0,12))strategies.push({with_genres:String(g),with_keywords:String(k),label:`gk:${g}:${k}`});
+  for(const item of seeds.slice(0,24)){const gs=(item.details.genres||[]).map(x=>x.id).slice(0,2),ks=(item.details.keywords?.keywords||[]).map(x=>x.id).slice(0,3);for(const g of gs)for(const k of ks)strategies.push({with_genres:String(g),with_keywords:String(k),label:`seedgk:${g}:${k}`});}
   const dedup=new Map();for(const x of strategies)dedup.set(x.label,x);const strategyList=[...dedup.values()].slice(0,CANDIDATE_DISCOVERY_STRATEGIES);
-  const actualSortModes=type==='movie'?['vote_average.desc','vote_count.desc','primary_release_date.desc']:['vote_average.desc','vote_count.desc','first_air_date.desc'];
-  const pageJobs=[];
-  for(const strategy of strategyList)for(const sort_by of actualSortModes)for(const page of [1,2]){
-    const params={language:'en-US',include_adult:false,page,sort_by,...strategy};delete params.label;
-    const maxYear=Math.min(config.yearMax,new Date().getFullYear());
-    if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${maxYear}-12-31`;}else{params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${maxYear}-12-31`;}
-    pageJobs.push({endpoint:type==='movie'?'discover/movie':'discover/tv',params});
-  }
-  const discovered=await mapLimit(pageJobs,DISCOVERY_CONCURRENCY,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
-  for(const data of discovered)addResults(data?.results);
-
-  // Cheap hard filters happen BEFORE any detail enrichment.
-  const cheap=[...candidates.values()].filter(d=>{
-    if(profile.watched.has(String(d.id)) || profile.watched.has(String(d.id).toLowerCase())) return false;
-    const rating=Number(d.vote_average),votes=Number(d.vote_count);
-    if(!Number.isFinite(rating)||rating<config.tmdbMinRating||rating>config.tmdbMaxRating)return false;
-    if(!Number.isFinite(votes)||votes<config.tmdbMinVotes)return false;
-    const date=d.release_date||d.first_air_date||'',year=Number(String(date).slice(0,4));
-    return year&&year>=config.yearMin&&year<=config.yearMax;
-  });
-
-  // Keep a broad pool, but don't make 1,000+ individual detail calls on every refresh.
+  const sortModes=type==='movie'?['vote_average.desc','vote_count.desc']:['vote_average.desc','vote_count.desc'];
+  const pageJobs=[];for(const strategy of strategyList)for(const sort_by of sortModes)for(const page of [1,2]){const params={language:'en-US',include_adult:false,page,sort_by,...strategy};delete params.label;if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}else{params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}pageJobs.push({endpoint:type==='movie'?'discover/movie':'discover/tv',params});}
+  const discovered=await mapLimit(pageJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of discovered)addResults(data?.results);
+  const cheap=[...candidates.values()].filter(d=>{const rating=Number(d.vote_average),votes=Number(d.vote_count);if(!Number.isFinite(rating)||rating<config.tmdbMinRating||rating>config.tmdbMaxRating)return false;if(!Number.isFinite(votes)||votes<config.tmdbMinVotes)return false;const date=d.release_date||d.first_air_date||'',year=Number(String(date).slice(0,4));return year&&year>=config.yearMin&&year<=config.yearMax;});
   const shuffled=cheap.slice().sort((a,b)=>stableSeed(`${ALGO_VERSION}:${type}:${a.id}:${profile.positiveCount}`)-stableSeed(`${ALGO_VERSION}:${type}:${b.id}:${profile.positiveCount}`));
-  const limited=shuffled.slice(0,CANDIDATE_DETAILS_LIMIT);
-  const detailed=(await mapLimit(limited,DETAIL_CONCURRENCY,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);
-  const final=detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
-  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} seedRequests=${seedJobs.length} discoveryRequests=${pageJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${final.length}`);
-  return final;
+  const limited=shuffled.slice(0,CANDIDATE_DETAILS_LIMIT);const detailed=(await mapLimit(limited,12,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);const final=detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
+  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} seedRequests=${seedJobs.length} discoveryRequests=${pageJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${final.length}`);return final;
 }
-async function buildTop50(type,config,profile){
-  if(!profile.positiveCount)return[];
-  const started=Date.now();
-  const filtered=await discoverCandidates(type,config,profile);
-  if(!filtered.length)return[];
 
-  // First rank locally. Gemini is deliberately reserved for the competitive
-  // frontier instead of embedding every enriched candidate. This preserves
-  // semantic quality while removing hundreds of unnecessary embedding inputs.
-  const local=filtered.map(d=>{
-    const feat=featureSimilarity(d,profile.featureProfile);
-    const discriminative=preferenceFeatureScore(d,profile.preferenceModel);
-    const lex=lexicalSimilarity(d,profile.positives);
-    const localTaste=.50*feat+.35*Math.max(0,discriminative)+.15*lex;
-    return {details:d,localTaste,imdbId:d.external_ids?.imdb_id||d.imdb_id};
-  }).filter(x=>x.imdbId);
-  local.sort((a,b)=>b.localTaste-a.localTaste);
-  const competitive=local.slice(0, Math.min(GEMINI_COMPETITIVE_LIMIT, local.length));
-  const indexById=new Map(competitive.map((x,i)=>[x.imdbId,i]));
-  let candidateVectors=null;
-  if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length){
-    candidateVectors=await cachedEmbeddings(config.geminiApiKey,competitive.map(x=>textOf(x.details)),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);
-  }
-  const scored=local.map(x=>{
-    const i=indexById.get(x.imdbId);
-    const vector=candidateVectors && i !== undefined ? candidateVectors[i] : null;
-    const d=x.details;
-    const sem=vector?semanticScore(vector,profile.positiveVectors,profile.positives,profile.clusters):0;
-    const feat=featureSimilarity(d,profile.featureProfile);
-    const discriminative=preferenceFeatureScore(d,profile.preferenceModel);
-    const lex=lexicalSimilarity(d,profile.positives);
-    const clusterFit=vector&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(vector,c.vector))*c.weight)):0;
-    const negativeSemantic=vector?watchedNegativeSimilarity(vector,profile.negativeVectors):0;
-    const negativeFeature=Math.max(0,-discriminative);
-    const negCount=profile.watchedUnrated?.length||0;
-    const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));
-    const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);
-    const positiveTaste=vector ? (.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex) : (.60*feat+.30*Math.max(0,discriminative)+.10*lex);
-    const convergence=vector?Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(v=>v>=.25).length/5):0;
-    const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));
-    const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
-    const votes=Math.max(0,Number(d.vote_count)||0);
-    const voteReliability=Math.min(1,Math.log10(1+votes)/5);
-    const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;
-    return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:vector};
-  }).filter(x=>x.imdbId);
-  scored.sort((a,b)=>b.personalScore-a.personalScore);
-  const top=diversityPick(scored,Math.min(30,config.maxResults));
-  console.log(`Ranking ${type}: candidates=${filtered.length} competitive=${competitive.length} gemini=${Boolean(candidateVectors?.length)} scored=${scored.length} selected=${top.length} ms=${Date.now()-started}`);
-  return top;
-}
+async function buildTop50(type,config,profile){if(!profile.positiveCount)return[];const filtered=await discoverCandidates(type,config,profile);if(!filtered.length)return[];let candidateVectors=null;if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length)candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);const scored=filtered.map((d,i)=>{const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;const feat=featureSimilarity(d,profile.featureProfile);const discriminative=preferenceFeatureScore(d,profile.preferenceModel);const lex=lexicalSimilarity(d,profile.positives);const clusterFit=candidateVectors?.[i]&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)):0;const negativeSemantic=candidateVectors?.[i]?watchedNegativeSimilarity(candidateVectors[i],profile.negativeVectors):0;const negativeFeature=Math.max(0,-discriminative);const negCount=profile.watchedUnrated?.length||0;const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);const positiveTaste=.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex;const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(x=>x>=.25).length/5);const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;const votes=Math.max(0,Number(d.vote_count)||0);const voteReliability=Math.min(1,Math.log10(1+votes)/5);const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:candidateVectors?.[i]||null};}).filter(x=>x.imdbId);scored.sort((a,b)=>b.personalScore-a.personalScore);const top=diversityPick(scored,Math.min(30,config.maxResults));console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);return top;}
 
 function serializeAndShuffle(top50, type, config = DEFAULTS) {
   const ordered = top50.slice();
@@ -1092,25 +963,39 @@ function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
     }catch(e){console.warn(`Gemini upgrade failed for ${type}: ${e.message}`);}
   });
 }
-async function fastBootstrapCatalog(type, config, token, library, profile) {
-  const media=type==='movie'?'movie':'tv';
-  const watched=profile.watched||new Set();
-  const seeds=chooseDiversePositiveSeeds(profile.positives,Math.min(FAST_BOOTSTRAP_SEEDS,profile.positives.length));
-  const raw=new Map();
-  const jobs=seeds.map(seed=>({endpoint:`${media}/${seed.details?.id}/recommendations`,params:{language:'en-US',page:1}})).filter(x=>x.endpoint.endsWith('/undefined')===false);
-  const responses=await mapLimit(jobs,12,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
-  for(const r of responses||[])for(const x of r?.results||[])if(x?.id&&!watched.has(String(x.id)))raw.set(x.id,x);
-  const basic=[...raw.values()].filter(x=>Number(x.vote_average)>=config.tmdbMinRating&&Number(x.vote_count)>=config.tmdbMinVotes).slice(0,FAST_BOOTSTRAP_DETAILS);
-  const detailed=(await mapLimit(basic,16,async x=>tmdb(`${media}/${x.id}`,{language:'en-US',append_to_response:'external_ids,keywords'},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);
-  const eligible=detailed.filter(d=>hardFilter(d,type,config,watched,new Set((config.excludeGenres||[]).map(cleanText))));
-  if(!eligible.length)return null;
-  const scored=eligible.map(d=>({details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore:featureSimilarity(d,profile.featureProfile)})).filter(x=>x.imdbId).sort((a,b)=>b.personalScore-a.personalScore).slice(0,30);
-  if(!scored.length)return null;
-  const payload=serializeAndShuffle(scored,type,config);
-  const fp=profileFingerprint(profile);
-  putCatalog(token,type,payload,fp,false);
-  console.log(`Fast bootstrap ${type}: raw=${raw.size} basic=${basic.length} eligible=${eligible.length} metas=${payload.metas.length}`);
-  return payload;
+async function buildBootstrapCatalog(type, config, token) {
+  // This is deliberately small and deterministic. It is only used when the
+  // personalized catalog has never been built in this process. Its job is to
+  // guarantee that Stremio gets a valid non-empty catalog while the real model
+  // warms in the background. It is never stored as a personalized result.
+  const media = type === "movie" ? "movie" : "tv";
+  const endpoint = type === "movie" ? "discover/movie" : "discover/tv";
+  const params = {
+    language: "en-US",
+    include_adult: false,
+    page: 1,
+    sort_by: "vote_average.desc",
+    "vote_count.gte": config.tmdbMinVotes,
+    "vote_average.gte": config.tmdbMinRating,
+    "vote_average.lte": config.tmdbMaxRating
+  };
+  if (type === "movie") {
+    params.primary_release_date_gte = `${config.yearMin}-01-01`;
+    params.primary_release_date_lte = `${Math.min(config.yearMax, new Date().getFullYear())}-12-31`;
+  } else {
+    params.first_air_date_gte = `${config.yearMin}-01-01`;
+    params.first_air_date_lte = `${Math.min(config.yearMax, new Date().getFullYear())}-12-31`;
+  }
+  const data = await tmdb(endpoint, params, config.tmdbAccessToken);
+  const raw = (data?.results || []).slice(0, 20);
+  const state = stateStore.get(stateKey(token));
+  const watched = state?.library ? watchedSetFromLibrary(state.library) : new Set();
+  const excludedGenres = new Set((config.excludeGenres || []).map(cleanText));
+  const details = (await mapLimit(raw, 8, async c => tmdb(`${media}/${c.id}`, { language: "en-US", append_to_response: "keywords,external_ids,credits" }, config.tmdbAccessToken).catch(() => null))).filter(Boolean);
+  const eligible = details.filter(d => hardFilter(d, type, config, watched, excludedGenres));
+  return serializeAndShuffle(eligible.slice(0, Math.min(30, config.maxResults)).map(d => ({
+    details: d, imdbId: d.external_ids?.imdb_id || d.imdb_id, personalScore: 0, semantic: null
+  })), type, { ...config, displayOrder: "score" });
 }
 
 async function discover(type, config, token) {
@@ -1125,9 +1010,6 @@ async function discover(type, config, token) {
     return cached.payload;
   }
 
-  // Cold start is type-specific. We do not wait for both movie and series builds,
-  // and we never intentionally return an empty catalog just because the other type
-  // is still warming.
   let state = stateStore.get(stateKey(token));
   if (!state || !state.library) {
     try {
@@ -1136,47 +1018,49 @@ async function discover(type, config, token) {
       stateStore.set(stateKey(token), state);
     } catch (e) {
       console.warn(`Cold-start Stremio sync failed for ${type}: ${e.message}`);
-      // A previously cached catalog would have been returned above. With no state
-      // and no catalog, there is no honest personalized response to fabricate.
-      return { metas: [] };
-    }
-  }
-
-  // First request gets a small, fast personalized bootstrap instead of an empty catalog.
-  if (!getCatalogCached(token, type)) {
-    try {
-      const profile = await buildProfile(config, state.library, type);
-      const boot = await fastBootstrapCatalog(type, config, token, state.library, profile);
-      if (boot) {
-        setImmediate(() => buildAndStoreCatalog(type, config, token, state.library).catch(e => console.warn(`Background full build failed for ${type}: ${e.message}`)));
-        return boot;
+      // No personalized state yet: return a small valid TMDB bootstrap instead
+      // of ever returning { metas: [] }. The full personalized build continues
+      // only when the account state becomes available.
+      try { return await buildBootstrapCatalog(type, config, token); }
+      catch (bootError) {
+        console.warn(`Bootstrap catalog failed for ${type}: ${bootError.message}`);
+        return { metas: [] };
       }
-    } catch (e) { console.warn(`Fast bootstrap failed for ${type}: ${e.message}`); }
+    }
   }
 
   const lockKey = `cold:${token}:${type}`;
   if (!REFRESH_LOCK.has(lockKey)) {
-    const job = enqueueCatalogBuild(token, type, async()=> {
-      try { return await buildAndStoreCatalog(type, config, token, state.library); }
-      catch(e) { console.warn(`Cold-start catalog build failed for ${type}: ${e.message}`); return null; }
+    const job = buildAndStoreCatalog(type, config, token, state.library).catch(e => {
+      console.warn(`Cold-start catalog build failed for ${type}: ${e.message}`);
+      return null;
     });
     REFRESH_LOCK.set(lockKey, job);
-    job.finally(()=>REFRESH_LOCK.delete(lockKey));
+    job.finally(() => REFRESH_LOCK.delete(lockKey));
   }
   const job = REFRESH_LOCK.get(lockKey);
-  if (job) await Promise.race([job.catch(()=>null), new Promise(r=>setTimeout(r, COLD_START_WAIT_MS))]);
+  if (job) await Promise.race([job.catch(() => null), new Promise(r => setTimeout(r, COLD_START_WAIT_MS))]);
 
   const ready = getCatalogCached(token, type);
-  if (ready && ready.payload?.metas?.length) {
-    // Warm the other type separately; never hold the current catalog hostage to it.
+  if (ready?.payload?.metas?.length) {
     const other = type === "movie" ? "series" : "movie";
     if (!getCatalogCached(token, other)) {
-      setImmediate(()=>scheduleRefresh(token, config, `warm-${other}`).catch(e=>console.warn(`Background ${other} build failed: ${e.message}`)));
+      setImmediate(() => buildAndStoreCatalog(other, config, token, state.library).catch(e => console.warn(`Background ${other} build failed: ${e.message}`)));
     }
     return ready.payload;
   }
-  console.warn(`Catalog ${type} still warming after ${COLD_START_WAIT_MS}ms; no empty result cached.`);
-  return { metas: [] };
+
+  // The personalized build may legitimately still be running. Give Stremio a
+  // valid temporary catalog rather than an empty response; it is never cached
+  // by HTTP and therefore cannot poison the client for five minutes.
+  try {
+    const bootstrap = await buildBootstrapCatalog(type, config, token);
+    console.warn(`Catalog ${type} still warming; serving temporary bootstrap (${bootstrap.metas?.length || 0} items).`);
+    return bootstrap;
+  } catch (e) {
+    console.warn(`Temporary bootstrap failed for ${type}: ${e.message}`);
+    return { metas: [] };
+  }
 }
 
 async function warmOtherType(currentType, config, token, library) {
@@ -1304,7 +1188,7 @@ async function handle(req, res) {
       try {
         if (resource === "catalog") {
           const result = await discover(type, tokenConfig, u.pathname.split("/")[2]);
-          res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"private, max-age=300, stale-while-revalidate=3600" });
+          res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"no-store, no-cache, must-revalidate" });
           return res.end(JSON.stringify(result));
         }
         const find = await tmdb(`find/${encodeURIComponent(id)}`, { external_source:"imdb_id", language:"en-US" }, tokenConfig.tmdbAccessToken);
@@ -1328,4 +1212,4 @@ http.createServer((req,res) => handle(req,res).catch(e => {
   console.error(e);
   if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
   res.end(JSON.stringify({ error:"internal_error" }));
-})).listen(PORT, HOST, () => console.log(`Antony addon v1.3.0 listening on ${HOST}:${PORT}`));
+})).listen(PORT, HOST, () => console.log(`Antony addon v4.0.1 listening on ${HOST}:${PORT}`));
