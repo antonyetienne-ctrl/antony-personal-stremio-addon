@@ -2,9 +2,10 @@
 
 const http = require("http");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "4.0.1";
+const ALGO_VERSION = "4.0.3";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -49,6 +50,15 @@ const MANIFEST = {
 let LAST_CONFIG_TOKEN = "";
 const CONFIG_ALIASES = new Map();
 const cache = new Map();
+const UPSTASH_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
+const UPSTASH_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || "");
+const UPSTASH_ENABLED = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
+const PERSIST_PREFIX = "antony:v4:p:";
+const PERSIST_CATALOG_TTL_SEC = 30 * 24 * 60 * 60;
+const PERSIST_STATE_TTL_SEC = 7 * 24 * 60 * 60;
+const PERSIST_TMDB_TTL_SEC = 90 * 24 * 60 * 60;
+const UPSTASH_TIMEOUT_MS = 7000;
+let upstashWarned = false;
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 const TMDB_DETAIL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -59,7 +69,7 @@ const REFRESH_LOCK = new Map();
 const ACTIVE_CONFIGS = new Map();
 const CACHE_MAX_ENTRIES = 220;
 const CATALOG_FRESH_MS = 12 * 60 * 60 * 1000;
-const CATALOG_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const CATALOG_STALE_MS = 30 * 24 * 60 * 60 * 1000;
 const STATE_REFRESH_MS = 15 * 60 * 1000;
 const STATE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const stateStore = new Map();
@@ -69,8 +79,11 @@ const typeBuildLocks = new Map();
 const MAX_POSITIVE_ITEMS = Infinity;
 const MAX_PROFILE_ITEMS = Infinity;
 const CANDIDATE_PAGES_PER_STRATEGY = 2;
-const CANDIDATE_DISCOVERY_STRATEGIES = 30;
-const CANDIDATE_DETAILS_LIMIT = 700;
+const CANDIDATE_DISCOVERY_STRATEGIES = 36;
+const CANDIDATE_DETAILS_LIMIT = 360;
+const CANDIDATE_DETAIL_BATCH = 60;
+const CANDIDATE_DETAIL_CONCURRENCY = 6;
+const MIN_RECOMMENDATIONS_TARGET = 30;
 const POSITIVE_SEED_LIMIT = 80;
 const SEED_NEIGHBOR_PAGES = 1;
 const WATCHED_NEGATIVE_LIMIT = 180;
@@ -106,6 +119,56 @@ function unpackConfig(token) {
     decipher.setAuthTag(raw.subarray(12, 28));
     return { ...DEFAULTS, ...JSON.parse(Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString("utf8")) };
   } catch { return null; }
+}
+
+
+function persistKey(scope, token = "", extra = "") {
+  const user = token ? crypto.createHash("sha256").update(token).digest("hex").slice(0, 24) : "global";
+  const suffix = extra ? `:${extra}` : "";
+  return `${PERSIST_PREFIX}${user}:${scope}${suffix}`;
+}
+function packPersistent(value) {
+  return zlib.gzipSync(Buffer.from(JSON.stringify(value), "utf8"), { level: 6 }).toString("base64");
+}
+function unpackPersistent(value) {
+  try {
+    return JSON.parse(zlib.gunzipSync(Buffer.from(String(value), "base64")).toString("utf8"));
+  } catch { return null; }
+}
+async function upstashCommand(command, args = []) {
+  if (!UPSTASH_ENABLED) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTASH_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${UPSTASH_URL}`, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${UPSTASH_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify([command, ...args]),
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`Upstash HTTP ${response.status}`);
+    const data = await response.json();
+    if (data?.error) throw new Error(`Upstash ${data.error}`);
+    return data?.result ?? null;
+  } catch (e) {
+    if (!upstashWarned) { console.warn(`Upstash cache unavailable; continuing with local cache: ${e.message}`); upstashWarned = true; }
+    return null;
+  } finally { clearTimeout(timer); }
+}
+async function persistentGet(key) {
+  if (!UPSTASH_ENABLED) return null;
+  const raw = await upstashCommand("GET", [key]);
+  return raw == null ? null : unpackPersistent(raw);
+}
+async function persistentSet(key, value, ttlSec) {
+  if (!UPSTASH_ENABLED) return false;
+  const raw = packPersistent(value);
+  const result = await upstashCommand("SET", [key, raw, "EX", ttlSec]);
+  return result === "OK";
+}
+async function persistentDeleteByPrefix(prefix) {
+  // Deliberately unused: avoid KEYS/SCAN traffic on the free tier. TTL + eviction handle housekeeping.
+  return false;
 }
 
 function cacheSet(key, value, ttlMs = CACHE_TTL_MS) {
@@ -253,12 +316,17 @@ function getCatalogCached(token, type) {
 
 function putCatalog(token, type, payload, fingerprint, usedGemini) {
   const now = Date.now();
-  catalogStore.set(catalogKey(token, type), {
-    payload, fingerprint, usedGemini,
-    createdAt: now,
-    freshUntil: now + CATALOG_FRESH_MS,
-    staleUntil: now + CATALOG_STALE_MS
-  });
+  const record = { payload, fingerprint, usedGemini, createdAt: now, freshUntil: now + CATALOG_FRESH_MS, staleUntil: now + CATALOG_STALE_MS };
+  catalogStore.set(catalogKey(token, type), record);
+  void persistentSet(persistKey(`catalog:${type}`, token), record, PERSIST_CATALOG_TTL_SEC);
+}
+async function hydrateCatalogFromPersistent(token, type) {
+  const local = getCatalogCached(token, type);
+  if (local) return local;
+  const record = await persistentGet(persistKey(`catalog:${type}`, token));
+  if (!record?.payload?.metas?.length) return null;
+  catalogStore.set(catalogKey(token, type), record);
+  return getCatalogCached(token, type);
 }
 
 function scheduleRefresh(token, config, reason = "request") {
@@ -299,6 +367,7 @@ async function refreshUserStateAndCatalogs(token, config, reason = "scheduled") 
     generation: (previous?.generation || 0) + 1
   };
   stateStore.set(stateKey(token), state);
+  void persistentSet(persistKey("state", token), { libraryFingerprint: fp, updatedAt: state.updatedAt, generation: state.generation }, PERSIST_STATE_TTL_SEC);
 
   if (changed || !previous || Date.now() - (previous.rebuiltAt || 0) >= STATE_REFRESH_MS) {
     invalidateTokenResults(token);
@@ -329,12 +398,12 @@ async function buildAndStoreCatalog(type, config, token, library) {
   const job = (async () => {
     const profile = await buildProfile(config, library, type);
     const fingerprint = profileFingerprint(profile);
-    const existing = getCatalogCached(token, type);
+    const existing = await hydrateCatalogFromPersistent(token, type);
     // If an identical fresh catalog already exists, do not redo the expensive TMDB/Gemini pipeline.
     if (existing && existing.fingerprint === fingerprint && !existing.stale) return existing.payload;
     const top30 = await buildTop50(type, config, profile);
-    if (!top30.length) {
-      console.warn(`No eligible recommendations produced for ${type}; preserving any previous catalog.`);
+    if (top30.length < Math.min(MIN_RECOMMENDATIONS_TARGET, config.maxResults)) {
+      console.warn(`Only ${top30.length} recommendations produced for ${type}; preserving previous catalog instead of storing a partial catalog.`);
       return existing?.payload || null;
     }
     const payload = serializeAndShuffle(top30, type, config);
@@ -397,11 +466,15 @@ async function mapLimit(items, limit, fn) {
 async function tmdb(endpoint, params, accessToken) {
   const u = new URL(`https://api.themoviedb.org/3/${endpoint}`);
   for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null && v !== "") u.searchParams.set(k, String(v));
-  const key = `tmdb:${crypto.createHash("sha256").update(`${endpoint}?${u.searchParams.toString()}`).digest("hex").slice(0, 28)}`;
+  const hash = crypto.createHash("sha256").update(`${endpoint}?${u.searchParams.toString()}`).digest("hex").slice(0, 40);
+  const key = `tmdb:${hash}`;
   const cached = cacheGet(key);
   if (cached) return cached;
+  const persisted = await persistentGet(persistKey("tmdb", "", hash));
+  if (persisted) { cacheSet(key, persisted, endpoint.startsWith("discover/") ? CATALOG_FRESH_MS : TMDB_DETAIL_CACHE_TTL_MS); return persisted; }
   const data = await jsonFetch(u, { headers: { Authorization: `Bearer ${accessToken}` } }, 10000, 3);
   cacheSet(key, data, endpoint.startsWith("discover/") ? CATALOG_FRESH_MS : TMDB_DETAIL_CACHE_TTL_MS);
+  void persistentSet(persistKey("tmdb", "", hash), data, PERSIST_TMDB_TTL_SEC);
   return data;
 }
 
@@ -896,13 +969,55 @@ async function discoverCandidates(type,config,profile){
   for(const g of genres.slice(0,10))for(const k of keywords.slice(0,12))strategies.push({with_genres:String(g),with_keywords:String(k),label:`gk:${g}:${k}`});
   for(const item of seeds.slice(0,24)){const gs=(item.details.genres||[]).map(x=>x.id).slice(0,2),ks=(item.details.keywords?.keywords||[]).map(x=>x.id).slice(0,3);for(const g of gs)for(const k of ks)strategies.push({with_genres:String(g),with_keywords:String(k),label:`seedgk:${g}:${k}`});}
   const dedup=new Map();for(const x of strategies)dedup.set(x.label,x);const strategyList=[...dedup.values()].slice(0,CANDIDATE_DISCOVERY_STRATEGIES);
-  const sortModes=type==='movie'?['vote_average.desc','vote_count.desc']:['vote_average.desc','vote_count.desc'];
-  const pageJobs=[];for(const strategy of strategyList)for(const sort_by of sortModes)for(const page of [1,2]){const params={language:'en-US',include_adult:false,page,sort_by,...strategy};delete params.label;if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}else{params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}pageJobs.push({endpoint:type==='movie'?'discover/movie':'discover/tv',params});}
-  const discovered=await mapLimit(pageJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of discovered)addResults(data?.results);
-  const cheap=[...candidates.values()].filter(d=>{const rating=Number(d.vote_average),votes=Number(d.vote_count);if(!Number.isFinite(rating)||rating<config.tmdbMinRating||rating>config.tmdbMaxRating)return false;if(!Number.isFinite(votes)||votes<config.tmdbMinVotes)return false;const date=d.release_date||d.first_air_date||'',year=Number(String(date).slice(0,4));return year&&year>=config.yearMin&&year<=config.yearMax;});
+  const sortModes=['vote_average.desc','vote_count.desc'];
+  const pageJobs=[];
+  for(const strategy of strategyList) for(const sort_by of sortModes) for(const page of [1,2]) {
+    const params={language:'en-US',include_adult:false,page,sort_by,...strategy}; delete params.label;
+    params.vote_count_gte=config.tmdbMinVotes; params.vote_average_gte=config.tmdbMinRating; params.vote_average_lte=config.tmdbMaxRating;
+    if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
+    else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
+    pageJobs.push({endpoint:type==='movie'?'discover/movie':'discover/tv',params});
+  }
+  const discovered=await mapLimit(pageJobs,8,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
+  for(const data of discovered)addResults(data?.results);
+
+  // A broad fallback is intentional: the personalized model decides what is
+  // good later. This prevents a narrow TMDB strategy from starving the movie
+  // pool and producing only a couple of usable titles.
+  const fallbackJobs=[1,2,3].flatMap(page=>sortModes.map(sort_by=>{
+    const params={language:'en-US',include_adult:false,page,sort_by,vote_count_gte:config.tmdbMinVotes,vote_average_gte:config.tmdbMinRating,vote_average_lte:config.tmdbMaxRating};
+    if(type==='movie'){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
+    else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
+    return {endpoint:type==='movie'?'discover/movie':'discover/tv',params};
+  }));
+  const fallback=await mapLimit(fallbackJobs,4,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));
+  for(const data of fallback)addResults(data?.results);
+
+  const cheap=[...candidates.values()].filter(d=>{
+    const rating=Number(d.vote_average),votes=Number(d.vote_count);
+    if(!Number.isFinite(rating)||rating<config.tmdbMinRating||rating>config.tmdbMaxRating)return false;
+    if(!Number.isFinite(votes)||votes<config.tmdbMinVotes)return false;
+    const date=d.release_date||d.first_air_date||'',year=Number(String(date).slice(0,4));
+    return year&&year>=config.yearMin&&year<=config.yearMax;
+  });
+
   const shuffled=cheap.slice().sort((a,b)=>stableSeed(`${ALGO_VERSION}:${type}:${a.id}:${profile.positiveCount}`)-stableSeed(`${ALGO_VERSION}:${type}:${b.id}:${profile.positiveCount}`));
-  const limited=shuffled.slice(0,CANDIDATE_DETAILS_LIMIT);const detailed=(await mapLimit(limited,12,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null))).filter(Boolean);const final=detailed.filter(d=>hardFilter(d,type,config,profile.watched,excludedGenres));
-  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} seedRequests=${seedJobs.length} discoveryRequests=${pageJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${final.length}`);return final;
+  const limited=shuffled.slice(0,CANDIDATE_DETAILS_LIMIT);
+  const detailed=[];
+  const eligible=[];
+  for(let start=0; start<limited.length && start< CANDIDATE_DETAILS_LIMIT; start+=CANDIDATE_DETAIL_BATCH){
+    const batch=limited.slice(start,start+CANDIDATE_DETAIL_BATCH);
+    const rows=await mapLimit(batch,CANDIDATE_DETAIL_CONCURRENCY,async c=>tmdb(`${media}/${c.id}`,{language:'en-US',append_to_response:'keywords,external_ids,credits'},config.tmdbAccessToken).catch(()=>null));
+    for(const d of rows){
+      if(!d) continue;
+      detailed.push(d);
+      if(hardFilter(d,type,config,profile.watched,excludedGenres)) eligible.push(d);
+    }
+    // Once we have a healthy pool, stop making expensive detail requests.
+    if(eligible.length>=Math.max(MIN_RECOMMENDATIONS_TARGET*4,80)) break;
+  }
+  console.log(`Candidate pipeline ${type}: seeds=${seeds.length} seedRequests=${seedJobs.length} discoveryRequests=${pageJobs.length+fallbackJobs.length} raw=${candidates.size} cheap=${cheap.length} detailed=${detailed.length} eligible=${eligible.length}`);
+  return eligible;
 }
 
 async function buildTop50(type,config,profile){if(!profile.positiveCount)return[];const filtered=await discoverCandidates(type,config,profile);if(!filtered.length)return[];let candidateVectors=null;if(geminiAvailable(config.geminiApiKey)&&profile.positiveVectors?.length)candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}:${type}`).catch(()=>null);const scored=filtered.map((d,i)=>{const sem=candidateVectors?.[i]?semanticScore(candidateVectors[i],profile.positiveVectors,profile.positives,profile.clusters):0;const feat=featureSimilarity(d,profile.featureProfile);const discriminative=preferenceFeatureScore(d,profile.preferenceModel);const lex=lexicalSimilarity(d,profile.positives);const clusterFit=candidateVectors?.[i]&&profile.clusters?.length?Math.max(...profile.clusters.map(c=>Math.max(0,cosine(candidateVectors[i],c.vector))*c.weight)):0;const negativeSemantic=candidateVectors?.[i]?watchedNegativeSimilarity(candidateVectors[i],profile.negativeVectors):0;const negativeFeature=Math.max(0,-discriminative);const negCount=profile.watchedUnrated?.length||0;const negativeStrength=Math.min(1,Math.log1p(negCount)/Math.log1p(24));const watchedPenalty=.34*negativeStrength*(.55*negativeSemantic+.45*negativeFeature);const positiveTaste=.46*sem+.20*feat+.20*Math.max(0,discriminative)+.09*clusterFit+.05*lex;const convergence=Math.min(1,[sem,feat,Math.max(0,discriminative),clusterFit,lex].filter(x=>x>=.25).length/5);const tasteScore=Math.max(0,Math.min(1,positiveTaste+.09*convergence-watchedPenalty));const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;const votes=Math.max(0,Number(d.vote_count)||0);const voteReliability=Math.min(1,Math.log10(1+votes)/5);const personalScore=.92*tasteScore+.05*rating+.03*voteReliability;return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:candidateVectors?.[i]||null};}).filter(x=>x.imdbId);scored.sort((a,b)=>b.personalScore-a.personalScore);const top=diversityPick(scored,Math.min(30,config.maxResults));console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length}`);return top;}
@@ -964,43 +1079,29 @@ function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
   });
 }
 async function buildBootstrapCatalog(type, config, token) {
-  // This is deliberately small and deterministic. It is only used when the
-  // personalized catalog has never been built in this process. Its job is to
-  // guarantee that Stremio gets a valid non-empty catalog while the real model
-  // warms in the background. It is never stored as a personalized result.
   const media = type === "movie" ? "movie" : "tv";
   const endpoint = type === "movie" ? "discover/movie" : "discover/tv";
-  const params = {
-    language: "en-US",
-    include_adult: false,
-    page: 1,
-    sort_by: "vote_average.desc",
-    "vote_count.gte": config.tmdbMinVotes,
-    "vote_average.gte": config.tmdbMinRating,
-    "vote_average.lte": config.tmdbMaxRating
-  };
-  if (type === "movie") {
-    params.primary_release_date_gte = `${config.yearMin}-01-01`;
-    params.primary_release_date_lte = `${Math.min(config.yearMax, new Date().getFullYear())}-12-31`;
-  } else {
-    params.first_air_date_gte = `${config.yearMin}-01-01`;
-    params.first_air_date_lte = `${Math.min(config.yearMax, new Date().getFullYear())}-12-31`;
+  const pages=[1,2,3];
+  const raw=[];
+  for(const page of pages){
+    const params={language:"en-US",include_adult:false,page,sort_by:"vote_count.desc",vote_count_gte:config.tmdbMinVotes,vote_average_gte:config.tmdbMinRating,vote_average_lte:config.tmdbMaxRating};
+    if(type==="movie"){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
+    else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
+    const data=await tmdb(endpoint,params,config.tmdbAccessToken).catch(()=>null);
+    raw.push(...(data?.results||[]));
   }
-  const data = await tmdb(endpoint, params, config.tmdbAccessToken);
-  const raw = (data?.results || []).slice(0, 20);
-  const state = stateStore.get(stateKey(token));
-  const watched = state?.library ? watchedSetFromLibrary(state.library) : new Set();
-  const excludedGenres = new Set((config.excludeGenres || []).map(cleanText));
-  const details = (await mapLimit(raw, 8, async c => tmdb(`${media}/${c.id}`, { language: "en-US", append_to_response: "keywords,external_ids,credits" }, config.tmdbAccessToken).catch(() => null))).filter(Boolean);
-  const eligible = details.filter(d => hardFilter(d, type, config, watched, excludedGenres));
-  return serializeAndShuffle(eligible.slice(0, Math.min(30, config.maxResults)).map(d => ({
-    details: d, imdbId: d.external_ids?.imdb_id || d.imdb_id, personalScore: 0, semantic: null
-  })), type, { ...config, displayOrder: "score" });
+  const state=stateStore.get(stateKey(token));
+  const watched=state?.library?watchedSetFromLibrary(state.library):new Set();
+  const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));
+  const details=await mapLimit([...new Map(raw.map(x=>[x.id,x])).values()].slice(0,90),6,async c=>tmdb(`${media}/${c.id}`,{language:"en-US",append_to_response:"keywords,external_ids,credits"},config.tmdbAccessToken).catch(()=>null));
+  const eligible=details.filter(Boolean).filter(d=>hardFilter(d,type,config,watched,excludedGenres));
+  const usable=eligible.filter(d=>d.external_ids?.imdb_id||d.imdb_id).slice(0,Math.min(30,config.maxResults));
+  return serializeAndShuffle(usable.map(d=>({details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore:0,semantic:null})),type,{...config,displayOrder:"score"});
 }
 
 async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
-  const cached = getCatalogCached(token, type);
+  const cached = await hydrateCatalogFromPersistent(token, type);
   if (cached) {
     if (cached.stale) scheduleRefresh(token, config, "stale-catalog");
     else {
@@ -1165,7 +1266,10 @@ async function handle(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
-  if (u.pathname === "/health") { res.writeHead(200, { "content-type":"text/plain", "cache-control":"no-store" }); return res.end("ok"); }
+  if (u.pathname === "/health") {
+    res.writeHead(200, { "content-type":"application/json", "cache-control":"no-store" });
+    return res.end(JSON.stringify({ ok:true, version:ALGO_VERSION, persistentCache:UPSTASH_ENABLED, catalogMemory:catalogStore.size }));
+  }
   if (u.pathname === "/configure" && req.method === "GET") {
     if (LAST_CONFIG_TOKEN && unpackConfig(LAST_CONFIG_TOKEN)) { res.writeHead(302, { "location": `/u/${LAST_CONFIG_TOKEN}/configure`, "cache-control":"no-store" }); return res.end(); }
     res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" }); return res.end(configurePage());
@@ -1212,4 +1316,4 @@ http.createServer((req,res) => handle(req,res).catch(e => {
   console.error(e);
   if (!res.headersSent) res.writeHead(500, { "content-type":"application/json" });
   res.end(JSON.stringify({ error:"internal_error" }));
-})).listen(PORT, HOST, () => console.log(`Antony addon v4.0.1 listening on ${HOST}:${PORT}`));
+})).listen(PORT, HOST, () => console.log(`Antony addon v4.0.3 listening on ${HOST}:${PORT}`));

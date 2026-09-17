@@ -1,19 +1,29 @@
-# 🎯 Antony — Personal Stremio Recommendations v4.0.1
+# 🎯 Antony — Personal Stremio Recommendations v4.0.3
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 👍/❤️ signals.
 
-## v4.0.1 — reliability + performance
+## v4.0.3 — persistent cache + reliable refresh
 
-- Keeps the v3 recommendation model and its learned taste logic.
-- Discovery remains broad, but expensive TMDB detail enrichment is capped after cheap eligibility filtering.
-- Candidate discovery uses positive seeds, TMDB similar/recommendations, and profile-derived genre/keyword combinations.
-- The first request never deliberately returns an empty catalog merely because personalization is still calculating.
-- If no personalized catalog exists yet, a small temporary TMDB bootstrap catalog is returned while the personalized build continues in the background.
-- Empty catalog responses are sent with `Cache-Control: no-store` so a transient failure cannot poison Stremio's cache for minutes.
+- Keeps the v3 recommendation model and learned taste logic.
+- Stores the **last valid Top 30 Films and last valid Top 30 Series** in Upstash Redis when the two `UPSTASH_REDIS_REST_*` environment variables are configured.
+- On Render restart, the previous catalogs can be restored immediately from Upstash while the new personalized calculation runs in the background.
+- TMDB responses already obtained by the addon are also cached persistently in Upstash for long-term reuse; eviction is enabled on the database so the cache can use the available capacity without making stale entries fatal.
+- The local Render RAM cache remains the fast L1 cache; Upstash is the persistent L2 cache.
+- A rebuild never replaces a valid 30-item catalog with a partial result.
 - Movie and series builds are serialized per user to avoid CPU/network contention on Render Free.
-- Duplicate builds for the same user/type are locked and coalesced.
-- A previously valid personalized catalog is retained if a rebuild produces no eligible results or fails.
+- Discovery remains broad, while expensive TMDB detail enrichment is applied only after cheap eligibility filters.
+- The first request never deliberately returns an empty catalog merely because personalization is still calculating.
+- If no personalized catalog exists yet, a temporary TMDB bootstrap can be returned while the full build continues.
 - Gemini remains optional; failures fall back to the local recommender.
+
+## Persistent cache
+
+Set these Render environment variables to the Upstash REST credentials:
+
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+
+The addon stores public TMDB metadata and the two last-known-good recommendation catalogs. It does **not** persist raw Stremio Likes/Loves/library records in Redis. The current Stremio account data remains sourced from Stremio.
 
 ## Recommendation model
 
@@ -34,6 +44,17 @@ Open `/configure` and provide:
 
 The TMDB Read Access Token is stored encrypted inside the generated manifest token and sent to TMDB only as an HTTP Bearer token.
 
-## Important Render Free limitation
+## Cache architecture
 
-Render Free web services have an ephemeral filesystem and can spin down after inactivity. Therefore this addon does not pretend that a local disk cache is persistent across restarts. The last-known-good catalog is kept in memory while the instance is alive; after a cold restart, the temporary bootstrap prevents an empty catalog while the personalized catalog is rebuilt. Render documents that persistent disks require paid services.
+```text
+Stremio
+   ↓
+Render addon
+   ├── L1: RAM cache (fast)
+   └── L2: Upstash Redis (persistent)
+          ├── last Top 30 Films
+          ├── last Top 30 Series
+          └── reusable TMDB responses
+```
+
+Render Free's local filesystem is ephemeral; the persistent cache therefore lives in Upstash rather than `/tmp`.
