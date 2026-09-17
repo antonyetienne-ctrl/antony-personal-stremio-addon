@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "5.0.0";
+const ALGO_VERSION = "5.2.0";
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const CONFIG_SECRET = process.env.CONFIG_SECRET || crypto.createHash("sha256").update(`antony:${process.env.RENDER_SERVICE_ID || process.env.RENDER_INSTANCE_ID || "local"}`).digest("hex");
@@ -29,23 +29,29 @@ const DEFAULTS = {
   maxResults: 30,
   displayOrder: "random",
   excludeKids: true,
-  excludeWesternAnimation: true
+  excludeWesternAnimation: true,
+  movieCatalogEnabled: true,
+  seriesCatalogEnabled: true,
+  eroticCatalogEnabled: false
 };
 
-const MANIFEST = {
-  id: "com.antony.personalrecommendations",
-  version: ALGO_VERSION,
-  name: "🎯 Antony — Personal Recommendations",
-  description: "Recommendations learned primarily from Stremio 👍 and ❤️, with watched-without-rating used as cautious negative evidence with repetition confidence; watched items remain excluded from results.",
-  resources: ["catalog", "meta"],
-  types: ["movie", "series"],
-  idPrefixes: ["tt"],
-  catalogs: [
-    { type: "movie", id: "antony_movies", name: "🎯 Recommandations selon vos Goûts" },
-    { type: "series", id: "antony_series", name: "🎯 Recommandations selon vos Goûts" }
-  ],
-  behaviorHints: { configurable: true, configurationRequired: false }
-};
+function buildManifest(config = DEFAULTS) {
+  const catalogs = [];
+  if (config.movieCatalogEnabled !== false) catalogs.push({ type: "movie", id: "antony_movies", name: "🎯 Recommandations selon vos Goûts" });
+  if (config.seriesCatalogEnabled !== false) catalogs.push({ type: "series", id: "antony_series", name: "🎯 Recommandations selon vos Goûts" });
+  if (config.eroticCatalogEnabled === true) catalogs.push({ type: "movie", id: "antony_erotic_movies", name: "🔞 Films érotiques" });
+  return {
+    id: "com.antony.personalrecommendations",
+    version: ALGO_VERSION,
+    name: "🎯 Antony — Personal Recommendations",
+    description: "Recommendations learned primarily from Stremio 👍 and ❤️, with watched-without-rating used as cautious negative evidence with repetition confidence; watched items remain excluded from results.",
+    resources: ["catalog", "meta"],
+    types: ["movie", "series"],
+    idPrefixes: ["tt"],
+    catalogs,
+    behaviorHints: { configurable: true, configurationRequired: false }
+  };
+}
 
 let LAST_CONFIG_TOKEN = "";
 const CONFIG_ALIASES = new Map();
@@ -72,6 +78,8 @@ const CATALOG_FRESH_MS = 12 * 60 * 60 * 1000;
 const CATALOG_STALE_MS = 30 * 24 * 60 * 60 * 1000;
 const STATE_REFRESH_MS = 15 * 60 * 1000;
 const STATE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const EROTIC_CATALOG_TTL_MS = 12 * 60 * 60 * 1000;
+let eroticCatalogCache = null;
 const stateStore = new Map();
 const catalogStore = new Map();
 const refreshJobs = new Map();
@@ -1239,7 +1247,62 @@ async function buildBootstrapCatalog(type, config, token) {
   return serializeAndShuffle(usable.map(d=>({details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore:0,semantic:null})),type,{...config,displayOrder:"score"});
 }
 
+async function buildEroticCatalog(config) {
+  const now = Date.now();
+  if (eroticCatalogCache && now - eroticCatalogCache.updatedAt < EROTIC_CATALOG_TTL_MS) return eroticCatalogCache.payload;
+  const keywordTerms = ["erotic", "erotica", "sensuality", "seduction", "sexual tension"];
+  const keywordResults = await mapLimit(keywordTerms, 3, async term => {
+    const data = await tmdb("search/keyword", { query: term, page: 1 }, config.tmdbAccessToken).catch(() => null);
+    return (data?.results || []).filter(k => /erotic|erotica|sensual|seduction|sexual tension/i.test(String(k.name || ""))).slice(0, 2).map(k => k.id);
+  });
+  const keywordIds = [...new Set(keywordResults.flat().filter(Boolean))].slice(0, 8);
+  const raw = new Map();
+  const add = data => { for (const x of data?.results || []) if (x?.id) raw.set(`movie:${x.id}`, x); };
+  const jobs = [];
+  for (const id of keywordIds) jobs.push({ with_keywords: String(id) });
+  // Genre fallback broadens recall without including TMDB's explicit-adult flag.
+  jobs.push({ with_genres: "10749" }, { with_genres: "18,10749" });
+  const pages = await mapLimit(jobs, 4, async extra => {
+    const data = await tmdb("discover/movie", {
+      language: "en-US", include_adult: false, page: 1, sort_by: "popularity.desc",
+      vote_count_gte: 50, ...extra
+    }, config.tmdbAccessToken).catch(() => null);
+    return data;
+  });
+  for (const d of pages) add(d);
+  const candidates = [...raw.values()].sort((a,b) => Number(b.popularity||0) - Number(a.popularity||0)).slice(0, 180);
+  const details = await mapLimit(candidates, 10, async c => tmdb(`movie/${c.id}`, {
+    language: "en-US", append_to_response: "keywords,external_ids"
+  }, config.tmdbAccessToken).catch(() => null));
+  const explicitWords = /\b(porn|pornographic|porno|hentai|sexploitation|xxx|explicit sex|adult video|adult film|hardcore)\b/i;
+  const eligible = details.filter(Boolean).filter(d => {
+    if (d.adult === true) return false;
+    const text = [d.title, d.overview, ...(d.keywords?.keywords || []).map(k => k.name)].join(" ");
+    if (explicitWords.test(text)) return false;
+    if (!Number.isFinite(Number(d.runtime)) || Number(d.runtime) < 15) return false;
+    const erotic = (d.keywords?.keywords || []).some(k => /erotic|erotica|sensual|seduction|sexual tension/i.test(String(k.name||"")));
+    const genres = new Set((d.genres || []).map(g => Number(g.id)));
+    return erotic || (genres.has(10749) && genres.has(18));
+  }).sort((a,b) => Number(b.popularity||0) - Number(a.popularity||0)).slice(0, 30);
+  const metas = eligible.map(d => ({
+    id: d.external_ids?.imdb_id || d.imdb_id || `tmdb:${d.id}`,
+    type: "movie",
+    name: d.title,
+    poster: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined,
+    background: d.backdrop_path ? `https://image.tmdb.org/t/p/w1280${d.backdrop_path}` : undefined,
+    description: d.overview || "",
+    releaseInfo: String(d.release_date || "").slice(0,4),
+    imdbRating: d.vote_average != null ? Number(d.vote_average).toFixed(1) : undefined,
+    genres: (d.genres || []).map(g => g.name),
+    posterShape: "poster"
+  }));
+  const payload = { metas };
+  eroticCatalogCache = { updatedAt: now, payload };
+  return payload;
+}
+
 async function discover(type, config, token) {
+
   ACTIVE_CONFIGS.set(token, config);
   const cached = await hydrateCatalogFromPersistent(token, type);
   if (cached) {
@@ -1353,7 +1416,10 @@ function configFromForm(p, base = DEFAULTS) {
     allowOngoingSeries: p.has("allowOngoingSeries"),
     displayOrder: p.get("displayOrder") === "score" ? "score" : (p.get("displayOrder") === "random" ? "random" : (base.displayOrder || DEFAULTS.displayOrder)),
     excludeKids: p.has("excludeKids"),
-    excludeWesternAnimation: p.has("excludeWesternAnimation")
+    excludeWesternAnimation: p.has("excludeWesternAnimation"),
+    movieCatalogEnabled: p.has("movieCatalogEnabled"),
+    seriesCatalogEnabled: p.has("seriesCatalogEnabled"),
+    eroticCatalogEnabled: p.has("eroticCatalogEnabled")
   };
 }
 
@@ -1367,7 +1433,7 @@ function configurePage(config = DEFAULTS, action = "/config/save") {
   const escAttr = v => esc(v).replace(/`/g, "&#96;");
   const checked = k => config[k] ? "checked" : "";
   const selected = k => config.displayOrder === k ? "selected" : "";
-  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Films : durée minimale (minutes)</label><input name="runtimeMinMovie" type="number" min="0" value="${config.runtimeMinMovie}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement. La durée minimale ci-dessus concerne uniquement les films.</p></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Un contenu vu sans 👍/❤️ produit un signal négatif prudent : un seul oubli pèse presque rien, mais un motif répété sur plusieurs contenus similaires pèse davantage. Cela ne devient jamais une exclusion.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🎯 Antony</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:24px auto;padding:0 18px;line-height:1.45}section{background:#1b1b1b;padding:18px;border-radius:14px;margin:14px 0}label{display:block;margin:12px 0 5px}input,select{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.check{display:flex;align-items:center;gap:9px}.check input{width:auto}.btn{display:block;width:100%;padding:14px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111}.muted{opacity:.72;font-size:.9em}.ok{background:#172b1d;padding:12px;border-radius:10px}</style></head><body><h1>🎯 Antony — Personal Recommendations</h1><p>30 films + 30 séries, appris uniquement de tes 👍 et ❤️.</p><form method="post" action="${action}"><section><h2>Connexions</h2><label>TMDB API Read Access Token *</label><input name="tmdbAccessToken" type="password" required autocomplete="off" value="${escAttr(config.tmdbAccessToken || "")}" placeholder="${escAttr(masked(config.tmdbAccessToken))}"><label>Stremio AuthKey *</label><input name="stremioAuthKey" type="password" required autocomplete="off" value="${escAttr(config.stremioAuthKey || "")}" placeholder="${escAttr(masked(config.stremioAuthKey))}"><label>Gemini API key (recommandée)</label><input name="geminiApiKey" type="password" autocomplete="off" value="${escAttr(config.geminiApiKey || "")}" placeholder="${escAttr(masked(config.geminiApiKey))}"><p class="muted">Les clés déjà enregistrées sont conservées. Tu peux les laisser telles quelles et modifier seulement les autres paramètres.</p></section><section><h2>Affichage</h2><label>Ordre des résultats</label><select name="displayOrder"><option value="score" ${selected("score")}>Meilleur score en premier</option><option value="random" ${selected("random")}>Aléatoire</option></select><p class="muted">Dans les deux cas, ce sont les 30 meilleurs candidats qui sont sélectionnés. « Aléatoire » ne fait que mélanger leur ordre.</p></section><section><h2>Filtres TMDB</h2><div class="grid"><div><label>Note minimale</label><input name="tmdbMinRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMinRating}"></div><div><label>Note maximale</label><input name="tmdbMaxRating" type="number" min="0" max="10" step="0.1" value="${config.tmdbMaxRating}"></div><div><label>Votes minimum</label><input name="tmdbMinVotes" type="number" min="0" step="100" value="${config.tmdbMinVotes}"></div><div><label>Année min.</label><input name="yearMin" type="number" value="${config.yearMin}"></div><div><label>Année max.</label><input name="yearMax" type="number" value="${config.yearMax || y}"></div><div><label>Films : durée minimale (minutes)</label><input name="runtimeMinMovie" type="number" min="0" value="${config.runtimeMinMovie}"></div></div><label>Genres à exclure</label><input name="excludeGenres" value="${escAttr((config.excludeGenres || []).join(", "))}"><p class="muted">La note et les votes restent des filtres, puis ont seulement un faible poids dans le classement. La durée minimale ci-dessus concerne uniquement les films.</p></section><section><h2>Affichage des catalogues</h2><p class="muted">Stremio ne permet pas à un addon de séparer indépendamment Board (catalogue) et Discover (découverte) pour un même catalogue : un catalogue standard apparaît dans les deux. Ces cases activent ou désactivent donc chaque catalogue.</p><label class="check"><input name="movieCatalogEnabled" type="checkbox" ${checked("movieCatalogEnabled")}> Films — afficher le catalogue</label><label class="check"><input name="seriesCatalogEnabled" type="checkbox" ${checked("seriesCatalogEnabled")}> Séries — afficher le catalogue</label><label class="check"><input name="eroticCatalogEnabled" type="checkbox" ${checked("eroticCatalogEnabled")}> Films érotiques — afficher le catalogue</label><p class="muted">Catalogue séparé, non personnalisé et trié par popularité. Il exclut le contenu pornographique explicite et les contenus explicitement adultes.</p></section><section><h2>Exclusions</h2><label class="check"><input name="excludeKids" type="checkbox" ${checked("excludeKids")}> Exclure le contenu clairement destiné aux enfants</label><label class="check"><input name="excludeWesternAnimation" type="checkbox" ${checked("excludeWesternAnimation")}> Séries : exclure l'animation occidentale</label><p class="muted">Les anime restent autorisés : l'animation japonaise est conservée.</p></section><section><h2>Apprentissage</h2><label class="check"><input name="useWatchedExclusion" type="checkbox" ${checked("useWatchedExclusion")}> Exclure ce que j'ai déjà vu</label><label class="check"><input name="useLikes" type="checkbox" ${checked("useLikes")}> Utiliser les 👍</label><label class="check"><input name="useHearts" type="checkbox" ${checked("useHearts")}> Utiliser les ❤️</label><label class="check"><input name="excludeCancelledSeries" type="checkbox" ${checked("excludeCancelledSeries")}> Exclure les séries annulées</label><label class="check"><input name="allowOngoingSeries" type="checkbox" ${checked("allowOngoingSeries")}> Autoriser les séries en cours</label></section><div class="ok">❤️ pèse 3× 👍. Un contenu vu sans 👍/❤️ produit un signal négatif prudent : un seul oubli pèse presque rien, mais un motif répété sur plusieurs contenus similaires pèse davantage. Cela ne devient jamais une exclusion.</div><br><button class="btn">Enregistrer</button></form></body></html>`;
 }
 
 async function saveConfig(req, res, previousToken = "") {
@@ -1419,7 +1485,7 @@ async function handle(req, res) {
   const pathTokenMatch = u.pathname.match(/^\/u\/([^/]+)/);
   const pathToken = pathTokenMatch?.[1] || "";
   const effectiveToken = resolvedPathToken(u.pathname);
-  if (tokenConfig && u.pathname.endsWith("/manifest.json")) { LAST_CONFIG_TOKEN = effectiveToken; ACTIVE_CONFIGS.set(effectiveToken, tokenConfig); res.writeHead(200, { "content-type":"application/json", "cache-control":"no-store" }); return res.end(JSON.stringify(MANIFEST)); }
+  if (tokenConfig && u.pathname.endsWith("/manifest.json")) { LAST_CONFIG_TOKEN = effectiveToken; ACTIVE_CONFIGS.set(effectiveToken, tokenConfig); res.writeHead(200, { "content-type":"application/json", "cache-control":"no-store" }); return res.end(JSON.stringify(buildManifest(tokenConfig))); }
   if (tokenConfig && u.pathname === `/u/${pathToken}/configure` && req.method === "GET") { LAST_CONFIG_TOKEN = effectiveToken; res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" }); return res.end(configurePage(tokenConfig, `/u/${effectiveToken}/config/save`)); }
   if (tokenConfig && u.pathname === `/u/${pathToken}/config/save` && req.method === "POST") {
     const result = await saveConfig(req, res, effectiveToken);
@@ -1431,6 +1497,13 @@ async function handle(req, res) {
       const [, resource, type, id] = m;
       try {
         if (resource === "catalog") {
+          const catalogId = id;
+          if (catalogId === "antony_erotic_movies") {
+            if (tokenConfig.eroticCatalogEnabled !== true) { res.writeHead(404); return res.end(JSON.stringify({ metas: [] })); }
+            const result = await buildEroticCatalog(tokenConfig);
+            res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"public, max-age=21600, stale-while-revalidate=86400" });
+            return res.end(JSON.stringify(result));
+          }
           const result = await discover(type, tokenConfig, u.pathname.split("/")[2]);
           res.writeHead(200, { "content-type":"application/json; charset=utf-8", "cache-control":"no-store, no-cache, must-revalidate" });
           return res.end(JSON.stringify(result));
