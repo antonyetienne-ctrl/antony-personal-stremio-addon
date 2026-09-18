@@ -1,6 +1,6 @@
 {
   "name": "antony-personal-stremio-addon",
-  "version": "6.1.1",
+  "version": "6.1.3",
   "private": true,
   "description": "Personal Stremio recommendations with unified taste learning, French metadata, measured builds and resumable checkpoints.",
   "main": "server.js",
