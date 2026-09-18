@@ -1,58 +1,43 @@
-# 🎯 Antony — Personal Stremio Recommendations v6.1.3
+# 🎯 Antony — Personal Stremio Recommendations v6.2.0
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio ❤️/👍 signals and watched-without-rating negative evidence.
 
-## v6.1.3 — T0 rebuild + persistent feedback cache + low-Upstash architecture
+## v6.2.0 — daily sync + cumulative candidate pool + low-Upstash architecture
 
 - Unified Films + Séries taste model, with format-specific heads.
+- **70% type-specific taste + 30% global Films+Séries taste** for both movie and series ranking.
 - ❤️ = loved; 👍 = liked; watched without 👍/❤️ = negative evidence.
-- Negative families, feature interactions, anti-patterns and semantic negative prototypes are learned separately from positive taste.
-- No artificial genre quota and no popularity ranking.
-- TMDB rating/vote thresholds remain hard filters; they are not the main ranking signal.
-- Final Top 30 is the actual highest personalized score, then optionally shuffled for display.
-- Last complete Top 30 Films and Top 30 Séries remain published while a new build runs. A partial/temporary popularity catalog is never published.
-- TMDB display metadata uses **fr-FR** wherever TMDB provides it.
-- French posters are preferred via TMDB image language selection, with neutral/English fallback when no French poster exists.
-- French YouTube trailer is preferred when TMDB has one; otherwise neutral/English trailer fallback is used.
-- Upstash is deliberately used only for high-value persistent state: last catalogs, encrypted configuration, ratings snapshot, compact profile source, candidate pools, build timing and compact checkpoints. High-volume per-item TMDB/embedding writes are not sent to Upstash.
-- Every catalog request starts the rebuild at **T0** for the measurement phase. The last complete Top 30 remains served immediately while the new movie + series build runs in the background.
-- Build timing is recorded phase-by-phase and persisted in Upstash.
-- Candidate discovery and eligible-detail pools are persisted as compact bulk values with short TTLs, so repeated builds avoid dozens of TMDB Discover calls without generating dozens of Upstash commands.
-- The latest encrypted configuration token is persisted separately in Upstash so API keys survive Render restarts/deployments; the configuration form preserves existing keys when fields are left blank.
-- Stremio ❤️/👍/neutral status is kept in one compact persistent snapshot. New titles are queried immediately; the full rating sweep is refreshed at most every 2 hours, because Stremio exposes rating status per title rather than as a bulk feed. This is the main speed/precision compromise.
-- `/u/<TOKEN>/debug/build.json` exposes the latest build status/timing for the configured addon token; it contains no API keys.
-- Gemini remains optional. If Gemini is unavailable or rate-limited, the local recommender continues.
+- The existing positive/negative learning model is retained; negative families, interactions and semantic negative prototypes remain separate from positive taste.
+- **TMDB rating < 5/10 is a hard exclusion. There is no minimum vote-count filter.** Vote count is only a weak confidence/ranking signal.
+- Candidate discovery is cumulative: the persistent pool grows across rebuilds and is not capped at a fixed total number of candidates.
+- Previously enriched candidate details remain available and are ranked together with newly enriched candidates. Each daily rebuild only limits the number of *new detail API calls* so TMDB work remains bounded; this is not a cap on the cumulative candidate pool.
+- Last complete Top 30 Films and Top 30 Séries remain published while a replacement build runs. A partial catalog is never published.
+- TMDB display metadata uses **fr-FR** wherever TMDB provides it; French posters and trailers are preferred with neutral/English fallback.
 
-## Build timing / diagnostic
+## Synchronisation
 
-After a real rebuild, open:
+- Stremio catalog navigation is read-only and **does not trigger a rebuild**.
+- At most **one synchronization per calendar day** (Europe/Zurich) is performed.
+- The daily sync refreshes the Stremio library and rating snapshot, then compares the resulting library/feedback fingerprints.
+- If nothing changed, **no recommendation rebuild occurs**.
+- A single relevant change — one Like, one Love, one newly watched item, etc. — causes a complete Films + Séries rebuild.
+- Configuration changes can intentionally trigger a rebuild immediately.
+- There is no periodic 15-minute rebuild loop.
 
-`https://YOUR-RENDER-URL/u/YOUR_TOKEN/debug/build.json`
+## Upstash / Free-tier strategy
 
-The response contains:
+Upstash is used only for compact, high-value persistent state. High-volume TMDB/embedding data is not written item-by-item to Upstash.
 
-- `status`: running / complete / failed
-- `startedAt`, `finishedAt`, `durationMs`
-- movie and series durations
-- phase durations for profile, ranking and French localization
-- reason for the rebuild
+The architecture specifically reduces commands by:
 
-The same data is written to the Render logs as `BUILD COMPLETE ...` and persisted in Upstash for later retrieval.
+- keeping build diagnostics and partial checkpoints in RAM only;
+- avoiding rebuilds caused by catalog navigation;
+- persisting the cumulative candidate pool as one compressed bulk value per type;
+- persisting the rating snapshot as one compact value;
+- serving existing catalogs directly from RAM or persistent cache;
+- using a longer Upstash timeout to avoid unnecessary fallback churn.
 
-## Render Free limitation
-
-Render Free can spin down after 15 minutes without inbound traffic. The addon therefore persists build checkpoints instead of assuming that a long in-process calculation will survive a sleep/restart.
-
-A server-originated self-ping is **not** used as a keep-alive mechanism.
-
-## Persistent cache
-
-Set:
-
-- `UPSTASH_REDIS_REST_URL`
-- `UPSTASH_REDIS_REST_TOKEN`
-
-The cache namespace is versioned (`v6.1`) so older v5/v6 catalogs cannot be mistaken for v6.1 results.
+The goal is for Upstash command volume to depend mainly on **real synchronisation/build events**, not on the number of candidates considered by the recommender.
 
 ## Configuration
 
@@ -62,12 +47,12 @@ Open `/configure` and provide:
 2. Stremio AuthKey
 3. Gemini API key (optional)
 
-Existing keys are preserved when the corresponding configuration field is left unchanged.
+Existing keys are preserved when corresponding fields are left unchanged.
 
-## Recommended default filters
+Default filters:
 
-- TMDB rating ≥ 7.2
-- TMDB votes ≥ 2000
+- TMDB rating ≥ 5.0
+- no minimum TMDB vote count
 - Horror / Romance / Music / Comedy excluded
 - Kids excluded
 - Western animation series excluded; anime remains allowed
@@ -75,19 +60,12 @@ Existing keys are preserved when the corresponding configuration field is left u
 - Ongoing series allowed
 - No maximum movie duration
 
-## Cache architecture
+## Diagnostics
 
-```text
-Stremio
-   ↓
-Render Web Service
-   ├── L1 RAM
-   └── L2 Upstash
-       ├── latest complete Top 30 Films
-       ├── latest complete Top 30 Series
-       ├── ratings snapshot
-       ├── compact profile source
-       ├── candidate pools (short TTL)
-       ├── build timing / compact checkpoints
-       └── encrypted latest configuration
-```
+`/u/<TOKEN>/debug/build.json` exposes the latest in-process build status and timings without exposing API keys.
+
+## Render / persistence
+
+Render Free can spin down after inactivity. The addon therefore relies on persistent catalogs, state and candidate pools in Upstash rather than assuming that RAM survives a restart.
+
+Persistent keys are compressed with gzip. The namespace remains versioned under `v6` so older generations are isolated from the current algorithm where appropriate.
