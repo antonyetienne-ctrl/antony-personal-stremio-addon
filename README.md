@@ -1,8 +1,8 @@
-# 🎯 Antony — Personal Stremio Recommendations v6.2.0
+# 🎯 Antony — Personal Stremio Recommendations v6.3.0
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio ❤️/👍 signals and watched-without-rating negative evidence.
 
-## v6.2.0 — daily sync + cumulative candidate pool + low-Upstash architecture
+## v6.3.0 — daily sync + cumulative candidate pool + low-Upstash architecture
 
 - Unified Films + Séries taste model, with format-specific heads.
 - **70% type-specific taste + 30% global Films+Séries taste** for both movie and series ranking.
@@ -22,6 +22,9 @@ Custom Stremio addon producing **30 films + 30 series** from the user's Stremio 
 - If nothing changed, **no recommendation rebuild occurs**.
 - A single relevant change — one Like, one Love, one newly watched item, etc. — causes a complete Films + Séries rebuild.
 - Configuration changes can intentionally trigger a rebuild immediately.
+- Daily-sync and configuration builds are coalesced per Stremio account; they can never run in parallel for the same account.
+- The persistent state, profile source, rating snapshot and rendered catalogs are keyed by the stable Stremio account scope rather than the random encrypted manifest token. Saving configuration therefore does not throw away the accumulated cache.
+- A first catalog request never intentionally returns an empty catalog: if no personalized catalog exists yet, a temporary TMDB bootstrap catalog is returned while the full personalized build runs in the background.
 - There is no periodic 15-minute rebuild loop.
 
 ## Upstash / Free-tier strategy
@@ -35,6 +38,8 @@ The architecture specifically reduces commands by:
 - persisting the cumulative candidate pool as one compressed bulk value per type;
 - persisting the rating snapshot as one compact value;
 - serving existing catalogs directly from RAM or persistent cache;
+- keeping configuration-token changes from duplicating the same user cache;
+- coalescing simultaneous background builds into one account-scoped job;
 - using a longer Upstash timeout to avoid unnecessary fallback churn.
 
 The goal is for Upstash command volume to depend mainly on **real synchronisation/build events**, not on the number of candidates considered by the recommender.
@@ -69,3 +74,11 @@ Default filters:
 Render Free can spin down after inactivity. The addon therefore relies on persistent catalogs, state and candidate pools in Upstash rather than assuming that RAM survives a restart.
 
 Persistent keys are compressed with gzip. The namespace remains versioned under `v6` so older generations are isolated from the current algorithm where appropriate.
+
+## 6.3.0 stability fixes
+
+- Fixed overlapping `daily-sync` / `configuration` builds caused by using the encrypted manifest token as the job identity.
+- Fixed cache fragmentation after configuration changes: user-scoped persistent data now follows the stable Stremio AuthKey scope.
+- Fixed the first-request `metas: []` path. A temporary bootstrap catalog is returned instead of deliberately returning an empty catalog.
+- Bootstrap catalogs use TMDB details already fetched and do not perform poster/video enrichment, keeping the first response substantially lighter than a full recommendation build.
+- Added a Render HTTP health check on `/health`.

@@ -5,3 +5,4 @@ services:
     plan: free
     region: frankfurt
     dockerfilePath: ./Dockerfile
+    healthCheckPath: /health

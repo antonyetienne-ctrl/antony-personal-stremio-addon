@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "6.2.0";
+const ALGO_VERSION = "6.3.0";
 const TMDB_LANGUAGE = "fr-FR";
 const TMDB_FALLBACK_LANGUAGE = "en-US";
 const BUILD_DELAY_MS = 0;
@@ -111,6 +111,7 @@ const NEGATIVE_QUASI_EXCLUSION_THRESHOLD = 0.72;
 const NEGATIVE_HARD_RISK_THRESHOLD = 0.88;
 const EMBEDDING_BATCH = 50;
 const COLD_START_WAIT_MS = 0;
+const BOOTSTRAP_CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 const SYNC_TIME_ZONE = "Europe/Zurich";
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
 let geminiCooldownUntil = 0;
@@ -159,8 +160,18 @@ function persistLatestConfigToken(token) {
 }
 
 
+function stableUserScope(config){
+  return crypto.createHash("sha256").update(String(config?.stremioAuthKey || "anonymous")).digest("hex").slice(0,24);
+}
+function tokenUserScope(token){
+  try {
+    const config = unpackConfig(token);
+    if (config?.stremioAuthKey) return stableUserScope(config);
+  } catch {}
+  return token ? crypto.createHash("sha256").update(String(token)).digest("hex").slice(0,24) : "global";
+}
 function persistKey(scope, token = "", extra = "") {
-  const user = token ? crypto.createHash("sha256").update(token).digest("hex").slice(0, 24) : "global";
+  const user = token ? tokenUserScope(token) : "global";
   const suffix = extra ? `:${extra}` : "";
   return `${PERSIST_PREFIX}${user}:${scope}${suffix}`;
 }
@@ -355,8 +366,8 @@ function watchedSetFromLibrary(library) {
   return watched;
 }
 
-function stateKey(token) { return `state:${token}`; }
-function catalogKey(token, type) { return `${token}:${type}`; }
+function stateKey(token) { return `state:${tokenUserScope(token)}`; }
+function catalogKey(token, type) { return `${tokenUserScope(token)}:${type}`; }
 
 function getCatalogCached(token, type) {
   const x = catalogStore.get(catalogKey(token, type));
@@ -402,19 +413,44 @@ function invalidateRatingCaches(token) {
 }
 
 async function scheduleRefresh(token, config, reason = "request") {
-  const key=`refresh:${token}`;
-  if(refreshJobs.has(key)) return refreshJobs.get(key);
-  const promise=(async()=>{
-    try { return await refreshUserStateAndCatalogs(token, config, reason, Date.now()); }
-    catch(e){ console.warn(`Background refresh failed (${reason}): ${e.message}`); return false; }
-    finally { refreshJobs.delete(key); }
+  // The encrypted manifest token changes when configuration is saved, but the
+  // Stremio account does not. Jobs therefore lock on the stable account scope,
+  // not on the random encrypted token. This prevents daily-sync and
+  // configuration builds from running in parallel for the same user.
+  const key = `refresh:${stableUserScope(config)}`;
+  const existing = refreshJobs.get(key);
+  if (existing) {
+    if (reason === "configuration") existing.followUp = { token, config };
+    return existing.promise;
+  }
+
+  const job = { followUp: null, promise: null };
+  job.promise = (async () => {
+    try {
+      let result = await refreshUserStateAndCatalogs(token, config, reason, Date.now());
+      // If a configuration save arrived while a daily sync was already running,
+      // do exactly one follow-up build, after the first build has published its
+      // last-known-good catalogs. Never overlap the two.
+      if (job.followUp && reason !== "configuration") {
+        const followUp = job.followUp;
+        job.followUp = null;
+        result = await refreshUserStateAndCatalogs(followUp.token, followUp.config, "configuration", Date.now());
+      }
+      return result;
+    } catch(e) {
+      console.warn(`Background refresh failed (${reason}): ${e.message}`);
+      return false;
+    } finally {
+      refreshJobs.delete(key);
+    }
   })();
-  refreshJobs.set(key,promise);
-  return promise;
+  refreshJobs.set(key, job);
+  return job.promise;
 }
 
 async function ensureDailySync(token, config) {
-  const existingCheck = dailySyncChecks.get(token);
+  const checkKey = stableUserScope(config);
+  const existingCheck = dailySyncChecks.get(checkKey);
   if (existingCheck) return existingCheck;
   const job = (async () => {
     try {
@@ -430,10 +466,10 @@ async function ensureDailySync(token, config) {
       if (state?.lastSyncDay === day) return false;
       return scheduleRefresh(token, config, "daily-sync");
     } finally {
-      dailySyncChecks.delete(token);
+      dailySyncChecks.delete(checkKey);
     }
   })();
-  dailySyncChecks.set(token, job);
+  dailySyncChecks.set(checkKey, job);
   return job;
 }
 
@@ -464,9 +500,8 @@ async function refreshUserStateAndCatalogs(token, config, reason = "daily-sync",
   const feedbackFp = unifiedProfileFingerprint(unified);
   const day = calendarDay();
   const changed = !previous || previous.libraryFingerprint !== fp || previous.feedbackFingerprint !== feedbackFp;
-  const state={...(previous||{}),library,libraryFingerprint:fp,feedbackFingerprint:feedbackFp,updatedAt:Date.now(),lastSyncDay:day,generation:(previous?.generation||0)+1};
+  const state={...(previous||{}),library,libraryFingerprint:fp,feedbackFingerprint:feedbackFp,updatedAt:Date.now(),lastSyncDay:previous?.lastSyncDay || "",generation:(previous?.generation||0)+1};
   stateStore.set(stateKey(token),state);
-  void persistentSet(persistKey("state",token),{libraryFingerprint:fp,feedbackFingerprint:feedbackFp,updatedAt:state.updatedAt,lastSyncDay:day,generation:state.generation},PERSIST_STATE_TTL_SEC);
 
   const forceBuild = reason === "configuration";
   const shouldBuild = forceBuild || changed;
@@ -474,8 +509,17 @@ async function refreshUserStateAndCatalogs(token, config, reason = "daily-sync",
     invalidateTokenResults(token);
     const tm=Date.now(); await buildAndStoreCatalog("movie",config,token,library,{stats,unified}); stats.types.movieMs=Date.now()-tm;
     const ts=Date.now(); await buildAndStoreCatalog("series",config,token,library,{stats,unified}); stats.types.seriesMs=Date.now()-ts;
-    const current=stateStore.get(stateKey(token)); if(current) current.rebuiltAt=Date.now();
+    const current=stateStore.get(stateKey(token));
+    if(current) {
+      current.rebuiltAt=Date.now();
+      current.lastSyncDay=day;
+      current.updatedAt=Date.now();
+      void persistentSet(persistKey("state",token),{libraryFingerprint:fp,feedbackFingerprint:feedbackFp,updatedAt:current.updatedAt,lastSyncDay:day,generation:current.generation},PERSIST_STATE_TTL_SEC);
+    }
   } else {
+    state.lastSyncDay=day;
+    state.updatedAt=Date.now();
+    void persistentSet(persistKey("state",token),{libraryFingerprint:fp,feedbackFingerprint:feedbackFp,updatedAt:state.updatedAt,lastSyncDay:day,generation:state.generation},PERSIST_STATE_TTL_SEC);
     console.log(`DAILY SYNC unchanged: library/profile unchanged; no rebuild`);
   }
   stats.status="complete"; stats.changed=changed; stats.finishedAt=Date.now(); stats.durationMs=stats.finishedAt-startedAt;
@@ -503,7 +547,7 @@ async function buildAndStoreCatalog(type, config, token, library, buildCtx = nul
     const fingerprint = profileFingerprint(profile);
     await saveBuildCheckpoint(token,type,{status:"profile_ready",stage:"profile",fingerprint});
     const existing = await hydrateCatalogFromPersistent(token, type);
-    if (existing && existing.fingerprint === fingerprint && !existing.stale) { clearBuildCheckpoint(token,type); return existing.payload; }
+    if (existing && existing.fingerprint === fingerprint && !existing.stale && !String(existing.fingerprint).startsWith("bootstrap-")) { clearBuildCheckpoint(token,type); return existing.payload; }
     const top30 = await timed(stats, `${type}.ranking`, () => buildTop50(type, config, profile, token, fingerprint, stats));
     if (top30.length < Math.min(MIN_RECOMMENDATIONS_TARGET, config.maxResults)) {
       console.warn(`Only ${top30.length} recommendations produced for ${type}; preserving previous catalog instead of storing a partial catalog.`);
@@ -1302,7 +1346,6 @@ function candidateConfigFingerprint(type, config) {
   })).digest("hex").slice(0,24);
 }
 
-function stableUserScope(config){ return crypto.createHash("sha256").update(String(config?.stremioAuthKey || "anonymous")).digest("hex").slice(0,24); }
 function candidatePoolKey(config,type){ return `${PERSIST_PREFIX}${stableUserScope(config)}:candidate-pool:${type}`; }
 
 async function loadCandidatePool(config,type){
@@ -1534,36 +1577,74 @@ function scheduleGeminiUpgrade(type,config,token,library,fingerprint){
 async function buildBootstrapCatalog(type, config, token) {
   const media = type === "movie" ? "movie" : "tv";
   const endpoint = type === "movie" ? "discover/movie" : "discover/tv";
-  const pages=[1,2,3];
-  const raw=[];
-  for(const page of pages){
-    const params={language:TMDB_LANGUAGE,include_adult:false,page,sort_by:"vote_count.desc",vote_average_gte:config.tmdbMinRating,vote_average_lte:config.tmdbMaxRating};
-    if(type==="movie"){params.primary_release_date_gte=`${config.yearMin}-01-01`;params.primary_release_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
-    else {params.first_air_date_gte=`${config.yearMin}-01-01`;params.first_air_date_lte=`${Math.min(config.yearMax,new Date().getFullYear())}-12-31`;}
-    const data=await tmdb(endpoint,params,config.tmdbAccessToken).catch(()=>null);
-    raw.push(...(data?.results||[]));
+  const raw = [];
+  for (const page of [1, 2]) {
+    const params = {
+      language: TMDB_LANGUAGE, include_adult: false, page, sort_by: "vote_count.desc",
+      vote_average_gte: config.tmdbMinRating, vote_average_lte: config.tmdbMaxRating
+    };
+    if (type === "movie") {
+      params.primary_release_date_gte = `${config.yearMin}-01-01`;
+      params.primary_release_date_lte = `${Math.min(config.yearMax, new Date().getFullYear())}-12-31`;
+    } else {
+      params.first_air_date_gte = `${config.yearMin}-01-01`;
+      params.first_air_date_lte = `${Math.min(config.yearMax, new Date().getFullYear())}-12-31`;
+    }
+    const data = await tmdb(endpoint, params, config.tmdbAccessToken).catch(() => null);
+    raw.push(...(data?.results || []));
   }
-  const state=stateStore.get(stateKey(token));
-  const watched=state?.library?watchedSetFromLibrary(state.library):new Set();
-  const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));
-  const details=await mapLimit([...new Map(raw.map(x=>[x.id,x])).values()].slice(0,90),6,async c=>tmdb(`${media}/${c.id}`,{language:TMDB_LANGUAGE,append_to_response:"keywords,external_ids,credits"},config.tmdbAccessToken).catch(()=>null));
-  const eligible=details.filter(Boolean).filter(d=>hardFilter(d,type,config,watched,excludedGenres));
-  const usable=eligible.filter(d=>d.external_ids?.imdb_id||d.imdb_id).slice(0,Math.min(30,config.maxResults));
-  return serializeAndShuffle(usable.map(d=>({details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore:0,semantic:null})),type,{...config,displayOrder:"score"});
+  const state = stateStore.get(stateKey(token));
+  const watched = state?.library ? watchedSetFromLibrary(state.library) : new Set();
+  const excludedGenres = new Set((config.excludeGenres || []).map(cleanText));
+  const unique = [...new Map(raw.map(x => [x.id, x])).values()].slice(0, 50);
+  const details = await mapLimit(unique, 10, async c =>
+    tmdb(`${media}/${c.id}`, { language: TMDB_LANGUAGE, append_to_response: "keywords,external_ids,credits" }, config.tmdbAccessToken).catch(() => null)
+  );
+  const eligible = details.filter(Boolean).filter(d => hardFilter(d, type, config, watched, excludedGenres));
+  const top = eligible.slice(0, Math.min(30, config.maxResults)).map(d => ({
+    details: d, imdbId: d.external_ids?.imdb_id || d.imdb_id, personalScore: 0, semantic: null
+  }));
+  // Bootstrap output uses metadata already returned by the detail calls. No
+  // extra /images or /videos requests are made here.
+  return { metas: top.map(({details:d, imdbId}) => ({
+    id: imdbId, type, name: d.title || d.name,
+    poster: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined,
+    background: d.backdrop_path ? `https://image.tmdb.org/t/p/w1280${d.backdrop_path}` : undefined,
+    description: d.overview || "",
+    releaseInfo: String(d.release_date || d.first_air_date || "").slice(0,4),
+    imdbRating: d.vote_average != null ? Number(d.vote_average).toFixed(1) : undefined,
+    genres: (d.genres || []).map(g => g.name), trailers: [], posterShape: "poster"
+  }))};
 }
 
 async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
   const cached = await hydrateCatalogFromPersistent(token, type);
-  // Catalog navigation is read-only. At most one calendar-day sync may be
-  // scheduled; ordinary navigation never launches another rebuild.
+  // Catalog navigation is read-only: it can request the once-per-day sync, but
+  // it must never wait for the heavy recommender build. Always serve the last
+  // known-good catalog immediately when one exists.
   void ensureDailySync(token, config).catch(e => console.warn(`Daily sync check failed: ${e.message}`));
-  if (cached) return cached.payload;
+  if (cached?.payload?.metas?.length) return cached.payload;
 
-  // True first run: the daily sync will build both catalogs. If a persistent
-  // catalog exists, hydrateCatalogFromPersistent above already returned it.
-  // Keep the protocol response valid while the background warm-up completes.
-  return { metas: [] };
+  // First install / empty persistent state: never return an empty catalog.
+  // Build a tiny deterministic bootstrap catalog from TMDB, publish it, and
+  // let the full personalized build replace it in the background. The bootstrap
+  // intentionally skips French image/video enrichment so it remains fast.
+  const bootstrapKey = `bootstrap:${stableUserScope(config)}:${type}`;
+  const inFlight = cacheGet(bootstrapKey);
+  if (inFlight?.promise) return await inFlight.promise;
+  const promise = buildBootstrapCatalog(type, config, token).then(payload => {
+    if (payload?.metas?.length) {
+      putCatalog(token, type, payload, `bootstrap-${ALGO_VERSION}`, false);
+      cacheSet(bootstrapKey, {promise: Promise.resolve(payload)}, BOOTSTRAP_CATALOG_TTL_MS);
+    }
+    return payload || { metas: [] };
+  }).catch(e => {
+    console.warn(`Bootstrap catalog failed (${type}): ${e.message}`);
+    return { metas: [] };
+  });
+  cacheSet(bootstrapKey, {promise}, 60 * 1000);
+  return await promise;
 }
 
 async function warmOtherType(currentType, config, token, library) {
@@ -1648,6 +1729,9 @@ async function saveConfig(req, res, previousToken = "") {
     ACTIVE_CONFIGS.set(token, config);
     res.writeHead(200, { "content-type":"text/html; charset=utf-8", "cache-control":"no-store" });
     res.end(`<!doctype html><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui;background:#111;color:#eee;max-width:650px;margin:40px auto;padding:20px}a{display:block;background:#fff;color:#111;text-align:center;padding:16px;border-radius:10px;font-weight:700;text-decoration:none;margin:20px 0}.small{word-break:break-all;opacity:.7}</style><h1>Configuration enregistrée</h1><p>Le moteur prépare tes deux catalogues en arrière-plan.</p><a href="stremio://${manifestUrl.replace(/^https?:\/\//, "")}">Mettre à jour dans Stremio</a><p class="small">URL du manifeste : ${esc(manifestUrl)}</p>`);
+    // Start one account-scoped background refresh. If a catalog request already
+    // started the daily sync, scheduleRefresh coalesces the work instead of
+    // creating a second build.
     setImmediate(() => prewarmBoth(token, config).catch(e => console.error("Prewarm failed:", e.message)));
   } catch (e) { res.writeHead(400, { "content-type":"text/plain; charset=utf-8" }); res.end(`Erreur de configuration: ${e.message}`); }
 }
