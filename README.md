@@ -1,8 +1,8 @@
-# 🎯 Antony — Personal Stremio Recommendations v6.1.0
+# 🎯 Antony — Personal Stremio Recommendations v6.1.1
 
 Custom Stremio addon producing **30 films + 30 series** from the user's Stremio ❤️/👍 signals and watched-without-rating negative evidence.
 
-## v6.1.0 — precision + French metadata + measured/resumable builds
+## v6.1.1 — T0 rebuild + precision + French metadata + measured/resumable builds
 
 - Unified Films + Séries taste model, with format-specific heads.
 - ❤️ = loved; 👍 = liked; watched without 👍/❤️ = negative evidence.

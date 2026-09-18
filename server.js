@@ -5,10 +5,10 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { URL, URLSearchParams } = require("url");
 
-const ALGO_VERSION = "6.1.0";
+const ALGO_VERSION = "6.1.1";
 const TMDB_LANGUAGE = "fr-FR";
 const TMDB_FALLBACK_LANGUAGE = "en-US";
-const BUILD_DELAY_MS = 5 * 60 * 1000;
+const BUILD_DELAY_MS = 0;
 const BUILD_CHECKPOINT_TTL_SEC = 24 * 60 * 60;
 const BUILD_STATS_TTL_SEC = 7 * 24 * 60 * 60;
 const PORT = Number(process.env.PORT || 10000);
@@ -97,9 +97,9 @@ const MIN_RECOMMENDATIONS_TARGET = 30;
 const POSITIVE_SEED_LIMIT = 80;
 const SEED_NEIGHBOR_PAGES = 1;
 const WATCHED_NEGATIVE_LIMIT = 300;
-const WATCHED_NEGATIVE_MAX_PENALTY = 0.58;
-const NEGATIVE_QUASI_EXCLUSION_THRESHOLD = 0.78;
-const NEGATIVE_HARD_RISK_THRESHOLD = 0.92;
+const WATCHED_NEGATIVE_MAX_PENALTY = 0.86;
+const NEGATIVE_QUASI_EXCLUSION_THRESHOLD = 0.72;
+const NEGATIVE_HARD_RISK_THRESHOLD = 0.88;
 const EMBEDDING_BATCH = 50;
 const COLD_START_WAIT_MS = 0;
 const GEMINI_COOLDOWN_MS = 15 * 60 * 1000;
@@ -356,7 +356,10 @@ function scheduleRefresh(token, config, reason = "request") {
   const key = `refresh:${token}`;
   if (refreshJobs.has(key)) return refreshJobs.get(key);
   const hasAnyCatalog = Boolean(getCatalogCached(token, "movie") || getCatalogCached(token, "series"));
-  const immediate = reason === "configuration" && !hasAnyCatalog;
+  // For this measurement build, every catalog request starts a fresh rebuild at T0.
+  // The last known-good catalogs remain readable throughout the rebuild.
+  const immediate = true;
+  const requestedAt = Date.now();
   const promise = new Promise(resolve => {
     const attempt = () => {
       const idleFor = Date.now() - lastActivity(token);
@@ -366,7 +369,7 @@ function scheduleRefresh(token, config, reason = "request") {
         return;
       }
       (async () => {
-        try { resolve(await refreshUserStateAndCatalogs(token, config, reason)); }
+        try { resolve(await refreshUserStateAndCatalogs(token, config, reason, requestedAt)); }
         catch (e) { console.warn(`Background refresh failed (${reason}): ${e.message}`); resolve(false); }
         finally { refreshJobs.delete(key); }
       })();
@@ -377,9 +380,10 @@ function scheduleRefresh(token, config, reason = "request") {
   return promise;
 }
 
-async function refreshUserStateAndCatalogs(token, config, reason = "scheduled") {
+async function refreshUserStateAndCatalogs(token, config, reason = "scheduled", requestedAt = Date.now()) {
   const startedAt=Date.now();
-  const stats={algorithm:ALGO_VERSION,status:"running",reason,startedAt,phases:{},types:{}};
+  const stats={algorithm:ALGO_VERSION,status:"running",reason,requestedAt,startedAt,startDelayMs:startedAt-requestedAt,phases:{},types:{}};
+  console.log(`BUILD START reason=${reason} delay=${stats.startDelayMs}ms`);
   await saveBuildStats(token,stats);
   const previous = stateStore.get(stateKey(token));
   let library;
@@ -394,7 +398,8 @@ async function refreshUserStateAndCatalogs(token, config, reason = "scheduled") 
   stateStore.set(stateKey(token),state);
   void persistentSet(persistKey("state",token),{libraryFingerprint:fp,updatedAt:state.updatedAt,generation:state.generation},PERSIST_STATE_TTL_SEC);
   try {
-    if(changed || !previous || Date.now()-(previous.rebuiltAt||0)>=STATE_REFRESH_MS){
+    const forceBuild = reason === "catalog-request" || reason === "configuration";
+    if(forceBuild || changed || !previous || Date.now()-(previous.rebuiltAt||0)>=STATE_REFRESH_MS){
       invalidateTokenResults(token);
       const tm=Date.now(); await buildAndStoreCatalog("movie",config,token,library,{stats}); stats.types.movieMs=Date.now()-tm;
       const ts=Date.now(); await buildAndStoreCatalog("series",config,token,library,{stats}); stats.types.seriesMs=Date.now()-ts;
@@ -429,7 +434,7 @@ async function buildAndStoreCatalog(type, config, token, library, buildCtx = nul
     await saveBuildCheckpoint(token,type,{status:"profile_ready",stage:"profile",fingerprint});
     const existing = await hydrateCatalogFromPersistent(token, type);
     if (existing && existing.fingerprint === fingerprint && !existing.stale) { clearBuildCheckpoint(token,type); return existing.payload; }
-    const top30 = await timed(stats, `${type}.ranking`, () => buildTop50(type, config, profile, token, fingerprint));
+    const top30 = await timed(stats, `${type}.ranking`, () => buildTop50(type, config, profile, token, fingerprint, stats));
     if (top30.length < Math.min(MIN_RECOMMENDATIONS_TARGET, config.maxResults)) {
       console.warn(`Only ${top30.length} recommendations produced for ${type}; preserving previous catalog instead of storing a partial catalog.`);
       return existing?.payload || null;
@@ -1165,9 +1170,12 @@ function samplePages(seedText, count = CANDIDATE_PAGES_PER_STRATEGY) {
 async function discoverCandidates(type,config,profile,token=null,fingerprint=null){
   const excludedGenres=new Set((config.excludeGenres||[]).map(cleanText));const candidates=new Map();const addResults=arr=>{for(const x of arr||[])if(x?.id)candidates.set(`${type}:${x.id}`,x);};const media=type==='movie'?'movie':'tv';
   const checkpoint=token?await loadBuildCheckpoint(token,type):null; const resumeCandidates=checkpoint?.fingerprint===fingerprint && Array.isArray(checkpoint.candidateBasics)?checkpoint.candidateBasics:null; if(resumeCandidates?.length){for(const x of resumeCandidates) if(x?.id)candidates.set(`${type}:${x.id}`,x); console.log(`Checkpoint resume ${type}: ${resumeCandidates.length} candidates`);}
+  let seeds=[];
+  let seedJobs=[];
+  let pageJobs=[];
   if (!resumeCandidates) {
-  const seeds=chooseDiversePositiveSeeds(profile.positives,Math.min(POSITIVE_SEED_LIMIT,profile.positives.length));
-  const seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];const base=`${media}/${id}`,jobs=[];for(let page=1;page<=SEED_NEIGHBOR_PAGES;page++){jobs.push({endpoint:`${base}/recommendations`,params:{language:TMDB_LANGUAGE,page}},{endpoint:`${base}/similar`,params:{language:TMDB_LANGUAGE,page}});}return jobs;});
+  seeds=chooseDiversePositiveSeeds(profile.positives,Math.min(POSITIVE_SEED_LIMIT,profile.positives.length));
+  seedJobs=seeds.flatMap(seed=>{const id=seed.details?.id;if(!id)return[];const base=`${media}/${id}`,jobs=[];for(let page=1;page<=SEED_NEIGHBOR_PAGES;page++){jobs.push({endpoint:`${base}/recommendations`,params:{language:TMDB_LANGUAGE,page}},{endpoint:`${base}/similar`,params:{language:TMDB_LANGUAGE,page}});}return jobs;});
   const seedResults=await mapLimit(seedJobs,10,async q=>tmdb(q.endpoint,q.params,config.tmdbAccessToken).catch(()=>null));for(const data of seedResults)addResults(data?.results);
   const genreScore=new Map(),keywordScore=new Map(),negGenre=new Map(),negKeyword=new Map();
   const addDiscovery=(items,mG,mK,scale=1)=>{for(const x of items||[]){const w=(x.rating==='heart'?3:1)*scale;for(const g of x.details.genres||[])mG.set(g.id,(mG.get(g.id)||0)+w);for(const k of x.details.keywords?.keywords||[])mK.set(k.id,(mK.get(k.id)||0)+w);}};
@@ -1186,7 +1194,7 @@ async function discoverCandidates(type,config,profile,token=null,fingerprint=nul
   for(const item of seeds.slice(0,24)){const gs=(item.details.genres||[]).map(x=>x.id).slice(0,2),ks=(item.details.keywords?.keywords||[]).map(x=>x.id).slice(0,3);for(const g of gs)for(const k of ks)strategies.push({with_genres:String(g),with_keywords:String(k),label:`seedgk:${g}:${k}`});}
   const dedup=new Map();for(const x of strategies)dedup.set(x.label,x);const strategyList=[...dedup.values()].slice(0,CANDIDATE_DISCOVERY_STRATEGIES);
   const sortModes=['vote_average.desc'];
-  const pageJobs=[];
+  pageJobs=[];
   for(const strategy of strategyList) for(const sort_by of sortModes) for(const page of [1,2]) {
     const params={language:TMDB_LANGUAGE,include_adult:false,page,sort_by,...strategy}; delete params.label;
     params.vote_count_gte=config.tmdbMinVotes; params.vote_average_gte=config.tmdbMinRating; params.vote_average_lte=config.tmdbMaxRating;
@@ -1232,17 +1240,12 @@ async function discoverCandidates(type,config,profile,token=null,fingerprint=nul
     let affinity = 0;
     for (const [gid, w] of profile.genreAffinity || []) if (gs.has(Number(gid))) affinity += w;
     const lexical = lexicalSimilarity(d, profile.positives);
-    const exploration = stableSeed(`${ALGO_VERSION}:${type}:${d.id}:${profile.positiveCount}`) / 0xffffffff;
-    return { d, cheapScore: 0.62 * affinity + 0.20 * lexical + 0.18 * exploration, exploration };
+    return { d, cheapScore: 0.72 * affinity + 0.28 * lexical };
   }).sort((a,b)=>b.cheapScore-a.cheapScore);
 
-  // Candidate discovery must not collapse onto the easiest genre signal.
-  // Reserve an explicit exploration tranche in addition to the learned-affinity
-  // tranche. The final ranking still decides the actual Top 30.
-  const primaryCount = Math.min(Math.floor(CANDIDATE_DETAILS_LIMIT * 0.70), rankedCheap.length);
-  const explorationPool = rankedCheap.slice(primaryCount).sort((a,b)=>b.exploration-a.exploration);
-  const explorationCount = Math.min(CANDIDATE_DETAILS_LIMIT - primaryCount, explorationPool.length);
-  const limitedRows = rankedCheap.slice(0, primaryCount).concat(explorationPool.slice(0, explorationCount));
+  // No artificial exploration: the expensive detail budget is allocated to the
+  // candidates that already have the strongest evidence of fitting the user's taste.
+  const limitedRows = rankedCheap.slice(0, CANDIDATE_DETAILS_LIMIT);
   const limited=limitedRows.map(x=>x.d);
   const detailed=[];
   const eligible=[];
@@ -1264,16 +1267,18 @@ async function discoverCandidates(type,config,profile,token=null,fingerprint=nul
   return eligible;
 }
 
-async function buildTop50(type,config,profile,token=null,fingerprint=null){
+async function buildTop50(type,config,profile,token=null,fingerprint=null,stats=null){
   if(!profile.positiveCount && !profile.global?.positiveCount)return[];
-  const filtered=await discoverCandidates(type,config,profile,token,fingerprint);
+  const filtered=stats ? await timed(stats, `${type}.candidateDiscovery`, () => discoverCandidates(type,config,profile,token,fingerprint)) : await discoverCandidates(type,config,profile,token,fingerprint);
   if(!filtered.length)return[];
   const global=profile.global || profile;
   let candidateVectors=null;
-  if(geminiAvailable(config.geminiApiKey) && global.positiveVectors?.length)
-    candidateVectors=await cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}`).catch(()=>null);
+  if(geminiAvailable(config.geminiApiKey) && global.positiveVectors?.length) {
+    const runEmbeddings = () => cachedEmbeddings(config.geminiApiKey,filtered.map(textOf),`candidate:${ALGO_VERSION}`).catch(()=>null);
+    candidateVectors = stats ? await timed(stats, `${type}.candidateEmbeddings`, runEmbeddings) : await runEmbeddings();
+  }
 
-  const scored=filtered.map((d,i)=>{
+  const scoreCandidates = () => filtered.map((d,i)=>{
     const vec=candidateVectors?.[i]||null;
     const localSem=vec&&profile.positiveVectors?.length?semanticScore(vec,profile.positiveVectors,profile.positives,profile.clusters):0;
     const globalSem=vec&&global.positiveVectors?.length?semanticScore(vec,global.positiveVectors,global.positives,global.clusters):0;
@@ -1299,9 +1304,10 @@ async function buildTop50(type,config,profile,token=null,fingerprint=null){
     const rating=Math.max(0,Math.min(10,Number(d.vote_average)||0))/10;
     const votes=Math.max(0,Number(d.vote_count)||0);
     const voteReliability=Math.min(1,Math.log10(1+votes)/5);
-    const personalScore=0.92*tasteScore+0.05*rating+0.03*voteReliability;
+    const personalScore=0.965*tasteScore+0.025*rating+0.01*voteReliability;
     return{details:d,imdbId:d.external_ids?.imdb_id||d.imdb_id,personalScore,tasteScore,semantic:vec};
   }).filter(x=>x.imdbId);
+  const scored = stats ? await timed(stats, `${type}.scoring`, async () => scoreCandidates()) : scoreCandidates();
   scored.sort((a,b)=>b.personalScore-a.personalScore);
   const top=scored.slice(0,Math.min(30,config.maxResults));
   console.log(`Ranking ${type}: scored=${scored.length} selected=${top.length} globalTaste=true`);
@@ -1383,11 +1389,10 @@ async function discover(type, config, token) {
   ACTIVE_CONFIGS.set(token, config);
   const cached = await hydrateCatalogFromPersistent(token, type);
   if (cached) {
-    if (cached.stale) scheduleRefresh(token, config, "stale-catalog");
-    else {
-      const state = stateStore.get(stateKey(token));
-      if (!state || Date.now() - state.updatedAt > STATE_REFRESH_MS) scheduleRefresh(token, config, "state-refresh");
-    }
+    // T0 measurement mode: return the last known-good Top 30 immediately, then
+    // launch the complete rebuild in the background. refreshJobs deduplicates
+    // concurrent Stremio requests.
+    scheduleRefresh(token, config, "catalog-request");
     return cached.payload;
   }
 
@@ -1420,7 +1425,9 @@ async function discover(type, config, token) {
     job.finally(() => REFRESH_LOCK.delete(lockKey));
   }
   const job = REFRESH_LOCK.get(lockKey);
-  if (job) await Promise.race([job.catch(() => null), new Promise(r => setTimeout(r, COLD_START_WAIT_MS))]);
+  // T0 mode: do not wait for the personalized build. Serve the previous catalog if one exists.
+  // The build continues in the background.
+  if (job) await Promise.race([Promise.resolve(null), new Promise(r => setTimeout(r, 0))]);
 
   const ready = getCatalogCached(token, type);
   if (ready?.payload?.metas?.length) {
