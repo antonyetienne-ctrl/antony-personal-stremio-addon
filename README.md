@@ -1,84 +1,84 @@
-# 🎯 Antony — Personal Stremio Recommendations v6.3.0
+# 🎯 Antony — Personal Stremio Recommendations v6.2.0
 
-Custom Stremio addon producing **30 films + 30 series** from the user's Stremio ❤️/👍 signals and watched-without-rating negative evidence.
+Evolution of v6.0.0 without replacing its recommendation engine.
 
-## v6.3.0 — daily sync + cumulative candidate pool + low-Upstash architecture
+## Priority: recommendation precision
 
-- Unified Films + Séries taste model, with format-specific heads.
-- **70% type-specific taste + 30% global Films+Séries taste** for both movie and series ranking.
-- ❤️ = loved; 👍 = liked; watched without 👍/❤️ = negative evidence.
-- The existing positive/negative learning model is retained; negative families, interactions and semantic negative prototypes remain separate from positive taste.
-- **TMDB rating < 5/10 is a hard exclusion. There is no minimum vote-count filter.** Vote count is only a weak confidence/ranking signal.
-- Candidate discovery is cumulative: the persistent pool grows across rebuilds and is not capped at a fixed total number of candidates.
-- Previously enriched candidate details remain available and are ranked together with newly enriched candidates. Each daily rebuild only limits the number of *new detail API calls* so TMDB work remains bounded; this is not a cap on the cumulative candidate pool.
-- Last complete Top 30 Films and Top 30 Séries remain published while a replacement build runs. A partial catalog is never published.
-- TMDB display metadata uses **fr-FR** wherever TMDB provides it; French posters and trailers are preferred with neutral/English fallback.
+- ❤️ Love = very strong positive anchor.
+- 👍 Like = moderate positive signal.
+- Watched without 👍/❤️ = negative evidence, separate from positives.
+- Positive/negative feature models include individual features, pair interactions, triple interactions, semantic prototypes and taste clusters.
+- Films and Séries use separate local heads plus a unified cross-format profile.
+- **Exact 70% local format profile + 30% global profile** at recommendation scoring/discovery layers.
+- No genre quota and no popularity ranking. TMDB rating/vote thresholds remain hard filters; popularity is not a ranking objective.
+- Final Top 30 is selected by personalized score; random display only shuffles those 30.
+- A conservative optional Gemini reranker judges the top local candidates for narrative fit and disappointment risk. It can only provide a limited 15% final adjustment; if Gemini fails, local ranking remains fully functional.
 
-## Synchronisation
+## Daily synchronization
 
-- Stremio catalog navigation is read-only and **does not trigger a rebuild**.
-- At most **one synchronization per calendar day** (Europe/Zurich) is performed.
-- The daily sync refreshes the Stremio library and rating snapshot, then compares the resulting library/feedback fingerprints.
-- If nothing changed, **no recommendation rebuild occurs**.
-- A single relevant change — one Like, one Love, one newly watched item, etc. — causes a complete Films + Séries rebuild.
-- Configuration changes can intentionally trigger a rebuild immediately.
-- Daily-sync and configuration builds are coalesced per Stremio account; they can never run in parallel for the same account.
-- The persistent state, profile source, rating snapshot and rendered catalogs are keyed by the stable Stremio account scope rather than the random encrypted manifest token. Saving configuration therefore does not throw away the accumulated cache.
-- A first catalog request never intentionally returns an empty catalog: if no personalized catalog exists yet, a temporary TMDB bootstrap catalog is returned while the full personalized build runs in the background.
-- There is no periodic 15-minute rebuild loop.
+- At most one complete user-state synchronization per **calendar day in Europe/Zurich**.
+- A day change triggers one check of the Stremio library plus the Love/Like status snapshot.
+- If neither library nor rating fingerprint changed, the existing catalogs are reused and no rebuild occurs.
+- If something changed, Films and Séries are rebuilt once from the same synchronized snapshot.
+- Navigation requests do not trigger repeated 15-minute rebuild checks.
+- The previous valid catalog remains untouched until a complete replacement is ready.
 
-## Upstash / Free-tier strategy
+## Upstash architecture
 
-Upstash is used only for compact, high-value persistent state. High-volume TMDB/embedding data is not written item-by-item to Upstash.
+Upstash is deliberately restricted to durable state that is actually useful after a Render restart:
 
-The architecture specifically reduces commands by:
+- latest complete Top 30 Films;
+- latest complete Top 30 Séries;
+- compact daily synchronization state;
+- last build timing/diagnostic record.
 
-- keeping build diagnostics and partial checkpoints in RAM only;
-- avoiding rebuilds caused by catalog navigation;
-- persisting the cumulative candidate pool as one compressed bulk value per type;
-- persisting the rating snapshot as one compact value;
-- serving existing catalogs directly from RAM or persistent cache;
-- keeping configuration-token changes from duplicating the same user cache;
-- coalescing simultaneous background builds into one account-scoped job;
-- using a longer Upstash timeout to avoid unnecessary fallback churn.
+High-volume TMDB metadata and Gemini embeddings are kept in Render RAM instead of issuing one Upstash GET + SET per item. This removes a major source of command amplification without reducing the candidate pool or recommendation model.
 
-The goal is for Upstash command volume to depend mainly on **real synchronisation/build events**, not on the number of candidates considered by the recommender.
+## Timing / diagnostics
 
-## Configuration
+The addon measures:
 
-Open `/configure` and provide:
+- Stremio library sync time;
+- Love/Like status scan time;
+- Film build time;
+- Series build time;
+- profile/ranking/store sub-times for each catalog;
+- total build duration;
+- Upstash commands consumed by the build.
 
-1. TMDB API Read Access Token
-2. Stremio AuthKey
-3. Gemini API key (optional)
+Diagnostic endpoint:
 
-Existing keys are preserved when corresponding fields are left unchanged.
+`/debug/build`
 
-Default filters:
+It exposes only timing/operational counters, never API keys or the Stremio AuthKey.
 
-- TMDB rating ≥ 5.0
-- no minimum TMDB vote count
-- Horror / Romance / Music / Comedy excluded
-- Kids excluded
-- Western animation series excluded; anime remains allowed
-- Cancelled series excluded
-- Ongoing series allowed
-- No maximum movie duration
+## French metadata
 
-## Diagnostics
+TMDB display metadata is requested in `fr-FR`.
 
-`/u/<TOKEN>/debug/build.json` exposes the latest in-process build status and timings without exposing API keys.
+- French titles/descriptions/genres when TMDB provides them;
+- French-first poster selection, then universal/English fallback when no French poster exists;
+- French-first YouTube trailers when available, then English fallback;
+- Stremio meta responses include trailers in the standard addon format.
 
-## Render / persistence
+## Gemini
 
-Render Free can spin down after inactivity. The addon therefore relies on persistent catalogs, state and candidate pools in Upstash rather than assuming that RAM survives a restart.
+Gemini is optional. The engine continues normally if Gemini is unavailable, rate-limited or times out.
 
-Persistent keys are compressed with gzip. The namespace remains versioned under `v6` so older generations are isolated from the current algorithm where appropriate.
+Two complementary uses are retained:
 
-## 6.3.0 stability fixes
+1. Gemini embeddings for semantic similarity and taste clusters.
+2. A conservative Gemini 2.5 Flash-Lite narrative reranker on the strongest local candidates, using Hearts, Likes and watched-unrated negatives as explicit evidence.
 
-- Fixed overlapping `daily-sync` / `configuration` builds caused by using the encrypted manifest token as the job identity.
-- Fixed cache fragmentation after configuration changes: user-scoped persistent data now follows the stable Stremio AuthKey scope.
-- Fixed the first-request `metas: []` path. A temporary bootstrap catalog is returned instead of deliberately returning an empty catalog.
-- Bootstrap catalogs use TMDB details already fetched and do not perform poster/video enrichment, keeping the first response substantially lighter than a full recommendation build.
-- Added a Render HTTP health check on `/health`.
+## Installation
+
+1. Deploy the ZIP to the existing GitHub/Render service.
+2. Keep the existing Render environment variables:
+   - `UPSTASH_REDIS_REST_URL`
+   - `UPSTASH_REDIS_REST_TOKEN`
+   - the TMDB/Stremio/Gemini keys are entered through `/configure` and embedded encrypted in the manifest token.
+3. Open `/configure` and save the existing configuration.
+4. Reinstall/update the manifest in Stremio.
+5. Wait for the first complete personalized build if no previous v6.2 catalog exists.
+
+The addon never substitutes a partial/bootstrap recommendation list for the personalized Top 30.

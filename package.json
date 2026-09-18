@@ -1,8 +1,8 @@
 {
   "name": "antony-personal-stremio-addon",
-  "version": "6.3.0",
+  "version": "6.2.0",
   "private": true,
-  "description": "Personal Stremio recommendations with unified taste learning, French metadata, daily synchronization, stable account persistence and cumulative candidate pools.",
+  "description": "Personal Stremio recommendations learned jointly from Stremio hearts, likes and watched-without-rating negatives.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
