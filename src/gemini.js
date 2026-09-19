@@ -36,8 +36,11 @@ class Gemini {
     this.cooldownUntil = 0; this.disabledUntil = 0; this.lastError = null; this.modelCheckedAt = 0;
     this.calls = calls && calls.day === zurichDay() ? calls : { day: zurichDay(), count: 0 };
     this.stats = { requests: 0, ok: 0, errors: 0 };
+    this.trace = [];          // 6 dernières réponses (extrait) : jamais de clé, uniquement du texte de réponse
+
   }
   get available() { return Boolean(this.key) && clock.now() >= this.cooldownUntil && clock.now() >= this.disabledUntil && this._quotaLeft() > 0; }
+  _trace(e) { this.trace.push({ at: new Date(clock.now()).toISOString(), ...e }); if (this.trace.length > 6) this.trace.shift(); }
   _quotaLeft() { if (this.calls.day !== zurichDay()) this.calls = { day: zurichDay(), count: 0 }; return this.maxPerDay - this.calls.count; }
   _err(e) {
     this.stats.errors++; this.lastError = { at: new Date(clock.now()).toISOString(), status: e.status || null, message: String(e.message || e).slice(0, 160) };
@@ -66,10 +69,11 @@ class Gemini {
       catch (e) { if (e.status === 404 && !this.forced) { this.model = null; this.modelCheckedAt = 0; model = await this.ensureModel(); res = await call(); } else throw e; }
       const text = ((res && res.candidates && res.candidates[0] && res.candidates[0].content && res.candidates[0].content.parts) || []).map((p) => p.text || '').join('');
       const obj = extractJson(text);
+      this._trace({ ok: Boolean(obj), chars: text.length, head: text.slice(0, 300), shape: obj === null ? 'null' : Array.isArray(obj) ? `array[${obj.length}]` : `objet{${Object.keys(obj).slice(0, 6).join(',')}}` });
       if (!obj) throw new Error('réponse non JSON');
       this.stats.ok++;
       return obj;
-    } catch (e) { this._err(e); return null; }
+    } catch (e) { this._trace({ ok: false, error: String(e.message).slice(0, 160), status: e.status || null }); this._err(e); return null; }
   }
 }
 
@@ -91,4 +95,28 @@ function arbitragePrompt({ adn, evite, candidats }) {
     `Réponds UNIQUEMENT en JSON : {"evaluations":[{"id":"<id>","adequation":0,"risque":0,"note":"<=14 mots"}]}\nCANDIDATS : ${JSON.stringify(candidats)}`;
 }
 
-module.exports = { Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };
+// Lecture tolérante de la réponse d'arbitrage : tableau direct ou objet, clés variantes, identifiants nus, scores en fraction (0-1) ou en points (0-100).
+function parseEvaluations(r, byId) {
+  const shape = r === null || r === undefined ? 'null' : Array.isArray(r) ? `array[${r.length}]` : `objet{${Object.keys(r).slice(0, 6).join(',')}}`;
+  let list = null;
+  if (Array.isArray(r)) list = r;
+  else if (r && typeof r === 'object') {
+    for (const k of ['evaluations', 'évaluations', 'evaluation', 'resultats', 'résultats', 'results', 'candidats', 'items']) if (Array.isArray(r[k])) { list = r[k]; break; }
+    if (!list) list = Object.values(r).find(Array.isArray) || null;
+  }
+  const map = new Map();
+  if (!list) return { map, shape, listLength: 0 };
+  const pick = (...v) => { for (const x of v) { if (x === null || x === undefined || x === '') continue; const n = Number(x); if (Number.isFinite(n)) return n; } return NaN; };
+  const rows = list.filter((e) => e && typeof e === 'object').map((e) => ({ e, fit: pick(e.adequation, e['adéquation'], e.fit, e.score), risk: pick(e.risque, e.risk) })).filter((x) => Number.isFinite(x.fit));
+  const frac = rows.length > 0 && rows.every((x) => x.fit <= 1 && (Number.isNaN(x.risk) || x.risk <= 1));
+  const k = frac ? 100 : 1;
+  for (const { e, fit, risk } of rows) {
+    const raw = String(e.id ?? e.identifiant ?? ''); const digits = raw.replace(/\D/g, '');
+    const im = byId.get(raw) || (digits && (byId.get('m' + digits) || byId.get('s' + digits)));
+    if (!im) continue;
+    map.set(im, { fit: Math.max(0, Math.min(100, fit * k)), risk: Math.max(0, Math.min(100, (Number.isFinite(risk) ? risk : 0) * k)), note: String(e.note || '').slice(0, 100) });
+  }
+  return { map, shape, listLength: list.length };
+}
+
+module.exports = { parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };

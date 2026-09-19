@@ -89,6 +89,7 @@ async function runBacktest(items, corpus, yielder, { onStage } = {}) {
   }
   out.risk = bestG;
   out.test.blend70_30 = metrics(scored.map((s) => utilityOf(s.b, out.rank) - bestG.kappa * s.b.sigma - bestG.rho * s.b.fp), ytArr, lvArr);   // classement FINAL (Top 30 orienté ❤️)
+  Object.assign(out.test.blend70_30, { logloss: null, brier: null, calibration: null, note: 'score de classement orienté ❤️ : logloss et calibration non applicables' });
   for (const v of out.variants) delete v.profile;
   out.ms = Date.now() - t0;
   return out;

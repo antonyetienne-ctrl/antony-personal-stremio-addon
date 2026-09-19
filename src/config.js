@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.1.0';
+const ENGINE_VERSION = '7.1.2';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB

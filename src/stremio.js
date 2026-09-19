@@ -43,7 +43,9 @@ function classify(item) {
   if (type === 'movie') { seen = times > 0 || flagged > 0 || ratio >= 0.7 || s.watched === true; started = !seen && (off > 0 || tw > 0 || ratio > 0 || bitfield); }
   else { seen = times > 0 || flagged > 0 || s.watched === true; started = !seen && (bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id)); }
   const lw = Date.parse(s.lastWatched || '') || Date.parse(item._mtime || '') || 0;
-  return { imdb, type, seen, started, lw };
+  // trace de la règle qui a déclenché "vu" (T = timesWatched, F = flaggedWatched, R = part regardée, D = durée en min) : visible dans /diagnostic
+  const why = `T${times} F${flagged} R${ratio.toFixed(2)} D${Math.round(dur / 60000)}m${s.watched === true ? ' W' : ''}${bitfield ? ' b' : ''}`;
+  return { imdb, type, seen, started, lw, why };
 }
 
 // Normalise la réponse de likes.stremio.com : 'love' | 'like' | 'none' | null (illisible => inconnu)

@@ -10,7 +10,7 @@ const { clock, log, redact, sha, Spans, fmtDuration, makeYielder, activity, zuri
 const cfg = require('./config');
 const stremio = require('./stremio');
 const { Tmdb } = require('./tmdb');
-const { Gemini, dnaPrompt, arbitragePrompt } = require('./gemini');
+const { Gemini, dnaPrompt, arbitragePrompt, parseEvaluations } = require('./gemini');
 const { Corpus, hashedVec, makeNamer, nameOfKey } = require('./features');
 const model = require('./model');
 const bt = require('./backtest');
@@ -137,12 +137,12 @@ class SyncEngine {
   }
   _fromSnap(snap) {
     const classified = [], statuses = new Map();
-    for (const [imdb, v] of Object.entries(snap.items)) { classified.push({ imdb, type: v[0] === 's' ? 'series' : 'movie', seen: v[2].includes('s'), started: v[2].includes('t'), lw: v[3] || 0 }); statuses.set(imdb, v[1] === 'L' ? 'love' : v[1] === 'K' ? 'like' : v[1] === 'N' ? 'none' : '?'); }
+    for (const [imdb, v] of Object.entries(snap.items)) { classified.push({ imdb, type: v[0] === 's' ? 'series' : 'movie', seen: v[2].includes('s'), started: v[2].includes('t'), lw: v[3] || 0, why: v[4] || null }); statuses.set(imdb, v[1] === 'L' ? 'love' : v[1] === 'K' ? 'like' : v[1] === 'N' ? 'none' : '?'); }
     return { classified, statuses };
   }
   async loadSnap(uid) { if (this.snaps.has(uid)) return this.snaps.get(uid); const s = await this.store.getJson(cfg.key.snap(uid), 'snap-load'); if (s) this.snaps.set(uid, s); return s || null; }
   _makeSnap(classified, statuses) {
-    const items = {}; for (const c of classified) { const st = statuses.get(c.imdb); items[c.imdb] = [c.type[0], st === 'love' ? 'L' : st === 'like' ? 'K' : st === 'none' ? 'N' : '?', (c.seen ? 's' : '') + (c.started ? 't' : ''), c.lw || 0]; }
+    const items = {}; for (const c of classified) { const st = statuses.get(c.imdb); items[c.imdb] = [c.type[0], st === 'love' ? 'L' : st === 'like' ? 'K' : st === 'none' ? 'N' : '?', (c.seen ? 's' : '') + (c.started ? 't' : ''), c.lw || 0, c.why || '']; }
     return { v: 1, at: clock.now(), items };
   }
 
@@ -231,7 +231,10 @@ class SyncEngine {
     const recheck = [];
     try {
       const g = profiles.global;
-      if (g.keys && g.task1 && g.task1.oof) { const idx = new Map(labeled.map((i) => [i.key, i])); const arr = []; g.keys.forEach((k, j) => { const it = idx.get(k); if (it && it.label === 0) arr.push({ it, p: g.task1.oof[j] }); }); arr.sort((a, b) => b.p - a.p); for (const { it, p } of arr.slice(0, 25)) recheck.push({ title: it.rec.t, year: it.rec.y, imdb: it.rec.im, type: it.rec.k === 's' ? 'series' : 'movie', probabilite: +p.toFixed(2) }); }
+      if (g.keys && g.task1 && g.task1.oof) { const idx = new Map(labeled.map((i) => [i.key, i])); const arr = []; g.keys.forEach((k, j) => { const it = idx.get(k); if (it && it.label === 0) arr.push({ it, p: g.task1.oof[j] }); }); arr.sort((a, b) => b.p - a.p);
+        // 20 films + 20 séries ; "why" = signaux Stremio qui ont fait compter le titre comme VU (pour repérer un faux "vu")
+        const whyMap = new Map(classified.map((c) => [c.imdb, c.why || null]));
+        for (const kind of ['m', 's']) for (const { it, p } of arr.filter((x) => x.it.rec.k === kind).slice(0, 20)) recheck.push({ title: it.rec.t, year: it.rec.y, imdb: it.rec.im, type: kind === 's' ? 'series' : 'movie', probabilite: +p.toFixed(2), why: whyMap.get(it.rec.im) || null }); }
     } catch { /* facultatif */ }
 
     // 5) ADN + anti-recettes (Gemini, ≤ 1 requête, mis en cache par empreinte) — repli local sinon
@@ -269,11 +272,10 @@ class SyncEngine {
       for (const t of targets) pools[t].slice(0, 45).forEach((c, i) => { const near = pipe.nearestTitles(c, loved, rejected); const id = `${t[0]}${c.rec.i}`; byId.set(id, c.rec.im); cs.push({ id, titre: c.rec.t, annee: c.rec.y, genres: (c.rec.gn || []).slice(0, 4), mots_cles: (c.rec.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (c.rec.ov || '').slice(0, 180), score_local: Math.round(c.util * 100), plus_proche_aime: near.aime, plus_proche_rejete: near.rejete }); });
       this.setStage(uid, job, 'gemini', 'arbitrage des candidats frontières (Gemini)');
       const r = await spans.wrap('gemini_arbitrage', () => gem.json(arbitragePrompt({ adn: dna.adn, evite: dna.evite, candidats: cs })));
-      if (r && Array.isArray(r.evaluations)) {
-        adj = new Map();
-        for (const e of r.evaluations) { const im = byId.get(String(e.id)); if (im && Number.isFinite(Number(e.adequation))) adj.set(im, { fit: Math.max(0, Math.min(100, Number(e.adequation))), risk: Math.max(0, Math.min(100, Number(e.risk ?? e.risque) || 0)), note: String(e.note || '').slice(0, 100) }); }
-        arb.used = adj.size > 0; arb.evaluated = adj.size;
-      }
+      const pe = parseEvaluations(r, byId);
+      arb.candidatesSent = cs.length; arb.responseShape = pe.shape; arb.listLength = pe.listLength; arb.trace = gem.trace.slice(-1);
+      if (pe.map.size) { adj = pe.map; arb.used = true; arb.evaluated = pe.map.size; }
+      else log('warn', `Arbitrage Gemini sans évaluation exploitable (${pe.shape}) : classement local conservé`);
     }
     // 7) sélection finale + validation, puis publication ATOMIQUE
     const explain = {};
