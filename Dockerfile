@@ -1,7 +1,9 @@
 FROM node:22-alpine
 WORKDIR /app
+ENV NODE_ENV=production \
+    NODE_OPTIONS="--max-old-space-size=400"
 COPY package.json ./
-COPY server.js ./
-ENV NODE_ENV=production
+COPY src ./src
 EXPOSE 10000
-CMD ["node", "server.js"]
+USER node
+CMD ["node", "src/index.js"]
