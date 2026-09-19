@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.2.0';
+const ENGINE_VERSION = '7.2.2';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB
@@ -17,7 +17,7 @@ function defaultSettings() {
   return {
     movie: { ratingMode: 'auto', minRating: 7.2, minVotes: 2000, minRuntime: 70, minYear: 1990, exclude: [], noWesternAnimation: false, order: 'score' },
     series: { ratingMode: 'auto', minRating: 7.2, minVotes: 2000, minYear: 0, exclude: [], noWesternAnimation: true, order: 'score' },
-    common: { excludeCancelled: true, movieCatalog: true, seriesCatalog: true, frMeta: true, useGemini: true }
+    common: { excludeCancelled: true, movieCatalog: true, seriesCatalog: true, frMeta: true, useGemini: true, watch: [] }
   };
 }
 
@@ -48,6 +48,7 @@ function normalizeSettings(input = {}, prev = defaultSettings()) {
   if ('exclude' in s) p.series.exclude = parseExclude(s.exclude, TV_GENRES);
   if ('order' in s) p.series.order = s.order === 'random' ? 'random' : 'score';
   for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'frMeta', 'useGemini']) if (k in c) p.common[k] = Boolean(c[k]);
+  if (Array.isArray(c.watch)) p.common.watch = c.watch.map((x) => String(x).trim().slice(0, 80)).filter(Boolean).slice(0, 30);
   return p;
 }
 
@@ -55,7 +56,7 @@ function normalizeSettings(input = {}, prev = defaultSettings()) {
 function settingsFingerprint(settings, type) {
   const t = settings[type], c = settings.common;
   const q = t.ratingMode === 'manual' ? { r: t.minRating, v: t.minVotes } : { auto: true };
-  return sha(JSON.stringify({ type, ...q, minRuntime: t.minRuntime || 0, minYear: t.minYear || 0, exclude: [...t.exclude].map(String).sort(), noWest: Boolean(t.noWesternAnimation), canc: c.excludeCancelled, gem: c.useGemini }), 12);
+  return sha(JSON.stringify({ type, ...q, minRuntime: t.minRuntime || 0, minYear: t.minYear || 0, exclude: [...t.exclude].map(String).sort(), noWest: Boolean(t.noWesternAnimation), canc: c.excludeCancelled, gem: c.useGemini, watch: (c.watch || []).join('|') }), 12);
 }
 
 const key = {

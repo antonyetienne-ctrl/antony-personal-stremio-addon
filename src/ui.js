@@ -3,7 +3,7 @@ const { MOVIE_GENRES, TV_GENRES, ENGINE_VERSION } = require('./config');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const CSS = `body{font-family:system-ui,sans-serif;background:#111;color:#eee;max-width:780px;margin:22px auto;padding:0 16px;line-height:1.45}h1{font-size:1.35em}h2{font-size:1.1em;margin:0 0 6px}
-section{background:#1b1b1b;padding:16px;border-radius:14px;margin:14px 0}label{display:block;margin:10px 0 4px;font-size:.93em}input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}
+section{background:#1b1b1b;padding:16px;border-radius:14px;margin:14px 0}label{display:block;margin:10px 0 4px;font-size:.93em}textarea,input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #444;background:#242424;color:#fff}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.chk{display:flex;align-items:center;gap:8px;margin:6px 0}.chk input{width:auto}.genres{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px}
 .btn{display:block;width:100%;padding:13px;border:0;border-radius:9px;font-weight:700;background:#fff;color:#111;margin-top:12px;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box}.btn.sec{background:#333;color:#fff}
 .muted{opacity:.7;font-size:.86em}.ok{background:#172b1d;padding:10px;border-radius:10px}.warn{background:#3a2a12;padding:10px;border-radius:10px}.err{background:#3a1616;padding:10px;border-radius:10px}code{background:#000;padding:2px 5px;border-radius:5px;word-break:break-all}
@@ -42,7 +42,8 @@ ${edit && view.has.gemini ? '<label class="chk"><input type="checkbox" name="cle
 <label class="chk"><input type="checkbox" name="common.seriesCatalog" value="1" ${s.common.seriesCatalog ? 'checked' : ''}>Catalogue Séries activé</label>
 <label class="chk"><input type="checkbox" name="common.excludeCancelled" value="1" ${s.common.excludeCancelled ? 'checked' : ''}>Exclure les séries annulées</label>
 <label class="chk"><input type="checkbox" name="common.frMeta" value="1" ${s.common.frMeta ? 'checked' : ''}>Fournir les fiches en français (/meta) — nécessite de réinstaller/mettre à jour l'addon dans Stremio si modifié</label>
-<label class="chk"><input type="checkbox" name="common.useGemini" value="1" ${s.common.useGemini ? 'checked' : ''}>Utiliser Gemini (ADN du profil, anti-recettes, arbitrage) quand une clé est enregistrée</label></section>
+<label class="chk"><input type="checkbox" name="common.useGemini" value="1" ${s.common.useGemini ? 'checked' : ''}>Utiliser Gemini (ADN du profil, anti-recettes, arbitrage) quand une clé est enregistrée</label>
+<label>Titres à surveiller (un par ligne)</label><textarea name="common.watch" rows="5" placeholder="The Expanse&#10;série: Rome&#10;film: Heat">${esc((s.common.watch || []).join('\n'))}</textarea><div class="muted">Le diagnostic (section « watch ») indique pour chacun s'il est vu, filtré ou candidat, et son rang. « série: » ou « film: » lève une ambiguïté. Enregistrer une nouvelle liste relance un recalcul (environ 2 minutes).</div></section>
 <button class="btn" type="submit">${edit ? 'Enregistrer' : 'Créer mon addon'}</button>
 <div class="muted" style="margin-top:8px">Modifier un filtre relance immédiatement le calcul des seuls catalogues concernés, sans réapprendre le profil. Changer l'ordre d'affichage ne relance aucun calcul.</div></form>
 ${edit ? `<script>

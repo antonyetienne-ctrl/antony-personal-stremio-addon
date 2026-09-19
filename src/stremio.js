@@ -41,7 +41,13 @@ function classify(item) {
   const bitfield = typeof s.watched === 'string' && s.watched.trim().length > 0;
   let seen, started;
   if (type === 'movie') { seen = times > 0 || flagged > 0 || ratio >= 0.7 || s.watched === true; started = !seen && (off > 0 || tw > 0 || ratio > 0 || bitfield); }
-  else { seen = times > 0 || flagged > 0 || s.watched === true; started = !seen && (bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id)); }
+  else {
+    // SÉRIE : seul compte le marquage de la série entière. Stremio incrémente timesWatched à CHAQUE épisode joué (ex. 113 pour une série longue) :
+    // times > 0 avec une durée de lecture réelle = épisodes regardés, pas série "vue". Marquage global = drapeau F, ou marque manuelle sans lecture (T > 0, durée ~ 0).
+    const noPlayback = dur < 30000;
+    seen = flagged > 0 || s.watched === true || (times > 0 && noPlayback);
+    started = !seen && (times > 0 || bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id));
+  }
   const lw = Date.parse(s.lastWatched || '') || Date.parse(item._mtime || '') || 0;
   // trace de la règle qui a déclenché "vu" (T = timesWatched, F = flaggedWatched, R = part regardée, D = durée en min) : visible dans /diagnostic
   const why = `T${times} F${flagged} R${ratio.toFixed(2)} D${Math.round(dur / 60000)}m${s.watched === true ? ' W' : ''}${bitfield ? ' b' : ''}`;

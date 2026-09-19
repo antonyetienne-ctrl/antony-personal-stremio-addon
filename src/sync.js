@@ -16,6 +16,7 @@ const model = require('./model');
 const bt = require('./backtest');
 const pipe = require('./pipeline');
 const { Imdb, attach: imdbAttach } = require('./imdb');
+const watchMod = require('./watch');
 
 const DEFAULT_RISK = { kappa: 0.25, rho: 0.1 };
 const TYPES = ['movie', 'series'];
@@ -216,6 +217,17 @@ class SyncEngine {
     const wantIds = new Set();
     for (const i of labeled) if (i.rec.im) wantIds.add(i.rec.im);
     for (const t of targets) for (const r of disc[t].recs) if (r.im) wantIds.add(r.im);
+    const watchList = (settings.common.watch || []).slice(0, 30); const watchRecs = new Map(); let watchEntries = [];
+    if (watchList.length) {
+      try {
+        this.setStage(uid, job, 'titres surveillés', `${watchList.length} titres`);
+        watchEntries = await spans.wrap('watch_resolve', () => watchMod.resolve(tmdb, watchList, { gate }));
+        for (const kind of ['movie', 'tv']) {
+          const ids = watchEntries.filter((e) => e.kind === kind && e.id).map((e) => e.id);
+          if (ids.length) { const m = await tmdb.ensureDetails(kind, ids, { gate }); for (const [id, rec] of m) { watchRecs.set(kind + id, rec); if (rec.im) wantIds.add(rec.im); } }
+        }
+      } catch (e) { log('warn', 'titres surveillés : résolution en échec', e.message); }
+    }
     const imr = await spans.wrap('imdb', () => this.imdb.ensure(wantIds, { gate, force }));
     let imdbActive = imr.active;
     if (imdbActive) {
@@ -224,7 +236,7 @@ class SyncEngine {
       imr.info.coverageLabeled = +cov.toFixed(3);
       if (cov < 0.8) { imdbActive = false; imr.info.error = imr.info.error || `couverture insuffisante des ❤️/👍 (${Math.round(cov * 100)} %)`; }
     }
-    imdbAttach([...labeled.map((i) => i.rec), ...targets.flatMap((t) => disc[t].recs)], imdbActive ? this.imdb : null);
+    imdbAttach([...labeled.map((i) => i.rec), ...targets.flatMap((t) => disc[t].recs), ...watchRecs.values()], imdbActive ? this.imdb : null);
     let effA;
     if (imdbActive) { const ai = require('./auto').autoThresholds(settings, labeled, { source: 'imdb' }); effA = ai.eff; job.taste = ai.info; }
     else effA = effTmdb;
@@ -289,11 +301,22 @@ class SyncEngine {
     }
 
     // 6) scoring de TOUS les candidats + arbitrage frontière
-    const pools = {}, sections = {};
+    const pools = {}, sections = {}, utils = {};
     for (const t of targets) {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
-      pools[t] = scored.slice(0, 60);
+      pools[t] = scored.slice(0, 60); utils[t] = scored.map((c) => c.util);
+    }
+    // suivi des titres attendus : trouvés ? vus/notés ? filtrés ? énumérés ? rang dans le classement complet ?
+    let watchReport = [];
+    if (watchEntries.length) {
+      try {
+        const classifiedBy = new Map(classified.map((c) => [c.imdb, c]));
+        const enumerated = { movie: new Set(), series: new Set() };
+        for (const t of targets) for (const r of disc[t].recs) enumerated[t].add(r.i);
+        const scoreOne = async (rec, type) => { const r = await pipe.scoreCandidates({ recs: [rec], corpus, profType: profiles[type], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }); return r[0]; };
+        for (const e of watchEntries) watchReport.push(await watchMod.inspect(e, e.id ? watchRecs.get(e.kind + e.id) : null, { classifiedBy, statuses, effA, enumerated, utils, scoreOne }));
+      } catch (e) { log('warn', 'titres surveillés : analyse en échec', e.message); }
     }
     let adj = null; const arb = { used: false };
     if (gem && gem.available) {
@@ -319,6 +342,29 @@ class SyncEngine {
     }
     if (!Object.keys(sections).length) throw new Error('aucun résultat valide à publier');
     this.setStage(uid, job, 'publication', 'publication atomique');
+    // classement "favoris estimés" : TOUS tes titres (vus, notés ou non), du plus au moins probable coup de cœur d'après des estimations
+    // HORS ÉCHANTILLON (chaque titre est noté par un modèle qui ne l'a pas vu pendant son apprentissage) ; mélange 70/30 type/global comme en production.
+    const favorites = {};
+    try {
+      const oofOf = (p) => { const m = new Map(); if (p && p.keys && p.task1 && p.taskLove) p.keys.forEach((k, j) => m.set(k, { pos: p.task1.oof[j], love: p.taskLove.oof[j] })); return m; };
+      const gm = oofOf(profiles.global);
+      for (const t of TYPES) {
+        const tm = profiles[t] && profiles[t] !== profiles.global ? oofOf(profiles[t]) : null;
+        const rows = labeled.filter((i) => i.rec.k === t[0]).map((i) => {
+          const g = gm.get(i.key), a = tm && tm.get(i.key); if (!g && !a) return null;
+          return { i, love: a && g ? 0.7 * a.love + 0.3 * g.love : (a || g).love, pos: a && g ? 0.7 * a.pos + 0.3 * g.pos : (a || g).pos };
+        }).filter(Boolean).sort((x, y) => y.love - x.love || y.pos - x.pos);
+        const tag = (l) => (l === 2 ? '❤️ Love' : l === 1 ? '👍 Like' : 'vu sans note');
+        const share = (n) => { const s = rows.slice(0, n); return { love: s.filter((x) => x.i.label === 2).length, like: s.filter((x) => x.i.label === 1).length, sansNote: s.filter((x) => x.i.label === 0).length }; };
+        const loveRanks = rows.map((x, r) => (x.i.label === 2 ? r + 1 : 0)).filter(Boolean);
+        favorites[t] = {
+          totalTitres: rows.length, partDeLoveDansTonHistorique: +(rows.filter((x) => x.i.label === 2).length / Math.max(1, rows.length)).toFixed(3),
+          top10: share(10), top30: share(30),
+          rangMedianDeTesLove: loveRanks.length ? loveRanks[Math.floor(loveRanks.length / 2)] : null,
+          classement: rows.slice(0, 30).map((x, r) => ({ rang: r + 1, titre: x.i.rec.t, annee: x.i.rec.y, reel: tag(x.i.label), pCoupDeCoeur: +x.love.toFixed(2), pApprecie: +x.pos.toFixed(2) }))
+        };
+      }
+    } catch (e) { log('warn', 'favoris estimés en échec', e.message); }
     // suivi de la précision RÉELLE : parmi le Top 30 précédemment publié, qu'as-tu noté depuis ? ("vu sans note" compté à part : oublis possibles)
     try {
       const prevRes = await this.results.getFast(uid); const loveS = new Set(), likeS = new Set(), unratedS = new Set();
@@ -338,7 +384,7 @@ class SyncEngine {
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
     Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
-    return { outcome: 'published', report: { imdb: job.imdb, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
+    return { outcome: 'published', report: { imdb: job.imdb, favorites, watch: watchReport, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }
 
   // ---------- lecture pour l'UI / le diagnostic ----------

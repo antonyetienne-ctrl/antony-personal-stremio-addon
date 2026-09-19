@@ -35,6 +35,7 @@ function parseForm(body) {
     if (p.has(`${t}.exclude__present`)) settings[t].exclude = p.getAll(`${t}.exclude`);
   }
   for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
+  if (p.has('common.watch')) settings.common.watch = String(p.get('common.watch')).split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
   return { secrets: { tmdb: g('tmdb') || '', stremio: g('stremio') || '', gemini: g('gemini') || '' }, clear: p.has('clearGemini') ? ['gemini'] : [], settings };
 }
 
