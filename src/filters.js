@@ -12,6 +12,7 @@ const has = (rec, id) => (rec.g || []).includes(id);
 
 function virtualTags(rec) {
   const names = kwNames(rec); const out = [];
+  if ((rec.g || []).includes(10762) || hasKidsKeyword(rec)) out.push('v:kids');
   for (const [tag, set] of Object.entries(VIRT)) if (names.some((n) => set.has(n))) out.push(tag);
   return out;
 }
@@ -32,20 +33,22 @@ function rejectReason(rec, settings, type) {
   if ((rec.g || []).some((g) => numeric.includes(g))) return 'genre';
   const virt = t.exclude.filter((x) => typeof x === 'string');
   if (virt.length && virtualTags(rec).some((v) => virt.includes(v))) return 'virtual-genre';
-  if (c.excludeKids && isKids(rec)) return 'kids';
-  if (c.excludeWesternKidsAnimation && isWesternKidsAnimation(rec)) return 'western-kids-animation';
+  if (t.noWesternAnimation && has(rec, 16) && !isAnime(rec)) return 'animation-non-japonaise';
   if (type === 'series' && c.excludeCancelled && String(rec.st || '').toLowerCase().startsWith('cancel')) return 'cancelled';
   if (type === 'movie' && t.minRuntime && rec.rt && rec.rt < t.minRuntime) return 'runtime';
+  if (t.minYear && rec.y && rec.y < t.minYear) return 'year';
   return null;
 }
 // Pré-filtre bon marché sur une ligne de /discover (avant de télécharger la fiche)
 function rowReject(row, settings, type) {
   const t = settings[type], c = settings.common;
   if (row.vote_average < t.minRating || row.vote_count < t.minVotes) return 'quality';
+  const yr = Number(String(row.release_date || row.first_air_date || '').slice(0, 4));
+  if (t.minYear && yr && yr < t.minYear) return 'year';
   const g = row.genre_ids || [];
   if (g.some((x) => t.exclude.includes(x))) return 'genre';
-  if (c.excludeKids && g.includes(10762)) return 'kids';
-  if (c.excludeWesternKidsAnimation && g.includes(16) && g.includes(10751) && row.original_language !== 'ja') return 'western-kids-animation';
+  if (t.exclude.includes('v:kids') && g.includes(10762)) return 'kids';
+  if (t.noWesternAnimation && g.includes(16) && row.original_language !== 'ja') return 'animation-non-japonaise';
   return null;
 }
 module.exports = { virtualTags, isAnime, isKids, isWesternKidsAnimation, rejectReason, rowReject };

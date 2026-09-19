@@ -30,10 +30,11 @@ function parseForm(body) {
   const p = new URLSearchParams(body); const g = (k) => p.get(k);
   const settings = { movie: {}, series: {}, common: {} };
   for (const t of ['movie', 'series']) {
-    for (const k of ['minRating', 'minVotes', 'minRuntime', 'order']) if (p.has(`${t}.${k}`)) settings[t][k] = g(`${t}.${k}`);
+    for (const k of ['minRating', 'minVotes', 'minRuntime', 'minYear', 'order', 'ratingMode']) if (p.has(`${t}.${k}`)) settings[t][k] = g(`${t}.${k}`);
+    settings[t].noWesternAnimation = p.has(`${t}.noWesternAnimation`);
     if (p.has(`${t}.exclude__present`)) settings[t].exclude = p.getAll(`${t}.exclude`);
   }
-  for (const k of ['excludeKids', 'excludeWesternKidsAnimation', 'excludeCancelled', 'movieCatalog', 'seriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
+  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
   return { secrets: { tmdb: g('tmdb') || '', stremio: g('stremio') || '', gemini: g('gemini') || '' }, clear: p.has('clearGemini') ? ['gemini'] : [], settings };
 }
 

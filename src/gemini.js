@@ -86,7 +86,7 @@ function dnaPrompt({ loves, likes, rejects, positiveTraits, negativeTraits, reci
 }
 function arbitragePrompt({ adn, evite, candidats }) {
   return `Tu départages des recommandations pour un spectateur dont l'ADN de goût est : ${adn || '(inconnu)'}\nÀ éviter : ${(evite || []).join(', ') || '(rien de précis)'}.\n` +
-    `Pour chaque candidat (déjà présélectionné par un modèle statistique, score_local 0-100), donne "adequation" (0-100 : probabilité qu'il plaise réellement) et "risque" (0-100 : risque de déception, ` +
+    `Pour chaque candidat (déjà présélectionné par un modèle statistique, score_local 0-100), donne "adequation" (0-100 : probabilité que ce soit un COUP DE CŒUR (❤️) pour lui, pas seulement un titre correct) et "risque" (0-100 : risque de déception, ` +
     `notamment s'il ressemble à "plus_proche_rejete" plutôt qu'à "plus_proche_aime"). Sois discriminant et fondé sur les nuances sémantiques (ton, thème, structure), pas sur la popularité.\n` +
     `Réponds UNIQUEMENT en JSON : {"evaluations":[{"id":"<id>","adequation":0,"risque":0,"note":"<=14 mots"}]}\nCANDIDATS : ${JSON.stringify(candidats)}`;
 }

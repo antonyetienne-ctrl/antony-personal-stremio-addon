@@ -6,7 +6,7 @@
 const { mapLimit, log } = require('./util');
 const { rowReject, rejectReason } = require('./filters');
 const { hashedVec } = require('./features');
-const { scoreProfile, blendScores, recipeMatches } = require('./model');
+const { scoreProfile, blendScores, recipeMatches, utilityOf } = require('./model');
 const { TOP_N } = require('./config');
 
 const PAGE_CAP = 100;          // 2 000 lignes par tri
@@ -18,6 +18,7 @@ async function enumerateRows(tmdb, kind, settings, type, { gate, onProgress } = 
   const base = { 'vote_average.gte': t.minRating, 'vote_count.gte': t.minVotes };
   if (numeric.length) base.without_genres = numeric.join(',');
   if (type === 'movie' && t.minRuntime) base['with_runtime.gte'] = t.minRuntime;
+  if (t.minYear) base[type === 'movie' ? 'primary_release_date.gte' : 'first_air_date.gte'] = `${t.minYear}-01-01`;
   const rows = new Map(); let calls = 0, complete = false, totalResults = 0, errors = 0;
   for (const sort of ['vote_count.desc', 'vote_average.desc', 'popularity.desc']) {
     let first;
@@ -81,7 +82,7 @@ function admissible(recs, { settings, type, seenImdb }) {
 }
 
 // Score de tous les candidats : 70 % profil du type + 30 % profil global ; utilité = mu − κσ − ρ·fp − pénalité toxique
-async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, yielder }) {
+async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, rank, yielder }) {
   const out = [];
   for (let i = 0; i < recs.length; i++) {
     const rec = recs[i]; const item = { rec, vec: hashedVec(rec, corpus) };
@@ -89,7 +90,7 @@ async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic
     let tox = 0; const hits = [];
     for (const t of toxic || []) if (recipeMatches(rec, t.parts)) { tox += t.conf * 0.06; hits.push(t.id); }
     tox = Math.min(0.12, tox);
-    const util = s.mu - (risk.kappa || 0) * s.sigma - (risk.rho || 0) * s.fp - tox;
+    const util = utilityOf(s, rank) - (risk.kappa || 0) * s.sigma - (risk.rho || 0) * s.fp - tox;
     out.push({ rec, item, s, tox, toxicHits: hits, util });
     if (yielder && i % 40 === 0) await yielder();
   }
@@ -112,16 +113,21 @@ function makeMeta(rec, type) {
 }
 
 // Sélection finale : les TOP_N meilleurs, sans quota ni diversité artificielle.
-// adj : Map imdb -> {fit, risk} (arbitrage Gemini) : correction BORNÉE de l'utilité, appliquée uniquement à la fenêtre frontière.
+// adj (arbitrage Gemini) : Map imdb -> {fit, risk, note}. Gemini ne peut que RÉORDONNER la fenêtre frontière (les WINDOW premiers
+// du classement local) : score relatif = 65 % utilité locale normalisée + 35 % avis Gemini normalisé. Un titre hors fenêtre
+// (non évalué) ne peut jamais entrer dans le Top 30 à sa place tant que la fenêtre contient au moins TOP_N titres.
+const WINDOW = 45;
 function finalizeTop(pool, adj) {
-  const scored = pool.map((c, idx) => {
-    let u = c.util; let gem = null;
-    const a = adj && adj.get(c.rec.im);
-    if (a) { gem = { fit: a.fit, risk: a.risk, note: a.note }; u += 0.12 * ((a.fit - 50) / 50) - 0.06 * (a.risk / 100); }
-    return { c, u, gem, localRank: idx + 1 };
-  });
-  scored.sort((a, b) => b.u - a.u || a.c.rec.i - b.c.rec.i);
-  return scored.slice(0, TOP_N);
+  const wrap = (c, idx, gem = null) => ({ c, u: c.util, gem, localRank: idx + 1 });
+  if (!adj || !adj.size) return pool.slice(0, TOP_N).map((c, i) => wrap(c, i));
+  const win = pool.slice(0, WINDOW).map((c, i) => { const a = adj.get(c.rec.im); return { ...wrap(c, i, a ? { fit: a.fit, risk: a.risk, note: a.note } : null), g: a ? a.fit / 100 - 0.5 * (a.risk / 100) : null }; });
+  const us = win.map((x) => x.c.util), umin = Math.min(...us), umax = Math.max(...us);
+  const gs = win.filter((x) => x.g !== null).map((x) => x.g), gmin = Math.min(...gs), gmax = Math.max(...gs);
+  const norm = (v, lo, hi) => (hi - lo > 1e-9 ? (v - lo) / (hi - lo) : 0.5);
+  for (const x of win) { const z = norm(x.c.util, umin, umax); x.u = x.g === null ? z : 0.65 * z + 0.35 * norm(x.g, gmin, gmax); }
+  win.sort((a, b) => b.u - a.u || a.c.rec.i - b.c.rec.i);
+  const rest = pool.slice(WINDOW).map((c, i) => wrap(c, WINDOW + i));
+  return [...win.map(({ c, u, gem, localRank }) => ({ c, u, gem, localRank })), ...rest].slice(0, TOP_N);
 }
 
 module.exports = { enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };

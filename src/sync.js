@@ -182,22 +182,23 @@ class SyncEngine {
         const id = ids.get(c.imdb); const rec = id && recs.get(id);
         if (!rec) { missing++; continue; }
         const label = st === 'love' ? 2 : st === 'like' ? 1 : 0;
-        labeled.push({ key: t[0] + c.imdb, rec, label, w: label ? 1 : model.negWeight(rec.va), lw: c.lw || 0 });
+        labeled.push({ key: t[0] + c.imdb, rec, label, w: 1, lw: c.lw || 0 });
       }
       lookup[t] = { known: new Set([...ids.values()]), missing, total: cand.length };
       if (cand.length && missing / cand.length > 0.08) throw new Error(`Fiches TMDB manquantes pour ${missing}/${cand.length} titres ${t} : calcul abandonné (résultat partiel refusé)`);
     }
     if (labeled.filter((i) => i.label > 0).length < 8) throw new Error('Pas assez de ❤️/👍 exploitables (minimum 8) pour apprendre des goûts');
     if (labeled.filter((i) => i.label === 0).length < 5) throw new Error('Pas assez de titres vus sans appréciation (minimum 5) pour apprendre ce qui est rejeté');
+    const auto = require('./auto').autoThresholds(settings, labeled); const eff = auto.eff; job.taste = auto.info;
     const seenImdb = new Set(classified.filter((c) => c.seen || c.started || ['love', 'like'].includes(statuses.get(c.imdb))).map((c) => c.imdb));
 
     // 3) découverte des candidats (canaux A/B) — checkpoint (cache TMDB) après chaque type
     const cands = {}, dstats = {};
     for (const t of targets) {
       const seeds = labeled.filter((i) => i.rec.k === t[0] && i.label > 0).sort((a, b) => b.label - a.label || b.lw - a.lw).map((i) => i.rec.i);
-      const d = await spans.wrap(`discover_${t}`, () => pipe.discoverCandidates({ tmdb, type: t, settings, seedTmdbIds: seeds, excludeTmdb: lookup[t].known, gate, onProgress: (label, done, total) => this.setStage(uid, job, `découverte ${t}`, `${label}`, done, total) }));
+      const d = await spans.wrap(`discover_${t}`, () => pipe.discoverCandidates({ tmdb, type: t, settings: eff, seedTmdbIds: seeds, excludeTmdb: lookup[t].known, gate, onProgress: (label, done, total) => this.setStage(uid, job, `découverte ${t}`, `${label}`, done, total) }));
       if (d.stats.discoverErrors > 0 || d.stats.detailErrors > Math.max(3, 0.03 * d.stats.toFetch)) throw new Error(`Découverte ${t} incomplète (${d.stats.discoverErrors} pages et ${d.stats.detailErrors} fiches en erreur) : calcul abandonné, l'ancien Top 30 est conservé`);
-      const adm = pipe.admissible(d.recs, { settings, type: t, seenImdb });
+      const adm = pipe.admissible(d.recs, { settings: eff, type: t, seenImdb });
       cands[t] = adm.recs; dstats[t] = { ...d.stats, admissible: adm.recs.length, rejects: adm.rejects };
       if (adm.recs.length < cfg.TOP_N) log('warn', `Seulement ${adm.recs.length} candidats admissibles pour ${t}`);
       job.checkpoint = { stage: `découverte ${t} terminée`, at: clock.now(), candidates: adm.recs.length };
@@ -226,6 +227,12 @@ class SyncEngine {
     }
     const namer = makeNamer(labeled.map((i) => i.rec));
     job.traits = explainProfile(profiles.global, namer);
+    // titres "vus sans note" que le modèle pense aimés : oublis probables de notation (à revérifier dans Stremio)
+    const recheck = [];
+    try {
+      const g = profiles.global;
+      if (g.keys && g.task1 && g.task1.oof) { const idx = new Map(labeled.map((i) => [i.key, i])); const arr = []; g.keys.forEach((k, j) => { const it = idx.get(k); if (it && it.label === 0) arr.push({ it, p: g.task1.oof[j] }); }); arr.sort((a, b) => b.p - a.p); for (const { it, p } of arr.slice(0, 25)) recheck.push({ title: it.rec.t, year: it.rec.y, imdb: it.rec.im, type: it.rec.k === 's' ? 'series' : 'movie', probabilite: +p.toFixed(2) }); }
+    } catch { /* facultatif */ }
 
     // 5) ADN + anti-recettes (Gemini, ≤ 1 requête, mis en cache par empreinte) — repli local sinon
     const recipes = model.negativeRecipes(labeled, 24);
@@ -252,7 +259,7 @@ class SyncEngine {
     const pools = {}, sections = {};
     for (const t of targets) {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
-      const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, toxic, yielder: gate }));
+      const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
       pools[t] = scored.slice(0, 60);
     }
     let adj = null; const arb = { used: false };
@@ -280,12 +287,26 @@ class SyncEngine {
     }
     if (!Object.keys(sections).length) throw new Error('aucun résultat valide à publier');
     this.setStage(uid, job, 'publication', 'publication atomique');
+    // suivi de la précision RÉELLE : parmi le Top 30 précédemment publié, qu'as-tu noté depuis ? ("vu sans note" compté à part : oublis possibles)
+    try {
+      const prevRes = await this.results.getFast(uid); const loveS = new Set(), likeS = new Set(), unratedS = new Set();
+      for (const c of classified) { const st = statuses.get(c.imdb); if (st === 'love') loveS.add(c.imdb); else if (st === 'like') likeS.add(c.imdb); else if (st === 'none' && c.seen) unratedS.add(c.imdb); }
+      job.precision = job.precision || [];
+      for (const t of TYPES) {
+        const sec = prevRes && prevRes[t]; if (!sec || !sec.items || !sec.buildId || sec.buildId === job.buildId) continue;
+        const ids = sec.items.map((x) => x.imdb);
+        const row = { buildId: sec.buildId, type: t, builtAt: sec.builtAt || null, checkedAt: clock.now(), shown: ids.length, love: ids.filter((i) => loveS.has(i)).length, like: ids.filter((i) => likeS.has(i)).length, seenUnrated: ids.filter((i) => unratedS.has(i)).length };
+        row.unseen = row.shown - row.love - row.like - row.seenUnrated;
+        job.precision = job.precision.filter((x) => !(x.buildId === row.buildId && x.type === t)); job.precision.push(row);
+      }
+      job.precision = job.precision.slice(-12);
+    } catch (e) { log('warn', 'suivi de précision', e.message); }
     const pub = await spans.wrap('publish', () => this.results.publish(uid, sections, { buildId: job.buildId }));
     await spans.wrap('cache_flush', () => tmdb.flushPersisted());
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
     Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
-    return { outcome: 'published', report: { counts, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
+    return { outcome: 'published', report: { counts, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }
 
   // ---------- lecture pour l'UI / le diagnostic ----------

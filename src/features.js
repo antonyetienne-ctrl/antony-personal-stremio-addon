@@ -21,6 +21,9 @@ function rawFeatures(rec) {
   for (const c of rec.ct || []) add('c:' + c, 0.2);
   if (rec.rt) add('rt:' + (rec.rt < 90 ? 0 : rec.rt < 120 ? 1 : rec.rt < 150 ? 2 : 3), 0.2);
   add('fmt:' + rec.k, 0.3);
+  // qualité perçue : le modèle APPREND si la note/le nombre de votes comptent pour cet utilisateur (exclu des vecteurs de similarité)
+  if (rec.va) add('q:r' + Math.max(0, Math.min(9, Math.floor((rec.va - 5) * 2))), 0.5);
+  if (rec.vc) add('q:v' + Math.min(8, Math.floor(Math.log10(Math.max(1, rec.vc)) * 2)), 0.3);
   const tf = new Map();
   for (const t of tokenize(rec.ov)) tf.set(t, (tf.get(t) || 0) + 1);
   for (const [t, c] of tf) add('w:' + t, 0.35 * (1 + Math.log(c)));
@@ -47,7 +50,7 @@ function fnv(str) {
 // vecteur dense haché (projection signée) : sert à la similarité cosinus, aux prototypes et aux clusters
 function hashedVec(rec, corpus, dim = 256) {
   const v = new Float32Array(dim);
-  for (const [k, w] of rawFeatures(rec)) { const h = fnv(k); v[h % dim] += ((h >>> 16) & 1 ? 1 : -1) * w * corpus.idf(k); }
+  for (const [k, w] of rawFeatures(rec)) { if (k.startsWith('q:')) continue; const h = fnv(k); v[h % dim] += ((h >>> 16) & 1 ? 1 : -1) * w * corpus.idf(k); }
   let n = 0; for (let i = 0; i < dim; i++) n += v[i] * v[i];
   n = Math.sqrt(n) || 1; for (let i = 0; i < dim; i++) v[i] /= n;
   return v;

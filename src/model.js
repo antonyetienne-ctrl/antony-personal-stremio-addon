@@ -155,7 +155,9 @@ async function trainProfile(items, cfg, corpus, yielder) {
   const nLove = pos.filter((i) => i.label === 2).length, nLike = pos.length - nLove;
   let task2 = null;
   if (nLove >= 6 && nLike >= 6) task2 = await trainTask(pos, Uint8Array.from(pos, (i) => (i.label === 2 ? 1 : 0)), pos.map(() => 1), { ...c, folds: 3, inter: c.inter, triples: false }, corpus, yielder);
-  return { task1, task2, loveRate: (nLove + 1) / (pos.length + 2), n: items.length, nPos: pos.length, nLove, nNeg: items.length - pos.length, cfg: c };
+  // tâche ❤️ directe : ❤️ contre tout le reste (👍 et vus sans appréciation) — comparée à la décomposition P(apprécié)·P(❤️|apprécié)
+  const taskLove = await trainTask(items, Uint8Array.from(items, (i) => (i.label === 2 ? 1 : 0)), w1, c, corpus, yielder);
+  return { task1, task2, taskLove, keys: items.map((i) => i.key), loveRate: (nLove + 1) / (pos.length + 2), n: items.length, nPos: pos.length, nLove, nNeg: items.length - pos.length, cfg: c };
 }
 // score d'une œuvre : {pPos, pLove, mu, sigma, fp, parts}
 function scoreProfile(profile, item) {
@@ -164,16 +166,27 @@ function scoreProfile(profile, item) {
   const mu = r1.p * (1 + (U_LOVE - 1) * pLove) / U_LOVE;
   const a = ml.sigmoid(r1.parts.zA), k = r1.parts.knnShare == null ? a : r1.parts.knnShare;
   const mean3 = (a + k + r1.p) / 3, dis = Math.sqrt(((a - mean3) ** 2 + (k - mean3) ** 2 + (r1.p - mean3) ** 2) / 3);
-  const novelty = Math.max(0, 0.5 - (r1.parts.maxSim || 0)) / 0.5;
-  return { pPos: r1.p, pLove, mu, sigma: Math.min(1, 2 * dis + 0.4 * novelty), fp: r1.parts.knnShare == null ? 0 : 1 - r1.parts.knnShare, parts: r1.parts };
+  const novelty = r1.parts.maxSim == null ? 0 : Math.max(0, 0.5 - r1.parts.maxSim) / 0.5;
+  const pLoveDirect = profile.taskLove ? profile.taskLove.predict(item).p : null;
+  return { pPos: r1.p, pLove, pLoveDirect, mu, sigma: Math.min(1, 2 * dis + 0.4 * novelty), fp: r1.parts.knnShare == null ? 0 : 1 - r1.parts.knnShare, parts: r1.parts };
 }
 // 70 % profil du type + 30 % profil global : ratio FIXE (exigence fonctionnelle)
 const W_TYPE = 0.7, W_GLOBAL = 0.3;
 function blendScores(a, g) {
-  return { pPos: W_TYPE * a.pPos + W_GLOBAL * g.pPos, pLove: W_TYPE * a.pLove + W_GLOBAL * g.pLove, mu: W_TYPE * a.mu + W_GLOBAL * g.mu, sigma: W_TYPE * a.sigma + W_GLOBAL * g.sigma, fp: W_TYPE * a.fp + W_GLOBAL * g.fp, parts: a.parts };
+  const direct = a.pLoveDirect == null || g.pLoveDirect == null ? null : W_TYPE * a.pLoveDirect + W_GLOBAL * g.pLoveDirect;
+  return { pPos: W_TYPE * a.pPos + W_GLOBAL * g.pPos, pLove: W_TYPE * a.pLove + W_GLOBAL * g.pLove, pLoveDirect: direct, mu: W_TYPE * a.mu + W_GLOBAL * g.mu, sigma: W_TYPE * a.sigma + W_GLOBAL * g.sigma, fp: W_TYPE * a.fp + W_GLOBAL * g.fp, parts: a.parts };
 }
 
-// Poids d'un négatif : un film mal noté par TMDB est plus probablement rejeté pour sa qualité que pour son thème.
+// Classement orienté ❤️ : P(❤️) = (1-α)·P(apprécié)·P(❤️|apprécié) + α·P(❤️ direct) ; utilité = P(❤️) + β·P(👍 seul).
+// α et β sont choisis par le backtest (taux de ❤️ dans le Top 30 sur la période de test).
+const DEFAULT_RANK = { alpha: 0.5, beta: 0.33 };
+function utilityOf(s, rank) {
+  const { alpha, beta } = { ...DEFAULT_RANK, ...(rank || {}) };
+  const dec = s.pPos * s.pLove;
+  const pl = s.pLoveDirect == null ? dec : (1 - alpha) * dec + alpha * s.pLoveDirect;
+  return pl + beta * Math.max(0, s.pPos - pl);
+}
+// Poids d'un négatif (conservé pour compatibilité ; le moteur v7.1 traite un vu-sans-note comme l'inverse d'un 👍 : poids 1) : un film mal noté par TMDB est plus probablement rejeté pour sa qualité que pour son thème.
 const negWeight = (va) => 0.25 + 0.75 / (1 + Math.exp(-((Number(va) || 0) - 6.6) / 0.5));
 
 // Recettes négatives candidates (pour analyse Gemini / règle locale) : combinaisons sur-représentées chez les négatifs,
@@ -190,4 +203,4 @@ function negativeRecipes(items, cap = 24) {
 }
 function recipeMatches(rec, parts) { const f = rawFeatures(rec); return parts.every((p) => f.has(p)); }
 
-module.exports = { U_LOVE, DEFAULT_CFG, W_TYPE, W_GLOBAL, trainProfile, scoreProfile, blendScores, negWeight, negativeRecipes, recipeMatches, mineInteractions, hashedVec, Corpus };
+module.exports = { DEFAULT_RANK, utilityOf, U_LOVE, DEFAULT_CFG, W_TYPE, W_GLOBAL, trainProfile, scoreProfile, blendScores, negWeight, negativeRecipes, recipeMatches, mineInteractions, hashedVec, Corpus };

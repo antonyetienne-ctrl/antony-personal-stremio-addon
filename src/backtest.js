@@ -12,8 +12,7 @@ const VARIANTS = [
   { id: 'A_lineaire', label: 'Régression sur features (baseline)', cfg: { inter: 0, stack: false } },
   { id: 'B_paires', label: '+ interactions (paires)', cfg: { inter: 2, stack: false } },
   { id: 'C_prototypes', label: '+ prototypes/kNN/clusters + empilement', cfg: { inter: 2, stack: true } },
-  { id: 'D_triplets', label: '+ triplets', cfg: { inter: 2, triples: true, stack: true } },
-  { id: 'E_recence', label: '+ pondération de récence (demi-vie 2 ans)', cfg: { inter: 2, stack: true, halfLifeDays: 730 } }
+  { id: 'D_triplets', label: '+ triplets', cfg: { inter: 2, triples: true, stack: true } }
 ];
 const GAIN_TO_ADOPT = 0.004;   // une variante plus complexe n'est adoptée que si elle gagne au moins autant en AUC
 
@@ -23,15 +22,10 @@ function metrics(p, y, love) {
   return { n, positives: pos, baseRate: +(pos / Math.max(1, n)).toFixed(3), auc: +ml.auc(p, y).toFixed(4), logloss: +ml.logloss(p, y).toFixed(4), brier: +ml.brier(p, y).toFixed(4), p10: at(10), p30: at(30), calibration: ml.calibration(p, y) };
 }
 
+// Les ❤️/👍/vus ont été saisis à la main, sans lien fiable avec la date de visionnage : PAS de découpage temporel.
+// Tirage déterministe 80/20 (par identifiant), donc reproductible.
 function split(items) {
-  const dated = items.filter((i) => i.lw > 0).length;
-  if (dated >= 0.6 * items.length) {
-    const order = items.map((_, i) => i).sort((a, b) => items[a].lw - items[b].lw);
-    const nTest = Math.max(30, Math.round(items.length * 0.2));
-    const testIdx = new Set(order.slice(order.length - nTest));
-    return { mode: 'temporel (20 % les plus récents)', dev: items.filter((_, i) => !testIdx.has(i)), test: items.filter((_, i) => testIdx.has(i)) };
-  }
-  return { mode: 'tirage déterministe 80/20 (dates insuffisantes)', dev: items.filter((i) => hashInt(i.key) % 5 !== 0), test: items.filter((i) => hashInt(i.key) % 5 === 0) };
+  return { mode: 'tirage déterministe 80/20 (dates de notation non fiables)', dev: items.filter((i) => hashInt(i.key) % 5 !== 0), test: items.filter((i) => hashInt(i.key) % 5 === 0) };
 }
 
 async function runBacktest(items, corpus, yielder, { onStage } = {}) {
@@ -69,20 +63,32 @@ async function runBacktest(items, corpus, yielder, { onStage } = {}) {
   const scored = test.map((it) => { const g = scoreProfile(profGlobal, it); const t = profByKind[it.rec.k] ? scoreProfile(profByKind[it.rec.k], it) : g; return { it, g, b: blendScores(t, g) }; });
   const yt = (arr) => arr.map((s) => (s.it.label > 0 ? 1 : 0)), lv = (arr) => arr.map((s) => (s.it.label === 2 ? 1 : 0));
   out.test.global = metrics(scored.map((s) => s.g.pPos), yt(scored), lv(scored));
-  out.test.blend70_30 = metrics(scored.map((s) => s.b.mu), yt(scored), lv(scored));
   for (const k of kinds) {
     const sub = scored.filter((s) => s.it.rec.k === k);
     if (sub.length >= 20 && new Set(yt(sub)).size === 2) out.test[k === 'm' ? 'films' : 'series'] = metrics(sub.map((s) => s.b.pPos), yt(sub), lv(sub));
   }
-  // 3) pénalités d'incertitude / de risque : choisies sur le test (grille minuscule, la plus simple qui gagne)
+  // 3) classement orienté ❤️ : α (part du modèle ❤️ direct) et β (crédit accordé au 👍 seul), choisis sur le taux de ❤️ dans le Top 30
+  const { utilityOf, DEFAULT_RANK } = require('./model');
+  const ytArr = yt(scored), lvArr = lv(scored);
+  const rankGrid = [];
+  for (const alpha of [DEFAULT_RANK.alpha, 0, 1]) for (const beta of [DEFAULT_RANK.beta, 0.1, 0.5]) rankGrid.push({ alpha, beta });
+  out.rankGrid = rankGrid.map((r) => {
+    const u = scored.map((s) => utilityOf(s.b, r)); const m = metrics(u, ytArr, lvArr);
+    return { ...r, loveRate30: m.p30 ? m.p30.loveRate : null, precision30: m.p30 ? m.p30.precision : null, loveAuc: +ml.auc(u, lvArr).toFixed(4) };
+  });
+  let bestR = out.rankGrid[0];                       // valeurs par défaut en tête : une alternative doit gagner nettement
+  for (const r of out.rankGrid.slice(1)) if ((r.loveRate30 || 0) + r.loveAuc >= (bestR.loveRate30 || 0) + bestR.loveAuc + 0.02) bestR = r;
+  out.rank = { alpha: bestR.alpha, beta: bestR.beta };
+  // 4) pénalités d'incertitude / de risque (grille minuscule, la plus simple qui gagne), critère : AUC du ❤️
   const grid = []; for (const kappa of [0, 0.25, 0.5]) for (const rho of [0, 0.1, 0.2]) grid.push({ kappa, rho });
   let bestG = null;
   for (const g of grid) {
-    const u = scored.map((s) => s.b.mu - g.kappa * s.b.sigma - g.rho * s.b.fp);
-    const a = ml.auc(u, yt(scored));
+    const u = scored.map((s) => utilityOf(s.b, out.rank) - g.kappa * s.b.sigma - g.rho * s.b.fp);
+    const a = ml.auc(u, lvArr);
     if (!bestG || a >= bestG.auc + 0.003) bestG = { ...g, auc: +a.toFixed(4) };
   }
   out.risk = bestG;
+  out.test.blend70_30 = metrics(scored.map((s) => utilityOf(s.b, out.rank) - bestG.kappa * s.b.sigma - bestG.rho * s.b.fp), ytArr, lvArr);   // classement FINAL (Top 30 orienté ❤️)
   for (const v of out.variants) delete v.profile;
   out.ms = Date.now() - t0;
   return out;
