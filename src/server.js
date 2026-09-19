@@ -45,7 +45,7 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
     if (method === 'OPTIONS') { res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET,POST,OPTIONS' }); return res.end(); }
     if (path === '/health') return json(res, 200, { ok: true, version: cfg.ENGINE_VERSION, upstash: store.enabled && store.available });
 
-    if (path === '/diagnostic' || path === '/diag') {
+    if (path === '/diagnostic' || path === '/diag' || path.startsWith('/diag/') || path.startsWith('/diagnostic/')) {
       if (!diagToken()) return json(res, 503, { error: 'DIAG_TOKEN non défini sur le serveur' });
       const t = u.searchParams.get('token') || req.headers['x-diag-token'] || '';
       if (!safeEq(t, diagToken())) return json(res, 401, { error: 'non autorisé' });

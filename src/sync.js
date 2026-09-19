@@ -15,6 +15,7 @@ const { Corpus, hashedVec, makeNamer, nameOfKey } = require('./features');
 const model = require('./model');
 const bt = require('./backtest');
 const pipe = require('./pipeline');
+const { Imdb, attach: imdbAttach } = require('./imdb');
 
 const DEFAULT_RISK = { kappa: 0.25, rho: 0.1 };
 const TYPES = ['movie', 'series'];
@@ -26,6 +27,7 @@ class SyncEngine {
     this.store = store; this.users = users; this.results = results; this.idleDelayMs = idleDelayMs;
     this.jobs = new Map(); this.running = new Set(); this.timers = new Map(); this.clients = new Map();
     this.snaps = new Map(); this.profileCache = new Map(); this.lastJobSave = new Map(); this.progress = new Map();
+    this.imdb = new Imdb({ store });
   }
 
   // ---------- état du job ----------
@@ -189,28 +191,56 @@ class SyncEngine {
     }
     if (labeled.filter((i) => i.label > 0).length < 8) throw new Error('Pas assez de ❤️/👍 exploitables (minimum 8) pour apprendre des goûts');
     if (labeled.filter((i) => i.label === 0).length < 5) throw new Error('Pas assez de titres vus sans appréciation (minimum 5) pour apprendre ce qui est rejeté');
-    const auto = require('./auto').autoThresholds(settings, labeled); const eff = auto.eff; job.taste = auto.info;
+    // seuils TMDB automatiques : repli si IMDb est indisponible, et base d'un pré-filtre TMDB ÉLARGI pour la découverte
+    const autoT = require('./auto').autoThresholds({ ...settings, movie: { ...settings.movie, ratingMode: 'auto' }, series: { ...settings.series, ratingMode: 'auto' } }, labeled, { source: 'tmdb' });
+    const effTmdb = autoT.eff; job.taste = autoT.info;
     const seenImdb = new Set(classified.filter((c) => c.seen || c.started || ['love', 'like'].includes(statuses.get(c.imdb))).map((c) => c.imdb));
 
-    // 3) découverte des candidats (canaux A/B) — checkpoint (cache TMDB) après chaque type
-    const cands = {}, dstats = {};
+    // 3) découverte des candidats (canaux A/B) avec un pré-filtre TMDB ÉLARGI : le vrai filtre de qualité est appliqué ensuite sur IMDb.
+    //    Checkpoint (cache TMDB persistant) après chaque type.
+    const relax = (t) => ({ ...effTmdb[t], minRating: Math.max(5, +(effTmdb[t].minRating - 0.7).toFixed(1)), minVotes: Math.max(100, Math.round(effTmdb[t].minVotes / 3)) });
+    const effDisc = { ...effTmdb, movie: relax('movie'), series: relax('series') };
+    const cands = {}, dstats = {}, disc = {};
     for (const t of targets) {
       const seeds = labeled.filter((i) => i.rec.k === t[0] && i.label > 0).sort((a, b) => b.label - a.label || b.lw - a.lw).map((i) => i.rec.i);
-      const d = await spans.wrap(`discover_${t}`, () => pipe.discoverCandidates({ tmdb, type: t, settings: eff, seedTmdbIds: seeds, excludeTmdb: lookup[t].known, gate, onProgress: (label, done, total) => this.setStage(uid, job, `découverte ${t}`, `${label}`, done, total) }));
+      const d = await spans.wrap(`discover_${t}`, () => pipe.discoverCandidates({ tmdb, type: t, settings: effDisc, seedTmdbIds: seeds, excludeTmdb: lookup[t].known, gate, onProgress: (label, done, total) => this.setStage(uid, job, `découverte ${t}`, `${label}`, done, total) }));
       if (d.stats.discoverErrors > 0 || d.stats.detailErrors > Math.max(3, 0.03 * d.stats.toFetch)) throw new Error(`Découverte ${t} incomplète (${d.stats.discoverErrors} pages et ${d.stats.detailErrors} fiches en erreur) : calcul abandonné, l'ancien Top 30 est conservé`);
-      const adm = pipe.admissible(d.recs, { settings: eff, type: t, seenImdb });
-      cands[t] = adm.recs; dstats[t] = { ...d.stats, admissible: adm.recs.length, rejects: adm.rejects };
-      if (adm.recs.length < cfg.TOP_N) log('warn', `Seulement ${adm.recs.length} candidats admissibles pour ${t}`);
-      job.checkpoint = { stage: `découverte ${t} terminée`, at: clock.now(), candidates: adm.recs.length };
+      disc[t] = d; dstats[t] = { ...d.stats };
+      job.checkpoint = { stage: `découverte ${t} terminée`, at: clock.now(), candidates: d.recs.length };
       await spans.wrap('cache_flush', () => tmdb.flushPersisted());
       await this.saveJob(job, uid, true);
+    }
+    // 3b) notes et votes IMDb (une seule lecture du jeu de données pour Films + Séries) : filtre de qualité + critères appris.
+    //     Indisponible ou couverture insuffisante des ❤️/👍 => repli sur les notes TMDB (seuils automatiques TMDB).
+    this.setStage(uid, job, 'imdb', 'notes et votes IMDb');
+    const wantIds = new Set();
+    for (const i of labeled) if (i.rec.im) wantIds.add(i.rec.im);
+    for (const t of targets) for (const r of disc[t].recs) if (r.im) wantIds.add(r.im);
+    const imr = await spans.wrap('imdb', () => this.imdb.ensure(wantIds, { gate, force }));
+    let imdbActive = imr.active;
+    if (imdbActive) {
+      const pos = labeled.filter((i) => i.label > 0);
+      const cov = pos.filter((i) => this.imdb.get(i.rec.im)).length / Math.max(1, pos.length);
+      imr.info.coverageLabeled = +cov.toFixed(3);
+      if (cov < 0.8) { imdbActive = false; imr.info.error = imr.info.error || `couverture insuffisante des ❤️/👍 (${Math.round(cov * 100)} %)`; }
+    }
+    imdbAttach([...labeled.map((i) => i.rec), ...targets.flatMap((t) => disc[t].recs)], imdbActive ? this.imdb : null);
+    let effA;
+    if (imdbActive) { const ai = require('./auto').autoThresholds(settings, labeled, { source: 'imdb' }); effA = ai.eff; job.taste = ai.info; }
+    else effA = effTmdb;
+    for (const t of TYPES) effA[t].source = imdbActive ? 'imdb' : 'tmdb';
+    job.imdb = { active: imdbActive, qualiteSur: imdbActive ? 'IMDb' : 'TMDB (repli)', ...imr.info, manuelIgnore: !imdbActive && (settings.movie.ratingMode === 'manual' || settings.series.ratingMode === 'manual') ? 'mode manuel ignoré : IMDb indisponible, seuils TMDB automatiques utilisés' : null };
+    for (const t of targets) {
+      const adm = pipe.admissible(disc[t].recs, { settings: effA, type: t, seenImdb });
+      cands[t] = adm.recs; dstats[t] = { ...dstats[t], admissible: adm.recs.length, rejects: adm.rejects };
+      if (adm.recs.length < cfg.TOP_N) log('warn', `Seulement ${adm.recs.length} candidats admissibles pour ${t}`);
     }
 
     // 4) modèle : backtest (mis en cache par empreinte) puis entraînement Global/Films/Séries
     this.setStage(uid, job, 'apprentissage', 'apprentissage des goûts');
     const corpus = new Corpus(labeled.map((i) => i.rec));
     for (const it of labeled) it.vec = hashedVec(it.rec, corpus);
-    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}`);
+    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}`);
     if (!job.backtest || job.backtest.key !== btKey || force) {
       const b = await spans.wrap('backtest', () => bt.runBacktest(labeled, corpus, gate, { onStage: (s) => this.setStage(uid, job, 'backtest', s) }));
       job.backtest = { key: btKey, ...b };
@@ -308,7 +338,7 @@ class SyncEngine {
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
     Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
-    return { outcome: 'published', report: { counts, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
+    return { outcome: 'published', report: { imdb: job.imdb, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }
 
   // ---------- lecture pour l'UI / le diagnostic ----------
@@ -327,4 +357,20 @@ function explainProfile(profile, namer, n = 12) {
   return { positive: arr.slice(0, n).filter((x) => x[1] > 0.05).map(([k, w]) => ({ name: nameOfKey(namer, k), weight: +w.toFixed(2) })), negative: arr.slice(-n).reverse().filter((x) => x[1] < -0.05).map(([k, w]) => ({ name: nameOfKey(namer, k), weight: +w.toFixed(2) })) };
 }
 
-module.exports = { SyncEngine, explainProfile, TYPES };
+// Répartition des signaux Stremio (T = fois vu, F = marqué vu, b = bitfield d'épisodes) et de la décision prise ("vu", "commencé", "rien").
+// Sert à vérifier, sur les vraies données, que la décision "vu" d'une SÉRIE repose bien sur le marquage global et non sur des épisodes isolés.
+function parseWhy(why) { const m = /T(\d+) F(\d+) R([\d.]+)/.exec(why || ''); return m ? { t: Number(m[1]), f: Number(m[2]), r: Number(m[3]), w: /\sW/.test(why), b: /\sb\b/.test(why) } : null; }
+function stateMatrixOf(classified, statuses) {
+  const out = {};
+  for (const c of classified) {
+    const p = parseWhy(c.why); if (!p) continue;
+    const k = `${c.type === 'series' ? 'série' : 'film'} | T${p.t > 0 ? '+' : '0'} F${p.f > 0 ? '+' : '0'}${p.b ? ' épisodes' : ''}${p.r >= 0.7 ? ' R≥70%' : ''} → ${c.seen ? 'VU' : c.started ? 'commencé' : 'rien'}`;
+    out[k] = (out[k] || 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(out).sort((a, b) => b[1] - a[1]));
+}
+function seriesSamplesOf(classified, statuses) {
+  return classified.filter((c) => c.type === 'series' && c.why && (c.seen || c.started)).slice(0, 15).map((c) => ({ imdb: c.imdb, why: c.why, decision: c.seen ? 'vu' : 'commencé', statut: statuses.get(c.imdb) }));
+}
+
+module.exports = { SyncEngine, explainProfile, TYPES, stateMatrixOf, seriesSamplesOf, parseWhy };

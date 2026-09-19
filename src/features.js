@@ -8,8 +8,9 @@ const tokenize = (text) => norm(text).split(/[^a-z0-9]+/).filter((t) => t.length
 
 const RAW = new WeakMap();
 function rawFeatures(rec) {
-  let f = RAW.get(rec); if (f) return f;
-  f = new Map();
+  const sig = `${rec.ir}|${rec.iv}`;
+  let hit = RAW.get(rec); if (hit && hit.sig === sig) return hit.f;
+  const f = new Map();
   const add = (k, w) => f.set(k, (f.get(k) || 0) + w);
   for (const g of rec.g || []) add('g:' + g, 1);
   for (const [id] of rec.kw || []) add('k:' + id, 1);
@@ -22,12 +23,17 @@ function rawFeatures(rec) {
   if (rec.rt) add('rt:' + (rec.rt < 90 ? 0 : rec.rt < 120 ? 1 : rec.rt < 150 ? 2 : 3), 0.2);
   add('fmt:' + rec.k, 0.3);
   // qualité perçue : le modèle APPREND si la note/le nombre de votes comptent pour cet utilisateur (exclu des vecteurs de similarité)
-  if (rec.va) add('q:r' + Math.max(0, Math.min(9, Math.floor((rec.va - 5) * 2))), 0.5);
-  if (rec.vc) add('q:v' + Math.min(8, Math.floor(Math.log10(Math.max(1, rec.vc)) * 2)), 0.3);
+  if (rec.ir != null) {                                  // note/votes IMDb (source de qualité privilégiée)
+    add('q:ir' + Math.max(0, Math.min(9, Math.floor((rec.ir - 5) * 2))), 0.5);
+    if (rec.iv) add('q:iv' + Math.min(13, Math.floor(Math.log10(Math.max(1, rec.iv)) * 2)), 0.3);
+  } else {                                               // repli : note/votes TMDB
+    if (rec.va) add('q:r' + Math.max(0, Math.min(9, Math.floor((rec.va - 5) * 2))), 0.5);
+    if (rec.vc) add('q:v' + Math.min(8, Math.floor(Math.log10(Math.max(1, rec.vc)) * 2)), 0.3);
+  }
   const tf = new Map();
   for (const t of tokenize(rec.ov)) tf.set(t, (tf.get(t) || 0) + 1);
   for (const [t, c] of tf) add('w:' + t, 0.35 * (1 + Math.log(c)));
-  RAW.set(rec, f);
+  RAW.set(rec, { sig, f });
   return f;
 }
 

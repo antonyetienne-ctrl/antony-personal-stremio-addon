@@ -27,8 +27,11 @@ function rejectReason(rec, settings, type) {
   const t = settings[type], c = settings.common;
   if (!rec.im) return 'no-imdb';
   if (rec.ad) return 'adult';
-  if (rec.va < t.minRating) return 'rating';
-  if (rec.vc < t.minVotes) return 'votes';
+  const useImdb = t.source === 'imdb';                       // source de qualité fixée par le moteur (IMDb si disponible, sinon TMDB)
+  const rating = useImdb ? rec.ir : rec.va, votes = useImdb ? rec.iv : rec.vc;
+  if (useImdb && (rating == null || votes == null)) return 'imdb-inconnu';
+  if (rating < t.minRating) return 'rating';
+  if (votes < t.minVotes) return 'votes';
   const numeric = t.exclude.filter((x) => typeof x === 'number');
   if ((rec.g || []).some((g) => numeric.includes(g))) return 'genre';
   const virt = t.exclude.filter((x) => typeof x === 'string');

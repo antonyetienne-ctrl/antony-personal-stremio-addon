@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.1.2';
+const ENGINE_VERSION = '7.2.0';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB
@@ -66,7 +66,8 @@ const key = {
   snap: (id) => `${NS}:snap:${id}`,
   ckpt: (id) => `${NS}:ckpt:${id}`,
   tmdb: (kind, shard) => `${NS}:tmdb:${LANG}:${kind}:${shard}`,
-  idmap: `${NS}:idmap`
+  idmap: `${NS}:idmap`,
+  imdb: `${NS}:imdbr`
 };
 
 module.exports = { ENGINE_VERSION, NS, LANG, DETAIL_SCHEMA, TOP_N, MOVIE_GENRES, TV_GENRES, defaultSettings, normalizeSettings, settingsFingerprint, key };
