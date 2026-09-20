@@ -52,8 +52,10 @@ function classify(item) {
     // Stremio incrémente timesWatched à chaque épisode joué, mais un suivi d'épisodes (bitfield) n'existe que si des épisodes ont réellement été lus. Donc :
     //  - compteur > 0 ET drapeau série (F) => vue (ex. Scrubs, Malcolm, Hero Skill : confirmées vues) ;
     //  - compteur > 0 SANS suivi d'épisodes = marque manuelle "vue", même avec un vieux reste de lecture (ex. Ted Lasso) => vue ;
+    //  - compteur > 0 AVEC suivi d'épisodes mais AUCUNE progression de lecture = série entière marquée vue à la main => vue ;
     //  - épisodes réellement lus (compteur + suivi d'épisodes) sans drapeau, ou drapeau seul => commencée.
-    seen = (times > 0 && (flagged > 0 || !bitfield)) || s.watched === true;
+    const noProgress = tw === 0 && off === 0;      // aucune progression de lecture : marquage manuel de la série entière (ex. Silo, Le Jeu de la dame, Alice in Borderland, Game of Thrones)
+    seen = (times > 0 && (flagged > 0 || !bitfield || noProgress)) || s.watched === true;
     started = !seen && (times > 0 || flagged > 0 || bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id));
   }
   const lw = Date.parse(s.lastWatched || '') || Date.parse(item._mtime || '') || 0;

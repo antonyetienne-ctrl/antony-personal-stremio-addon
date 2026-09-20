@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.2.5';
+const ENGINE_VERSION = '7.2.6';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB
@@ -56,7 +56,7 @@ function normalizeSettings(input = {}, prev = defaultSettings()) {
 function settingsFingerprint(settings, type) {
   const t = settings[type], c = settings.common;
   const q = t.ratingMode === 'manual' ? { r: t.minRating, v: t.minVotes } : { auto: true };
-  return sha(JSON.stringify({ type, ...q, minRuntime: t.minRuntime || 0, minYear: t.minYear || 0, exclude: [...t.exclude].map(String).sort(), noWest: Boolean(t.noWesternAnimation), canc: c.excludeCancelled, gem: c.useGemini }), 12);
+  return sha(JSON.stringify({ type, ...q, minRuntime: t.minRuntime || 0, minYear: t.minYear || 0, exclude: [...t.exclude].map(String).sort(), noWest: Boolean(t.noWesternAnimation), canc: c.excludeCancelled, gem: c.useGemini, vf: type === 'series' ? t.vfCheck !== false : undefined }), 12);
 }
 
 const key = {

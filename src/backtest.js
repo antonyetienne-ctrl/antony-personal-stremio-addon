@@ -28,7 +28,7 @@ function split(items) {
   return { mode: 'tirage déterministe 80/20 (dates de notation non fiables)', dev: items.filter((i) => hashInt(i.key) % 5 !== 0), test: items.filter((i) => hashInt(i.key) % 5 === 0) };
 }
 
-async function runBacktest(items, corpus, yielder, { onStage } = {}) {
+async function runBacktest(items, corpus, yielder, { onStage, afterTest } = {}) {
   const t0 = Date.now();
   const out = { at: new Date().toISOString(), n: items.length, variants: [], chosen: null, test: {}, risk: null, notes: [] };
   const usable = items.filter((i) => i.label >= 0);
@@ -91,6 +91,10 @@ async function runBacktest(items, corpus, yielder, { onStage } = {}) {
   out.test.blend70_30 = metrics(scored.map((s) => utilityOf(s.b, out.rank) - bestG.kappa * s.b.sigma - bestG.rho * s.b.fp), ytArr, lvArr);   // classement FINAL (Top 30 orienté ❤️)
   Object.assign(out.test.blend70_30, { logloss: null, brier: null, calibration: null, note: 'score de classement orienté ❤️ : logloss et calibration non applicables' });
   for (const v of out.variants) delete v.profile;
+  if (typeof afterTest === 'function') {                       // mesure facultative (ex. apport de Gemini) : ne modifie rien au classement
+    try { out.geminiEval = await afterTest({ dev, test, scored, profGlobal, rank: out.rank, risk: out.risk }); }
+    catch (e) { out.geminiEval = { error: String(e && e.message || e).slice(0, 160) }; }
+  }
   out.ms = Date.now() - t0;
   return out;
 }

@@ -119,4 +119,12 @@ function parseEvaluations(r, byId) {
   return { map, shape, listLength: list.length };
 }
 
-module.exports = { parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };
+// Prompt de MESURE : aucune information locale (ni score, ni titres voisins) pour que la comparaison avec le modèle soit honnête.
+function evalPrompt({ adn, evite, candidats }) {
+  return `Tu estimes, pour un spectateur dont l'ADN de goût est : ${adn || '(inconnu)'}\nÀ éviter : ${(evite || []).join(', ') || '(rien de précis)'}.\n` +
+    `Pour chaque titre ci-dessous, donne "adequation" (0-100 : probabilité que ce soit un COUP DE CŒUR (❤️) pour lui) et "risque" (0-100 : risque qu'il ne l'apprécie pas). ` +
+    `Appuie-toi sur son ADN et sur le contenu (thème, ton, structure narrative), pas sur la popularité. Sois discriminant : utilise toute l'échelle.\n` +
+    `Réponds UNIQUEMENT en JSON : {"evaluations":[{"id":"<id>","adequation":0,"risque":0}]}\nTITRES : ${JSON.stringify(candidats)}`;
+}
+
+module.exports = { evalPrompt, parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };

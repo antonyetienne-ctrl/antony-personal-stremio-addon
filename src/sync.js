@@ -12,6 +12,7 @@ const stremio = require('./stremio');
 const { Tmdb } = require('./tmdb');
 const { Gemini, dnaPrompt, arbitragePrompt, parseEvaluations } = require('./gemini');
 const { Corpus, hashedVec, makeNamer, nameOfKey } = require('./features');
+const geval = require('./geval');
 const model = require('./model');
 const bt = require('./backtest');
 const pipe = require('./pipeline');
@@ -242,9 +243,20 @@ class SyncEngine {
     this.setStage(uid, job, 'apprentissage', 'apprentissage des goûts');
     const corpus = new Corpus(labeled.map((i) => i.rec));
     for (const it of labeled) it.vec = hashedVec(it.rec, corpus);
-    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}`);
+    const canEval = Boolean(gem && gem.available);      // la mesure Gemini est refaite si Gemini devient disponible
+    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}|${canEval ? 'g' : 'n'}`);
     if (!job.backtest || job.backtest.key !== btKey || force) {
-      const b = await spans.wrap('backtest', () => bt.runBacktest(labeled, corpus, gate, { onStage: (s) => this.setStage(uid, job, 'backtest', s) }));
+      const prev = job.backtest && job.backtest.key === btKey ? job.backtest.geminiEval : null;      // même historique : on réutilise la mesure déjà faite
+      const prevOk = prev && !prev.error && !prev.skipped ? prev : null;
+      const b = await spans.wrap('backtest', () => bt.runBacktest(labeled, corpus, gate, {
+        onStage: (s) => this.setStage(uid, job, 'backtest', s),
+        afterTest: async (ctx) => {
+          if (prevOk) return prevOk;
+          if (!gem || !gem.available) return { skipped: 'Gemini indisponible ou désactivé : aucune mesure' };
+          this.setStage(uid, job, 'gemini', 'mesure de l\'apport de Gemini');
+          return spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, explain: (p, nm) => explainProfile(p, nm) }));
+        }
+      }));
       job.backtest = { key: btKey, ...b };
     }
     const chosen = job.backtest.chosen; const risk = job.backtest.risk ? { kappa: job.backtest.risk.kappa, rho: job.backtest.risk.rho } : DEFAULT_RISK;
@@ -291,12 +303,22 @@ class SyncEngine {
     }
 
     // 6) scoring de TOUS les candidats + arbitrage frontière
-    const pools = {}, sections = {}, utils = {};
+    const pools = {}, sections = {}, utils = {}, scoredAll = {};
     for (const t of targets) {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
-      pools[t] = scored.slice(0, 60); utils[t] = scored.map((c) => c.util);
+      pools[t] = scored.slice(0, 60); utils[t] = scored.map((c) => c.util); scoredAll[t] = scored;
     }
+    // exclusion VF (séries d'origine asiatique/turque sans VF) : AVANT Gemini et la sélection finale ; en cas de doute ou de panne, on GARDE
+    let vfCtx = null, vfExcluded = [];
+    try {
+      const vfKeyF = user.secrets.rapidapi;
+      if (settings.series.vfCheck !== false && vfKeyF && pools.series && scoredAll.series) {
+        await this.vf.load(); vfCtx = this.vf.begin(vfKeyF, tmdb, gate);
+        const r = await spans.wrap('vf_filtre', () => this.vf.filterPool(scoredAll.series, vfCtx, { limit: 60 }));
+        pools.series = r.kept; vfExcluded = r.excluded;
+      }
+    } catch (e) { log('warn', 'exclusion VF en échec (ignorée : aucune série écartée)', e.message); vfCtx = null; vfExcluded = []; }
     let adj = null; const arb = { used: false };
     if (gem && gem.available) {
       const loved = labeled.filter((i) => i.label === 2), rejected = labeled.filter((i) => i.label === 0);
@@ -351,7 +373,7 @@ class SyncEngine {
       const vfKey = user.secrets.rapidapi;
       if (settings.series.vfCheck === false) vfReport = { active: false, raison: 'désactivée dans la configuration' };
       else if (!vfKey) vfReport = { active: false, raison: 'aucune clé enregistrée' };
-      else if (finRecs.series) { vfReport = await spans.wrap('vf', () => this.vf.annotate(finRecs.series, { apiKey: vfKey, tmdb, gate })); await this.vf.save(); }
+      else if (finRecs.series) { vfReport = await spans.wrap('vf', () => this.vf.annotate(finRecs.series, { apiKey: vfKey, tmdb, gate, ctx: vfCtx || undefined })); vfReport.mode = 'exclusion : séries d\'origine asiatique ou turque sans VF (VOSTFR, VO seule, absente des plateformes FR) ; « inconnu » = gardée'; vfReport.exclusions = vfExcluded; await this.vf.save(); }
       else vfReport = { active: true, raison: 'catalogue séries non recalculé dans cette passe' };
     } catch (e) { log('warn', 'détection VF en échec (ignorée)', e.message); vfReport = { active: true, erreur: String(e.message).slice(0, 120) }; }
     // signaux Stremio bruts des titres du Top 30 déjà présents dans la bibliothèque (pour comprendre un cas "déjà vu")

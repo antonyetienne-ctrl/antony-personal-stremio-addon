@@ -20,7 +20,7 @@ function build({ store, users, engine, results, started }) {
       lastRun: job.lastRun || null, library: job.libStats || null, traits: job.traits || null,
       gemini: { configured: Boolean(cl && cl.gemini), model: cl && cl.gemini ? cl.gemini.model : null, calls: cl && cl.gemini ? cl.gemini.calls : null, stats: cl && cl.gemini ? cl.gemini.stats : null, lastError: cl && cl.gemini ? cl.gemini.lastError : null, dna: job.dna ? { source: job.dna.source, adn: job.dna.adn, themes: job.dna.themes, evite: job.dna.evite, recipes: (job.dna.recipes || []).length } : null },
       tmdb: cl && cl.tmdb ? { ...cl.tmdb.stats, cachedRecords: cl.tmdb.ram.size, languages: [...cl.tmdb.langUsed], persistCanFlush: cl.tmdb.canFlush } : null,
-      backtest: bt ? { at: bt.at, split: bt.split, chosen: bt.chosen, risk: bt.risk, notes: bt.notes, variants: (bt.variants || []).map((v) => ({ id: v.id, auc: v.cv.auc, logloss: v.cv.logloss, p10: v.cv.p10 && v.cv.p10.precision, p30: v.cv.p30 && v.cv.p30.precision })), test: bt.test, ms: bt.ms } : null,
+      backtest: bt ? { at: bt.at, split: bt.split, chosen: bt.chosen, risk: bt.risk, notes: bt.notes, geminiEval: bt.geminiEval || null, variants: (bt.variants || []).map((v) => ({ id: v.id, auc: v.cv.auc, logloss: v.cv.logloss, p10: v.cv.p10 && v.cv.p10.precision, p30: v.cv.p30 && v.cv.p30.precision })), test: bt.test, ms: bt.ms } : null,
       settings: u ? u.settings : null,
       top30: {}
     };
