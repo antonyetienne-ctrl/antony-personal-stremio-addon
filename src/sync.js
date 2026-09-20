@@ -30,7 +30,7 @@ class SyncEngine {
     this.store = store; this.users = users; this.results = results; this.idleDelayMs = idleDelayMs;
     this.jobs = new Map(); this.running = new Set(); this.timers = new Map(); this.clients = new Map();
     this.snaps = new Map(); this.profileCache = new Map(); this.lastJobSave = new Map(); this.progress = new Map();
-    this.imdb = new Imdb({ store }); this.vf = new VF({ store }); this.embedSpaces = new Map();
+    this.imdb = new Imdb({ store }); this.vf = new VF({ store }); this.embedSpaces = new Map(); this.embedTimers = new Map(); this.embedBusy = new Set();
   }
 
   // ---------- état du job ----------
@@ -71,11 +71,48 @@ class SyncEngine {
   }
   async resumeAll() {
     const ids = await this.users.list();
-    for (const uid of ids) { const job = await this.loadJob(uid); if (job.status === 'running') { log('warn', 'Job interrompu détecté au démarrage : reprise prévue', { stage: job.stage }); } this._schedule(uid, 3000); }
+    for (const uid of ids) { const job = await this.loadJob(uid); if (job.status === 'running') { log('warn', 'Job interrompu détecté au démarrage : reprise prévue', { stage: job.stage }); } this._schedule(uid, 3000); if (this._embedTodoCount(job) > 0) this._scheduleEmbed(uid, 120000); }
   }
   async onSettingsSaved(uid, changedTypes) { if (changedTypes.length) this._runBg(uid, { mode: 'rerank', types: changedTypes, reason: 'réglages modifiés' }); }
   force(uid) { return this._runBg(uid, { mode: 'full', force: true, reason: 'Force Rebuild' }); }
   _runBg(uid, opts) { if (this.running.has(uid)) return { started: false, why: 'un calcul est déjà en cours' }; setImmediate(() => this.run(uid, opts).catch((e) => log('error', 'run', e.message))); return { started: true }; }
+
+  // ---------- reprise en arrière-plan de la vectorisation (embeddings) : sans relancer le calcul complet ----------
+  _embedTodoCount(job) { const t = job && job.embed && job.embed.todo; return t ? (t.labeledIds || []).length + (t.candIds || []).length : 0; }
+  _scheduleEmbed(uid, delayMs) {
+    if (process.env.EMBED_BACKGROUND === 'off') return;
+    const old = this.embedTimers.get(uid); if (old) clearTimeout(old);
+    const t = setTimeout(() => { this.embedTimers.delete(uid); this.embedContinue(uid).catch((e) => log('warn', 'reprise de la vectorisation', String(e && e.message || e).slice(0, 120))); }, Math.max(1000, delayMs === undefined ? Number(process.env.EMBED_CONT_DELAY_MS || 30000) : delayMs));
+    if (t.unref) t.unref(); this.embedTimers.set(uid, t);
+  }
+  async embedContinue(uid, opts = {}) {
+    if (this.embedBusy.has(uid)) return { skipped: 'déjà en cours' };
+    if (this.running.has(uid)) { this._scheduleEmbed(uid, 60000); return { skipped: 'un calcul est en cours : nouvelle tentative dans 60 s' }; }
+    const job = await this.loadJob(uid); const S = job.embed;
+    if (this._embedTodoCount(job) === 0) return { skipped: 'rien à reprendre' };
+    const user = await this.users.get(uid);
+    if (!user || !user.secrets.gemini || user.settings.common.useGemini === false) return { skipped: 'Gemini indisponible ou désactivé' };
+    this.embedBusy.add(uid);
+    try {
+      const cl = this.clientsFor(user, job); await cl.tmdb.loadPersisted();
+      const r = await embed.continueTodo({ store: this.store, apiKey: user.secrets.gemini, job, tmdb: cl.tmdb, spaces: this.embedSpaces, ...(opts.embed || {}) });
+      await this.saveJob(job, uid, true);
+      if (r.error || r.skipped) return r;
+      // historique vectorisé à 90 % ou plus : un recalcul léger mesure les voisins sémantiques et le poids (une seule fois)
+      if (S.coverage && S.coverage.historique >= embed.MIN_COVERAGE && !S.appliedFull) {
+        const enabled = TYPES.filter((t) => user.settings.common[t === 'movie' ? 'movieCatalog' : 'seriesCatalog']);
+        const st = this._runBg(uid, { mode: 'rerank', types: enabled, reason: 'vectorisation des embeddings terminée' });
+        if (!st.started) this._scheduleEmbed(uid, 60000);
+        return { ...r, recalcul: st.started };
+      }
+      if (r.done) return r;
+      S.contFails = r.embedded === 0 && !(S.pausedUntil > clock.now()) ? (S.contFails || 0) + 1 : 0;
+      if (S.contFails >= 3) { log('warn', 'Vectorisation en arrière-plan : aucun progrès sur 3 passes, reprise au prochain calcul'); return r; }
+      const wait = S.pausedUntil > clock.now() ? S.pausedUntil - clock.now() + 5000 : r.stop && /plafond quotidien/.test(r.stop) ? nextZurichMidnight() - clock.now() + 120000 : undefined;
+      this._scheduleEmbed(uid, wait);
+      return r;
+    } finally { this.embedBusy.delete(uid); }
+  }
 
   async tick(uid) {
     if (this.running.has(uid)) return;
@@ -118,6 +155,7 @@ class SyncEngine {
     this.progress.delete(uid);
     await this.saveJob(job, uid, true);
     this.running.delete(uid);
+    if (!error && this._embedTodoCount(job) > 0) this._scheduleEmbed(uid, job.embed.pausedUntil > clock.now() ? job.embed.pausedUntil - clock.now() + 5000 : undefined);
     log('info', `BUILD ${error ? 'FAILED' : 'COMPLETE'} (${outcome})  Total: ${fmtDuration(durationMs)}  Films: ${fmtDuration(films)}  Séries: ${fmtDuration(series)}  Autres: ${fmtDuration(job.lastRun.otherMs)}`);
     return { outcome, error };
   }
