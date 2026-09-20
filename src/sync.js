@@ -354,6 +354,12 @@ class SyncEngine {
       else if (finRecs.series) { vfReport = await spans.wrap('vf', () => this.vf.annotate(finRecs.series, { apiKey: vfKey, tmdb, gate })); await this.vf.save(); }
       else vfReport = { active: true, raison: 'catalogue séries non recalculé dans cette passe' };
     } catch (e) { log('warn', 'détection VF en échec (ignorée)', e.message); vfReport = { active: true, erreur: String(e.message).slice(0, 120) }; }
+    // signaux Stremio bruts des titres du Top 30 déjà présents dans la bibliothèque (pour comprendre un cas "déjà vu")
+    const libTop = {};
+    try {
+      const byImdb = new Map(classified.map((c) => [c.imdb, c]));
+      for (const t of Object.keys(sections)) libTop[t] = sections[t].items.map((x, i) => ({ x, i })).filter(({ x }) => byImdb.has(x.imdb)).map(({ x, i }) => { const c = byImdb.get(x.imdb); return { rang: i + 1, titre: x.meta && x.meta.name, imdb: x.imdb, signaux: c.why || null, decision: c.seen ? 'vu' : c.started ? 'commencé' : 'rien', statut: statuses.get(x.imdb) }; });
+    } catch { /* facultatif */ }
     // suivi de la précision RÉELLE : parmi le Top 30 précédemment publié, qu'as-tu noté depuis ? ("vu sans note" compté à part : oublis possibles)
     try {
       const prevRes = await this.results.getFast(uid); const loveS = new Set(), likeS = new Set(), unratedS = new Set();
@@ -373,7 +379,7 @@ class SyncEngine {
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
     Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
-    return { outcome: 'published', report: { imdb: job.imdb, favorites, vf: vfReport, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
+    return { outcome: 'published', report: { imdb: job.imdb, favorites, vf: vfReport, bibliotheque: libTop, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }
 
   // ---------- lecture pour l'UI / le diagnostic ----------

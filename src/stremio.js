@@ -40,12 +40,18 @@ function classify(item) {
   const ratio = dur > 0 ? Math.max(tw, off) / dur : 0;
   const bitfield = typeof s.watched === 'string' && s.watched.trim().length > 0;
   let seen, started;
-  if (type === 'movie') { seen = times > 0 || flagged > 0 || ratio >= 0.7 || s.watched === true; started = !seen && (off > 0 || tw > 0 || ratio > 0 || bitfield); }
+  if (type === 'movie') {
+    // FILM : le drapeau flaggedWatched SEUL est un résidu (marqué vu puis retiré : compteur à 0, drapeau à 1 ; Stremio n'affiche pas de coche).
+    // Vu = compteur > 0 (y compris marque manuelle) ou ≥ 70 % d'un vrai film (≥ 30 min ; une bande-annonce de 2 min ne compte pas).
+    seen = times > 0 || (dur >= 30 * 60000 && ratio >= 0.7) || s.watched === true;
+    started = !seen && (off > 0 || tw > 0 || ratio > 0 || bitfield || flagged > 0);
+  }
   else {
-    // SÉRIE : seul compte le marquage de la série entière. Stremio incrémente timesWatched à CHAQUE épisode joué (ex. 113 pour une série longue) :
-    // times > 0 avec une durée de lecture réelle = épisodes regardés, pas série "vue". Marquage global = drapeau F, ou marque manuelle sans lecture (T > 0, durée ~ 0).
-    const noPlayback = dur < 30000;
-    seen = flagged > 0 || s.watched === true || (times > 0 && noPlayback);
+    // SÉRIE : seule compte la marque "série vue" (peu importe l'état des épisodes). Stremio incrémente timesWatched à CHAQUE épisode joué,
+    // mais un suivi d'épisodes (bitfield) n'existe que si des épisodes ont réellement été lus. Donc :
+    //  - drapeau F (série entière marquée vue) => vue ; - compteur > 0 SANS suivi d'épisodes = marque manuelle "vue" (même avec un vieux reste de lecture) => vue ;
+    //  - épisodes lus (compteur + suivi d'épisodes) sans drapeau => commencée.
+    seen = flagged > 0 || s.watched === true || (times > 0 && !bitfield);
     started = !seen && (times > 0 || bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id));
   }
   const lw = Date.parse(s.lastWatched || '') || Date.parse(item._mtime || '') || 0;

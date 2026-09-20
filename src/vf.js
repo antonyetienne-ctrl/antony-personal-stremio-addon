@@ -7,7 +7,7 @@
 //  - si la vérification est impossible : on garde l'ancien statut, SAUF si l'API est muette depuis plus de 6 mois ET que la série est
 //    récente (dernier épisode < 6 mois, ou série en cours) : statut "inconnu" (un doublage peut encore arriver) ;
 //  - séries françaises/américaines : non concernées ; animes : exemptés ; aucun appel pour eux.
-const { fetchJson, clock, log, zurichDay, HttpError } = require('./util');
+const { fetchJson, clock, log, zurichDay, HttpError, redact } = require('./util');
 const { key } = require('./config');
 const { isAnime } = require('./filters');
 
@@ -16,6 +16,8 @@ const BASE = process.env.VF_API_BASE || `https://${HOST}`;
 const WEEK = 7 * 864e5, SIX_MONTHS = 183 * 864e5;
 const MAX_PER_BUILD = () => Number(process.env.VF_MAX_PER_BUILD || 40);
 const DAILY_CAP = () => Number(process.env.VF_DAILY_CAP || 800);      // marge sous les 1 000 requêtes/jour du plan gratuit
+const DIRECT_BASE = process.env.VF_API_BASE_DIRECT || 'https://api.movieofthenight.com/v4';
+const isDirectKey = (k) => /^motn-key-/i.test(String(k || ''));      // clé obtenue sur developers.movieofthenight.com (API directe v4)
 const TEST_IMDB = 'tt0903747';                                       // série connue, pour le bouton "Tester maintenant"
 const FR = new Set(['fr', 'fra', 'fre', 'french', 'français', 'francais']);
 const LABEL = { vf: 'VF', vostfr: 'VOSTFR', vo: 'VO seule', absent: 'absente des plateformes FR', inconnu: 'inconnu' };
@@ -42,6 +44,7 @@ function analyse(show) {
   if (!anyAudio) return { statut: 'inconnu', note: 'aucune langue audio renseignée par l\'API', ...base };
   return { statut: subFr ? 'vostfr' : 'vo', ...base };
 }
+const isJapaneseAnimation = (rec) => (rec.g || []).includes(16) && isAnime(rec);
 const isFrUs = (rec) => (rec.ct || []).some((c) => c === 'FR' || c === 'US') || rec.ol === 'fr';
 const dotOf = (health, hasKey) => (!hasKey || !health || (!health.lastOkAt && !health.lastFailAt) ? 'grey' : health.lastOkAt && (!health.lastFailAt || health.lastOkAt >= health.lastFailAt) ? 'green' : 'red');
 
@@ -60,14 +63,17 @@ class VF {
     if (ok) this.dirty = false; return ok;
   }
   _day() { const d = zurichDay(); if (this.health.day !== d) { this.health.day = d; this.health.callsToday = 0; } }
-  _ok(now) { this.health.lastOkAt = now; this.health.lastError = null; this.health.lastCode = 200; this.dirty = true; }
+  _ok(now) { this.health.lastOkAt = now; this.health.lastError = null; this.health.lastBody = null; this.health.lastCode = 200; this.dirty = true; }
   _fail(err, now) {
     this.health.lastFailAt = now; this.health.lastCode = err instanceof HttpError ? err.status : null; this.dirty = true;
+    this.health.lastBody = err instanceof HttpError && err.body ? redact(String(err.body)).slice(0, 200) : null;     // message renvoyé par l'API (sans clé)
     this.health.lastError = err instanceof HttpError ? (err.status === 401 || err.status === 403 ? 'clé refusée par l\'API' : err.status === 429 ? 'quota de requêtes épuisé' : `erreur HTTP ${err.status}`) : 'API injoignable (réseau ou délai dépassé)';
   }
   async _fetch(imdb, apiKey) {
-    const u = new URL(`${BASE}/shows/${imdb}`); u.searchParams.set('country', 'fr');
-    const res = await fetchJson(u, { headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': HOST, accept: 'application/json' }, timeoutMs: 9000, retries: 0, label: 'vf-api' });
+    const direct = isDirectKey(apiKey); this.health.mode = direct ? 'API directe (developers.movieofthenight.com)' : 'RapidAPI';
+    const u = new URL(`${direct ? DIRECT_BASE : BASE}/shows/${imdb}`); u.searchParams.set('country', 'fr');
+    const headers = direct ? { 'X-API-Key': apiKey, accept: 'application/json' } : { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': HOST, accept: 'application/json' };
+    const res = await fetchJson(u, { headers, timeoutMs: 9000, retries: 0, label: 'vf-api' });
     const so = res && res.streamingOptions; const fr = so && (so.fr || so.FR);
     this.trace.push({ imdb, at: new Date(clock.now()).toISOString(), cles: res && typeof res === 'object' ? Object.keys(res).slice(0, 10) : typeof res, pays: so ? Object.keys(so).slice(0, 8) : null, optionsFr: Array.isArray(fr) ? fr.length : null, exempleOption: Array.isArray(fr) && fr[0] ? Object.keys(fr[0]).slice(0, 10) : null, exempleAudios: Array.isArray(fr) && fr[0] && Array.isArray(fr[0].audios) ? fr[0].audios.slice(0, 2) : null });
     if (this.trace.length > 4) this.trace.shift();
@@ -88,7 +94,7 @@ class VF {
     for (const [i, rec] of recs.entries()) {
       const row = { rang: i + 1, titre: rec.t, annee: rec.y, imdb: rec.im, pays: (rec.ct || []).join(',') || null, langueOriginale: rec.ol || null };
       if (isFrUs(rec)) { row.statut = 'non concerné (série française ou américaine)'; rows.push(row); continue; }
-      if (isAnime(rec)) { row.statut = 'exempté (anime)'; rows.push(row); continue; }
+      if (isJapaneseAnimation(rec)) { row.statut = 'exempté (anime)'; rows.push(row); continue; }
       let e = this.items.get(rec.im), verified = false;
       const due = !e || (e.s !== 'vf' && now - (e.t || 0) >= WEEK);
       if (due && apiKey && !stop && calls < MAX_PER_BUILD() && (this.health.callsToday || 0) < DAILY_CAP()) {

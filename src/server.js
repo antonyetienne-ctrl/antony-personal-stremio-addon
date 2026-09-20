@@ -88,7 +88,7 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
       }
       if (rest === 'rebuild' && method === 'POST') return json(res, 200, engine.force(uid));
       if (rest === 'vf-test' && method === 'POST') return json(res, 200, await engine.vfTest(uid));
-      if (rest === 'status') return json(res, 200, engine.status(uid));
+      if (rest === 'status') return json(res, 200, { ...engine.status(uid), vf: await engine.vfView(user) });
       const c = rest.match(/^catalog\/(movie|series)\/(antony_movies|antony_series)(?:\/([^/]+?))?(?:\.json)?$/);
       if (c) {
         activity.mark(); engine.touch(uid);
