@@ -47,12 +47,14 @@ function classify(item) {
     started = !seen && (off > 0 || tw > 0 || ratio > 0 || bitfield || flagged > 0);
   }
   else {
-    // SÉRIE : seule compte la marque "série vue" (peu importe l'état des épisodes). Stremio incrémente timesWatched à CHAQUE épisode joué,
-    // mais un suivi d'épisodes (bitfield) n'existe que si des épisodes ont réellement été lus. Donc :
-    //  - drapeau F (série entière marquée vue) => vue ; - compteur > 0 SANS suivi d'épisodes = marque manuelle "vue" (même avec un vieux reste de lecture) => vue ;
-    //  - épisodes lus (compteur + suivi d'épisodes) sans drapeau => commencée.
-    seen = flagged > 0 || s.watched === true || (times > 0 && !bitfield);
-    started = !seen && (times > 0 || bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id));
+    // SÉRIE : seule compte la marque "série vue" (peu importe l'état des épisodes). Le drapeau flaggedWatched SEUL (compteur à 0) est un RÉSIDU
+    // (marqué vu puis retiré ; ex. True Beauty, Crash Landing on You, Snowdrop, confirmées NON vues par l'utilisateur).
+    // Stremio incrémente timesWatched à chaque épisode joué, mais un suivi d'épisodes (bitfield) n'existe que si des épisodes ont réellement été lus. Donc :
+    //  - compteur > 0 ET drapeau série (F) => vue (ex. Scrubs, Malcolm, Hero Skill : confirmées vues) ;
+    //  - compteur > 0 SANS suivi d'épisodes = marque manuelle "vue", même avec un vieux reste de lecture (ex. Ted Lasso) => vue ;
+    //  - épisodes réellement lus (compteur + suivi d'épisodes) sans drapeau, ou drapeau seul => commencée.
+    seen = (times > 0 && (flagged > 0 || !bitfield)) || s.watched === true;
+    started = !seen && (times > 0 || flagged > 0 || bitfield || off > 0 || tw > 0 || ratio > 0 || Boolean(s.video_id));
   }
   const lw = Date.parse(s.lastWatched || '') || Date.parse(item._mtime || '') || 0;
   // trace de la règle qui a déclenché "vu" (T = timesWatched, F = flaggedWatched, R = part regardée, D = durée en min) : visible dans /diagnostic
