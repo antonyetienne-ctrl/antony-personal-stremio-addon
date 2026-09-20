@@ -16,7 +16,7 @@ const model = require('./model');
 const bt = require('./backtest');
 const pipe = require('./pipeline');
 const { Imdb, attach: imdbAttach } = require('./imdb');
-const watchMod = require('./watch');
+const { VF } = require('./vf');
 
 const DEFAULT_RISK = { kappa: 0.25, rho: 0.1 };
 const TYPES = ['movie', 'series'];
@@ -28,7 +28,7 @@ class SyncEngine {
     this.store = store; this.users = users; this.results = results; this.idleDelayMs = idleDelayMs;
     this.jobs = new Map(); this.running = new Set(); this.timers = new Map(); this.clients = new Map();
     this.snaps = new Map(); this.profileCache = new Map(); this.lastJobSave = new Map(); this.progress = new Map();
-    this.imdb = new Imdb({ store });
+    this.imdb = new Imdb({ store }); this.vf = new VF({ store });
   }
 
   // ---------- état du job ----------
@@ -187,7 +187,8 @@ class SyncEngine {
         const label = st === 'love' ? 2 : st === 'like' ? 1 : 0;
         labeled.push({ key: t[0] + c.imdb, rec, label, w: 1, lw: c.lw || 0 });
       }
-      lookup[t] = { known: new Set([...ids.values()]), missing, total: cand.length };
+      // pré-filtre de découverte : SEULS les titres marqués VUS sont exclus (un titre noté ou commencé mais non marqué vu reste recommandable)
+      lookup[t] = { known: pipe.exclusions(classified, cand, ids).knownTmdb, missing, total: cand.length };
       if (cand.length && missing / cand.length > 0.08) throw new Error(`Fiches TMDB manquantes pour ${missing}/${cand.length} titres ${t} : calcul abandonné (résultat partiel refusé)`);
     }
     if (labeled.filter((i) => i.label > 0).length < 8) throw new Error('Pas assez de ❤️/👍 exploitables (minimum 8) pour apprendre des goûts');
@@ -195,7 +196,7 @@ class SyncEngine {
     // seuils TMDB automatiques : repli si IMDb est indisponible, et base d'un pré-filtre TMDB ÉLARGI pour la découverte
     const autoT = require('./auto').autoThresholds({ ...settings, movie: { ...settings.movie, ratingMode: 'auto' }, series: { ...settings.series, ratingMode: 'auto' } }, labeled, { source: 'tmdb' });
     const effTmdb = autoT.eff; job.taste = autoT.info;
-    const seenImdb = new Set(classified.filter((c) => c.seen || c.started || ['love', 'like'].includes(statuses.get(c.imdb))).map((c) => c.imdb));
+    const seenImdb = pipe.exclusions(classified, [], new Map()).seenImdb;   // règle unique : seul un titre marqué VU est exclu
 
     // 3) découverte des candidats (canaux A/B) avec un pré-filtre TMDB ÉLARGI : le vrai filtre de qualité est appliqué ensuite sur IMDb.
     //    Checkpoint (cache TMDB persistant) après chaque type.
@@ -217,17 +218,6 @@ class SyncEngine {
     const wantIds = new Set();
     for (const i of labeled) if (i.rec.im) wantIds.add(i.rec.im);
     for (const t of targets) for (const r of disc[t].recs) if (r.im) wantIds.add(r.im);
-    const watchList = (settings.common.watch || []).slice(0, 30); const watchRecs = new Map(); let watchEntries = [];
-    if (watchList.length) {
-      try {
-        this.setStage(uid, job, 'titres surveillés', `${watchList.length} titres`);
-        watchEntries = await spans.wrap('watch_resolve', () => watchMod.resolve(tmdb, watchList, { gate }));
-        for (const kind of ['movie', 'tv']) {
-          const ids = watchEntries.filter((e) => e.kind === kind && e.id).map((e) => e.id);
-          if (ids.length) { const m = await tmdb.ensureDetails(kind, ids, { gate }); for (const [id, rec] of m) { watchRecs.set(kind + id, rec); if (rec.im) wantIds.add(rec.im); } }
-        }
-      } catch (e) { log('warn', 'titres surveillés : résolution en échec', e.message); }
-    }
     const imr = await spans.wrap('imdb', () => this.imdb.ensure(wantIds, { gate, force }));
     let imdbActive = imr.active;
     if (imdbActive) {
@@ -236,7 +226,7 @@ class SyncEngine {
       imr.info.coverageLabeled = +cov.toFixed(3);
       if (cov < 0.8) { imdbActive = false; imr.info.error = imr.info.error || `couverture insuffisante des ❤️/👍 (${Math.round(cov * 100)} %)`; }
     }
-    imdbAttach([...labeled.map((i) => i.rec), ...targets.flatMap((t) => disc[t].recs), ...watchRecs.values()], imdbActive ? this.imdb : null);
+    imdbAttach([...labeled.map((i) => i.rec), ...targets.flatMap((t) => disc[t].recs)], imdbActive ? this.imdb : null);
     let effA;
     if (imdbActive) { const ai = require('./auto').autoThresholds(settings, labeled, { source: 'imdb' }); effA = ai.eff; job.taste = ai.info; }
     else effA = effTmdb;
@@ -307,17 +297,6 @@ class SyncEngine {
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
       pools[t] = scored.slice(0, 60); utils[t] = scored.map((c) => c.util);
     }
-    // suivi des titres attendus : trouvés ? vus/notés ? filtrés ? énumérés ? rang dans le classement complet ?
-    let watchReport = [];
-    if (watchEntries.length) {
-      try {
-        const classifiedBy = new Map(classified.map((c) => [c.imdb, c]));
-        const enumerated = { movie: new Set(), series: new Set() };
-        for (const t of targets) for (const r of disc[t].recs) enumerated[t].add(r.i);
-        const scoreOne = async (rec, type) => { const r = await pipe.scoreCandidates({ recs: [rec], corpus, profType: profiles[type], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }); return r[0]; };
-        for (const e of watchEntries) watchReport.push(await watchMod.inspect(e, e.id ? watchRecs.get(e.kind + e.id) : null, { classifiedBy, statuses, effA, enumerated, utils, scoreOne }));
-      } catch (e) { log('warn', 'titres surveillés : analyse en échec', e.message); }
-    }
     let adj = null; const arb = { used: false };
     if (gem && gem.available) {
       const loved = labeled.filter((i) => i.label === 2), rejected = labeled.filter((i) => i.label === 0);
@@ -331,7 +310,7 @@ class SyncEngine {
       else log('warn', `Arbitrage Gemini sans évaluation exploitable (${pe.shape}) : classement local conservé`);
     }
     // 7) sélection finale + validation, puis publication ATOMIQUE
-    const explain = {};
+    const explain = {}, finRecs = {};
     for (const t of targets) {
       const local = pipe.finalizeTop(pools[t], null), fin = pipe.finalizeTop(pools[t], adj);
       if (!fin.length) { log('warn', `Aucun candidat pour ${t} : type non publié (ancien résultat conservé)`); continue; }
@@ -339,6 +318,7 @@ class SyncEngine {
       sections[t] = { settingsFP: cfg.settingsFingerprint(settings, t), labelFP, short: fin.length < cfg.TOP_N, builtAt: clock.now(), buildId: job.buildId, items: fin.map((x, i) => ({ imdb: x.c.rec.im, tmdb: x.c.rec.i, meta: pipe.makeMeta(x.c.rec, t), score: { rank: i + 1, localRank: x.localRank, util: +x.u.toFixed(4), mu: +x.c.s.mu.toFixed(4), pPos: +x.c.s.pPos.toFixed(3), pLove: +x.c.s.pLove.toFixed(3), sigma: +x.c.s.sigma.toFixed(3), fp: +x.c.s.fp.toFixed(3), toxic: +x.c.tox.toFixed(3), gemini: x.gem } })) };
       const a = new Set(local.map((x) => x.c.rec.im)), b = new Set(fin.map((x) => x.c.rec.im));
       explain[t] = { poolSize: cands[t].length, replacedByGemini: [...b].filter((x) => !a.has(x)).length };
+      finRecs[t] = fin.map((x) => x.c.rec);
     }
     if (!Object.keys(sections).length) throw new Error('aucun résultat valide à publier');
     this.setStage(uid, job, 'publication', 'publication atomique');
@@ -365,6 +345,15 @@ class SyncEngine {
         };
       }
     } catch (e) { log('warn', 'favoris estimés en échec', e.message); }
+    // détection VF (séries, MODE INFORMATION : n'exclut rien ; toute erreur est ignorée)
+    let vfReport = null;
+    try {
+      const vfKey = user.secrets.rapidapi;
+      if (settings.series.vfCheck === false) vfReport = { active: false, raison: 'désactivée dans la configuration' };
+      else if (!vfKey) vfReport = { active: false, raison: 'aucune clé enregistrée' };
+      else if (finRecs.series) { vfReport = await spans.wrap('vf', () => this.vf.annotate(finRecs.series, { apiKey: vfKey, tmdb, gate })); await this.vf.save(); }
+      else vfReport = { active: true, raison: 'catalogue séries non recalculé dans cette passe' };
+    } catch (e) { log('warn', 'détection VF en échec (ignorée)', e.message); vfReport = { active: true, erreur: String(e.message).slice(0, 120) }; }
     // suivi de la précision RÉELLE : parmi le Top 30 précédemment publié, qu'as-tu noté depuis ? ("vu sans note" compté à part : oublis possibles)
     try {
       const prevRes = await this.results.getFast(uid); const loveS = new Set(), likeS = new Set(), unratedS = new Set();
@@ -384,10 +373,20 @@ class SyncEngine {
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
     Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
-    return { outcome: 'published', report: { imdb: job.imdb, favorites, watch: watchReport, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
+    return { outcome: 'published', report: { imdb: job.imdb, favorites, vf: vfReport, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }
 
   // ---------- lecture pour l'UI / le diagnostic ----------
+  async vfView(user) {
+    try { await this.vf.load(); } catch { /* facultatif */ }
+    const hasKey = !!(user && user.secrets && user.secrets.rapidapi);
+    return { ...this.vf.view(hasKey), hasKey, enabled: !user || user.settings.series.vfCheck !== false };
+  }
+  async vfTest(uid) {
+    const user = await this.users.get(uid);
+    if (!user) return { ok: false, pastille: 'grey', message: 'profil inconnu' };
+    try { return await this.vf.testNow(user.secrets.rapidapi); } catch (e) { return { ok: false, pastille: 'red', message: String(e.message).slice(0, 100) }; }
+  }
   status(uid) {
     const job = this.jobs.get(uid) || {}; const p = this.progress.get(uid) || null;
     const res = this.results.ram.get(uid) || {};

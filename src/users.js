@@ -77,11 +77,11 @@ class Users {
   }
   async retryDirty() { for (const id of [...this.dirty]) { const u = this.ram.get(id); if (u) await this._persist(u); } }
   // vue publique : jamais de valeur en clair
-  view(u) { return { id: u.id, settings: u.settings, keys: { tmdb: mask(u.secrets.tmdb), stremio: mask(u.secrets.stremio), gemini: mask(u.secrets.gemini) }, has: { tmdb: !!u.secrets.tmdb, stremio: !!u.secrets.stremio, gemini: !!u.secrets.gemini } }; }
+  view(u) { return { id: u.id, settings: u.settings, keys: { tmdb: mask(u.secrets.tmdb), stremio: mask(u.secrets.stremio), gemini: mask(u.secrets.gemini), rapidapi: mask(u.secrets.rapidapi) }, has: { tmdb: !!u.secrets.tmdb, stremio: !!u.secrets.stremio, gemini: !!u.secrets.gemini, rapidapi: !!u.secrets.rapidapi } }; }
 }
 function cleanSecrets(input, prev) {
   const out = { ...prev };
-  for (const k of ['tmdb', 'stremio', 'gemini']) {
+  for (const k of ['tmdb', 'stremio', 'gemini', 'rapidapi']) {
     const v = typeof input[k] === 'string' ? input[k].trim() : '';
     if (v && !/^•+/.test(v)) out[k] = v;   // vide (ou valeur masquée renvoyée par le formulaire) => on garde l'ancienne
   }

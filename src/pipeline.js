@@ -70,12 +70,19 @@ async function discoverCandidates({ tmdb, type, settings, seedTmdbIds, excludeTm
   return { recs: [...details.values()], stats };
 }
 
+// RÈGLE UNIQUE : seul un titre marqué VU est exclu des recommandations. Un titre noté ❤️/👍 ou commencé mais NON marqué vu reste recommandable
+// (une note sans marque "vu" est considérée comme une erreur de marquage).
+//  classified : items de la bibliothèque ; cand : [{c, st}] titres étiquetés d'un type ; idMap : imdb -> id TMDB des titres étiquetés
+function exclusions(classified, cand, idMap) {
+  return { seenImdb: new Set(classified.filter((c) => c.seen).map((c) => c.imdb)), knownTmdb: new Set(cand.filter(({ c }) => c.seen).map(({ c }) => idMap.get(c.imdb)).filter(Boolean)) };
+}
+
 // hard filters + exclusion vus/commencés (par IMDb) sur fiches complètes
 function admissible(recs, { settings, type, seenImdb }) {
   const out = []; const rejects = {};
   for (const rec of recs) {
     let why = rejectReason(rec, settings, type);
-    if (!why && seenImdb.has(rec.im)) why = 'seen-or-started';
+    if (!why && seenImdb.has(rec.im)) why = 'vu';
     if (why) rejects[why] = (rejects[why] || 0) + 1; else out.push(rec);
   }
   return { recs: out, rejects };
@@ -130,4 +137,4 @@ function finalizeTop(pool, adj) {
   return [...win.map(({ c, u, gem, localRank }) => ({ c, u, gem, localRank })), ...rest].slice(0, TOP_N);
 }
 
-module.exports = { enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };
+module.exports = { exclusions, enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };

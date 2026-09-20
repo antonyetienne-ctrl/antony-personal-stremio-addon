@@ -35,8 +35,8 @@ function parseForm(body) {
     if (p.has(`${t}.exclude__present`)) settings[t].exclude = p.getAll(`${t}.exclude`);
   }
   for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
-  if (p.has('common.watch')) settings.common.watch = String(p.get('common.watch')).split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-  return { secrets: { tmdb: g('tmdb') || '', stremio: g('stremio') || '', gemini: g('gemini') || '' }, clear: p.has('clearGemini') ? ['gemini'] : [], settings };
+  settings.series.vfCheck = p.has('series.vfCheck');
+  return { secrets: { tmdb: g('tmdb') || '', stremio: g('stremio') || '', gemini: g('gemini') || '', rapidapi: g('rapidapi') || '' }, clear: p.has('clearGemini') ? ['gemini'] : [], settings };
 }
 
 function createApp({ store, users, engine, results, started = Date.now() }) {
@@ -87,6 +87,7 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
         } catch (e) { return html(res, 400, ui.page({ mode: 'edit', view: users.view(user), host: hostOf(req), notice: { kind: 'err', text: redact(e.message) }, secretsReady: secretsReady() })); }
       }
       if (rest === 'rebuild' && method === 'POST') return json(res, 200, engine.force(uid));
+      if (rest === 'vf-test' && method === 'POST') return json(res, 200, await engine.vfTest(uid));
       if (rest === 'status') return json(res, 200, engine.status(uid));
       const c = rest.match(/^catalog\/(movie|series)\/(antony_movies|antony_series)(?:\/([^/]+?))?(?:\.json)?$/);
       if (c) {
