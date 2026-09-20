@@ -5,6 +5,8 @@
 const pipe = require('./pipeline');
 const { attach } = require('./imdb');
 const { classify } = require('./stremio');
+const { virtualTags } = require('./filters');
+const embed = require('./embed');
 
 const MAX_ENTRIES = 30, MAX_MATCHES = 5;
 const fold = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -52,8 +54,8 @@ async function run({ q, user, engine, results, library }) {
       return type ? [{ imdb: entry, type, name: lib && lib.name, via: lib ? 'bibliothèque' : sn ? 'dernier calcul' : 'TMDB' }] : [];
     }
     const f = fold(entry);
-    const exact = libItems.filter((x) => fold(x.name) === f), part = libItems.filter((x) => x.name && fold(x.name).includes(f));
-    const pool = exact.length ? exact : part;
+    const exact = libItems.filter((x) => fold(x.name) === f), word = libItems.filter((x) => x.name && (` ${fold(x.name)} `).includes(` ${f} `));   // nom identique, puis mot entier (« RRR » ne correspond plus à « RRRrrrr!!! »)
+    const pool = exact.length ? exact : word;
     if (pool.length) return pool.slice(0, MAX_MATCHES).map((x) => ({ imdb: x.imdb, type: x.type, name: x.name, via: 'bibliothèque' }));
     const r = await cl.tmdb.get('/search/multi', { query: entry, language: 'fr-FR', include_adult: false }, { label: 'search' }).catch(() => null);
     const hits = ((r && r.results) || []).filter((x) => x.media_type === 'movie' || x.media_type === 'tv').slice(0, 3);
@@ -64,6 +66,10 @@ async function run({ q, user, engine, results, library }) {
       if (out.length) break;                                            // on analyse le meilleur résultat ; les autres sont listés en alternatives
     }
     if (out.length) out[0].alternatives = hits.slice(1).map((h) => h.title || h.name).filter(Boolean);
+    if (!out.length) {                                                  // dernier recours : sous-chaîne dans la bibliothèque
+      const part = libItems.filter((x) => x.name && fold(x.name).includes(f));
+      return part.slice(0, MAX_MATCHES).map((x) => ({ imdb: x.imdb, type: x.type, name: x.name, via: 'bibliothèque (correspondance partielle)' }));
+    }
     return out;
   }
 
@@ -103,7 +109,9 @@ async function run({ q, user, engine, results, library }) {
           if (!r.titre) r.titre = rec.t; r.annee = rec.y || null;
           const adm = pipe.admissible([rec], { settings: eff, type: t.type, seenImdb: seenSet });
           const why = Object.keys(adm.rejects)[0] || null;
-          r.filtres = { passe: adm.recs.length === 1, bloquePar: why, genres: rec.gn, noteIMDb: rec.ir ?? null, votesIMDb: rec.iv ?? null, noteTMDB: rec.va, votesTMDB: rec.vc, seuils: { note: eff[t.type].minRating, votes: eff[t.type].minVotes, source: eff[t.type].source }, statutSerie: t.type === 'series' ? rec.st : undefined };
+          r.filtres = { passe: adm.recs.length === 1, bloquePar: why, genres: rec.gn, genresVirtuels: virtualTags(rec), motsCles: (rec.kw || []).slice(0, 15).map((k) => k[1]), noteIMDb: rec.ir ?? null, votesIMDb: rec.iv ?? null, noteTMDB: rec.va, votesTMDB: rec.vc, seuils: { note: eff[t.type].minRating, votes: eff[t.type].minVotes, source: eff[t.type].source }, statutSerie: t.type === 'series' ? rec.st : undefined };
+          if (t.type === 'series') { try { await engine.vf.load(); r.vf = engine.vf.peek(rec); } catch { r.vf = { statut: 'illisible' }; } }
+          try { const es = job.embed && job.embed.model ? engine.embedSpaces.get(`${job.embed.model}:${job.embed.dim}`) : null; r.embedding = es ? { vectorise: es.has(embed.idOf(rec)) } : { vectorise: false, note: 'embeddings inactifs ou non chargés' }; } catch { /* facultatif */ }
         }
       }
     } catch (e) { r.filtres = { erreur: String(e && e.message || e).slice(0, 100) }; }
@@ -111,7 +119,7 @@ async function run({ q, user, engine, results, library }) {
     const sec = published[t.type]; const it = sec && sec.items.find((x) => x.imdb === t.imdb);
     r.top30 = it ? { rang: it.score.rank, rangLocal: it.score.localRank ?? null, probaCoupDeCoeur: round(it.score.pLove), gemini: it.score.gemini ? { note: it.score.gemini.fit, connaissance: it.score.gemini.know, motif: it.score.gemini.note } : null } : null;
     const rk = job.ranks && job.ranks[t.type]; const pos = rk ? rk.findIndex((x) => x[0] === t.imdb) : -1;
-    r.modele = pos >= 0 ? { rangLocal: pos + 1, utilite: rk[pos][1], surCandidats: `${rk.length} premiers conservés` } : rk ? { rangLocal: `au-delà de ${rk.length}${r.filtres && r.filtres.passe === false ? ' (ou écarté par les filtres)' : ''}` } : { rangLocal: 'pas encore disponible (relance un calcul)' };
+    r.modele = pos >= 0 ? { rangLocal: pos + 1, rangApresExclusionVF: t.type === 'series' ? pos + 1 - rk.slice(0, pos).filter((x) => x[2]).length : undefined, utilite: rk[pos][1], surCandidats: `${rk.length} premiers conservés`, note: t.type === 'series' ? 'rangLocal = avant exclusion VF ; rangApresExclusionVF = rang réel dans la liste' : undefined } : rk ? { rangLocal: `au-delà de ${rk.length}${r.filtres && r.filtres.passe === false ? ' (ou écarté par les filtres)' : ''}` } : { rangLocal: 'pas encore disponible (relance un calcul)' };
     return r;
   }
   return { profil: uid.slice(0, 6) + '…', demandes: entries.length, resultats: out, notes };

@@ -55,11 +55,12 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
       if (!diagToken()) return json(res, 503, { error: 'DIAG_TOKEN non défini sur le serveur' });
       const t = u.searchParams.get('token') || req.headers['x-diag-token'] || '';
       if (!safeEq(t, diagToken())) return json(res, 401, { error: 'non autorisé' });
-      if (path === '/diag/check') {                     // vérification d'une liste de titres (identifiants IMDb ou noms) : vu ? filtré ? classé ?
+      if (path === '/diag/check' || path.startsWith('/diag/check/')) {                     // vérification d'une liste de titres (identifiants IMDb ou noms) : vu ? filtré ? classé ? La liste peut aussi passer dans le CHEMIN : /diag/check/Outlander,tt0111161?token=…
+        let q = u.searchParams.get('q') || ''; if (!q && path.length > '/diag/check/'.length) { try { q = decodeURIComponent(path.slice('/diag/check/'.length)); } catch { q = path.slice('/diag/check/'.length); } }
         const list = await users.list(); const want = u.searchParams.get('u') || ''; const uid = list.find((x) => want && x.startsWith(want)) || list[0];
         const user = uid && await users.get(uid);
         if (!user) return json(res, 404, { error: 'aucun profil' });
-        return json(res, 200, await inspect.run({ q: u.searchParams.get('q') || '', user, engine, results, library }));
+        return json(res, 200, await inspect.run({ q, user, engine, results, library }));
       }
       return json(res, 200, diag.build({ store, users, engine, results, started }));
     }

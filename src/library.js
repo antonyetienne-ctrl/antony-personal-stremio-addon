@@ -2,7 +2,8 @@
 // Catalogues « 📌 Votre liste de lecture » : la bibliothèque Stremio de l'utilisateur, séparée en films et en séries (TOUTE la bibliothèque, vus et non vus mêlés).
 // Règles : lecture À LA DEMANDE (aucun calcul lourd, aucune écriture Upstash) avec une mémoire de 10 minutes en RAM ; passé ce délai, la liste périmée est servie
 // aussitôt et rafraîchie en arrière-plan (« stale-while-revalidate ») ; si Stremio est injoignable on sert la dernière liste connue, sinon une liste vide (jamais d'erreur) ;
-// aucune clé n'est journalisée. Même filtre que la bibliothèque de Stremio : ni titres retirés (removed), ni titres temporaires (temp).
+// aucune clé n'est journalisée. Même filtre que la bibliothèque de Stremio : ni titres retirés (removed), ni titres temporaires (temp) ;
+// et on RETIRE ce qui figure déjà dans la rangée « Continuer à regarder » de Stremio (règle du cœur de Stremio : point de reprise timeOffset > 0).
 const { fetchLibrary, extractImdb } = require('./stremio');
 const { clock, log } = require('./util');
 
@@ -20,8 +21,9 @@ function compactItem(it) {
     lw: timeMs(s.lastWatched) || timeMs(it._mtime) || timeMs(it._ctime), mtime: it._mtime || null, ctime: it._ctime || null, state: s };
 }
 // filtre de la bibliothèque de Stremio + tri par activité récente (comme le tri par défaut de Stremio), puis nom
+const inContinueWatching = (x) => Number(x.state && x.state.timeOffset) > 0;
 function listOf(items, type) {
-  return items.filter((x) => x.type === type && !x.removed && !x.temp).sort((a, b) => b.lw - a.lw || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.imdb < b.imdb ? -1 : 1));
+  return items.filter((x) => x.type === type && !x.removed && !x.temp && !inContinueWatching(x)).sort((a, b) => b.lw - a.lw || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.imdb < b.imdb ? -1 : 1));
 }
 const toMeta = (x) => ({ id: x.imdb, type: x.type, name: x.name || x.imdb, poster: x.poster || posterFallback(x.imdb), posterShape: 'poster' });
 
@@ -58,4 +60,4 @@ class LibraryCatalog {
     return listOf(r.items, type).slice(skip, skip + PAGE).map(toMeta);
   }
 }
-module.exports = { LibraryCatalog, compactItem, listOf, toMeta, PAGE, TTL_MS };
+module.exports = { LibraryCatalog, compactItem, listOf, toMeta, inContinueWatching, PAGE, TTL_MS };

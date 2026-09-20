@@ -1,10 +1,12 @@
 'use strict';
 // Filtres durs (configurables). Tout se fait sur des IDENTIFIANTS de genres ; les genres "virtuels"
-// (v:horror, v:romance, v:music) compensent l'absence de ces genres côté séries TMDB via des mots-clés.
+// (v:horror, v:romance, v:music, v:sitcom) compensent l'absence de ces genres côté séries TMDB via des mots-clés.
 const VIRT = {
   'v:horror': new Set(['horror', 'slasher', 'gore', 'splatter', 'supernatural horror', 'body horror', 'psychological horror', 'folk horror', 'creature feature', 'haunted house', 'demonic possession', 'found footage', 'zombie']),
   'v:romance': new Set(['romance', 'romantic comedy', 'love triangle', 'forbidden love', 'teen romance', 'romantic drama']),
-  'v:music': new Set(['musical', 'music', 'concert', 'singer', 'musician', 'k-pop'])
+  'v:music': new Set(['musical', 'music', 'concert', 'singer', 'musician', 'k-pop']),
+  // sitcom : comédie de situation (mots-clés TMDB) ; aucune heuristique de durée ou de genre : une comédie qui n'est pas étiquetée sitcom n'est pas touchée
+  'v:sitcom': new Set(['sitcom', 'situation comedy', 'sitcom (situation comedy)', 'multi-camera', 'multi-camera sitcom', 'laugh track', 'live studio audience', 'studio audience', 'family sitcom', 'teen sitcom', 'workplace sitcom', 'animated sitcom'])
 };
 const KIDS_KW = new Set(['kids', 'kid', "children's", 'children', 'preschool', 'preschoolers', 'toddler', 'nursery', 'for children', 'educational', 'kindergarten']);
 const kwNames = (rec) => (rec.kw || []).map((x) => String(x[1] || '').toLowerCase());

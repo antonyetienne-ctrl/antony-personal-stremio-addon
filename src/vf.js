@@ -123,6 +123,15 @@ class VF {
     return { kind: 'st', s, e, verified, due, expired };
   }
 
+  // Statut connu (cache uniquement, AUCUNE requête) : pour l'outil /diag/check
+  peek(rec) {
+    if (isFrUs(rec)) return { statut: 'non concerné (série française ou américaine)', exclue: false };
+    if (isJapaneseAnimation(rec)) return { statut: 'animation japonaise : jamais concernée', exclue: false };
+    const e = this.items.get(rec.im);
+    if (!e) return { statut: 'jamais vérifiée (gardée)', exclue: false };
+    return { statut: LABEL[e.s] || e.s, exclue: Boolean(NON_FR_STATUSES.has(e.s) && NON_WESTERN.has(rec.ol)), plateformes: e.p || [], verifieLe: new Date(e.t).toISOString().slice(0, 10) };
+  }
+
   // EXCLUSION : parcourt les candidats classés (meilleur d'abord) et écarte ceux qui répondent à la règle ; s'arrête quand `limit` sont gardés.
   // Ne lève jamais ; en cas de doute, on GARDE.
   async filterPool(scored, ctx, { limit = 60, maxScan = 220 } = {}) {

@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.3.0';
+const ENGINE_VERSION = '7.4.0';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB
@@ -10,7 +10,7 @@ const TOP_N = 30;
 // Genres TMDB (identifiants stables). Les filtres se font sur les IDENTIFIANTS, jamais sur les noms traduits.
 const MOVIE_GENRES = [[28, 'Action'], [12, 'Aventure'], [16, 'Animation'], [35, 'Comédie'], [80, 'Crime'], [99, 'Documentaire'], [18, 'Drame'], [10751, 'Familial'], [14, 'Fantastique'], [36, 'Histoire'], [27, 'Horreur'], [10402, 'Musique'], [9648, 'Mystère'], [10749, 'Romance'], [878, 'Science-Fiction'], [10770, 'Téléfilm'], [53, 'Thriller'], [10752, 'Guerre'], [37, 'Western'], ['v:kids', 'Kids / Enfants (détecté par mots-clés)']];
 // TMDB n'a PAS de genre Horreur/Romance/Musique pour les séries : on les détecte par mots-clés (genres "virtuels").
-const TV_GENRES = [[10759, 'Action & Aventure'], [16, 'Animation'], [35, 'Comédie'], [80, 'Crime'], [99, 'Documentaire'], [18, 'Drame'], [10751, 'Familial'], [9648, 'Mystère'], [10763, 'Actualités'], [10764, 'Téléréalité'], [10765, 'Science-Fiction & Fantastique'], [10766, 'Feuilleton'], [10767, 'Talk-show'], [10768, 'Guerre & Politique'], [37, 'Western'], ['v:horror', 'Horreur (détectée par mots-clés)'], ['v:romance', 'Romance (détectée par mots-clés)'], ['v:music', 'Musique (détectée par mots-clés)'], ['v:kids', 'Kids / Enfants (genre TMDB + mots-clés)']];
+const TV_GENRES = [[10759, 'Action & Aventure'], [16, 'Animation'], [35, 'Comédie'], [80, 'Crime'], [99, 'Documentaire'], [18, 'Drame'], [10751, 'Familial'], [9648, 'Mystère'], [10763, 'Actualités'], [10764, 'Téléréalité'], [10765, 'Science-Fiction & Fantastique'], [10766, 'Feuilleton'], [10767, 'Talk-show'], [10768, 'Guerre & Politique'], [37, 'Western'], ['v:horror', 'Horreur (détectée par mots-clés)'], ['v:romance', 'Romance (détectée par mots-clés)'], ['v:music', 'Musique (détectée par mots-clés)'], ['v:sitcom', 'Sitcom (détectée par mots-clés)'], ['v:kids', 'Kids / Enfants (genre TMDB + mots-clés)']];
 
 function defaultSettings() {
   // AUCUN genre exclu par défaut. Seuils note/votes : mode automatique (calculé sur les ❤️/👍) ; valeurs manuelles = point de départ initial.
@@ -69,7 +69,8 @@ const key = {
   tmdb: (kind, shard) => `${NS}:tmdb:${LANG}:${kind}:${shard}`,
   idmap: `${NS}:idmap`,
   imdb: `${NS}:imdbr`,
-  vf: `${NS}:vf`
+  vf: `${NS}:vf`,
+  emb: (tag, shard) => `${NS}:emb:${tag}:${shard}`     // embeddings sémantiques (blocs de titres, vecteurs quantifiés)
 };
 
 module.exports = { ENGINE_VERSION, NS, LANG, DETAIL_SCHEMA, TOP_N, MOVIE_GENRES, TV_GENRES, defaultSettings, normalizeSettings, settingsFingerprint, key };

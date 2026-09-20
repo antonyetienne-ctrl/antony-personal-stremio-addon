@@ -79,7 +79,7 @@ function effect(rows, adj, params, ex) {
 // ctx : { gem, dev, test, scored, rank, previousMalus, passes }
 // passes(rec) : le titre respecte les filtres ACTUELS de la page de configuration. Comme les candidats de la production, seuls ces titres sont mesurés.
 async function evaluate(ctx) {
-  const { gem, dev, rank, previousMalus, passes } = ctx;
+  const { gem, dev, rank, previousMalus, passes, neighborsFor } = ctx;      // neighborsFor(item, lovedDev, rejDev) -> {adores, non_aimes} | null : voisins sémantiques (sinon « genres + mots-clés »)
   const scoredAll = ctx.scored; const scored = passes ? scoredAll.filter((s) => { try { return passes(s.it.rec); } catch { return true; } }) : scoredAll; const horsFiltres = scoredAll.length - scored.length;
   if (scored.length < MIN_MATCHED) return { error: `trop peu de titres de test respectent les filtres actuels (${scored.length}/${scoredAll.length}, minimum ${MIN_MATCHED}) : mesure impossible`, titresHorsFiltres: horsFiltres };
   try {
@@ -96,7 +96,7 @@ async function evaluate(ctx) {
       const chunk = items.slice(i, i + BATCH); const byId = new Map();
       const cards = chunk.map((s, j) => {
         const id = 't' + (i + j + 1); byId.set(id, s.it.key); const r = s.it.rec; const c = { item: s.it };
-        return { id, titre: r.t, annee: r.y, genres: r.gn || [], mots_cles: (r.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (r.ov || '').slice(0, 180), adores: nearestK(c, lovedDev, 3), non_aimes: nearestK(c, rejDev, 3) };
+        return { id, titre: r.t, annee: r.y, genres: r.gn || [], mots_cles: (r.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (r.ov || '').slice(0, 180), ...(() => { const nb = neighborsFor ? neighborsFor(s.it, lovedDev, rejDev) : null; return { adores: nb ? nb.adores : nearestK(c, lovedDev, 3), non_aimes: nb ? nb.non_aimes : nearestK(c, rejDev, 3) }; })() };
       });
       const res = await gem.json(comparePrompt({ candidats: cards })); batches++;
       const pe = parseEvaluations(res, byId);
@@ -138,7 +138,7 @@ async function evaluate(ctx) {
     // désaccords : ❤️ que Gemini juge très éloignés des adorés / titres non aimés qu'il juge très proches des adorés
     const dis = rows.map((r, i) => ({ titre: r.s.it.rec.t, annee: r.s.it.rec.y, reel: lab(r.s.it.label), net: Math.round(r.gm.fit), procheDesAdores: r.gm.sim ? Math.round(r.gm.sim.adores) : null, procheDesNonAimes: r.gm.sim ? Math.round(r.gm.sim.nonAimes) : null, rangLocalPct: Math.round(rk.lLove[i] * 100), motif: r.gm.note || undefined }));
     return {
-      at: new Date().toISOString(), model: gem.model || null, variante: 'C (proximité)', titresEvalues: n, titresHorsFiltres: horsFiltres, lots: batches, requetesGemini: batches,
+      at: new Date().toISOString(), model: gem.model || null, variante: 'C (proximité)', voisins: neighborsFor ? 'sémantiques (embeddings)' : 'genres + mots-clés', titresEvalues: n, titresHorsFiltres: horsFiltres, lots: batches, requetesGemini: batches,
       protocole: 'production : mêmes prompt et mêmes cartes (3 adorés et 3 non aimés les plus proches, tirés de l\'apprentissage seulement), ni ADN rédigé, ni filtres, ni score local ; seuls les titres qui respectent les filtres actuels sont mesurés',
       aucCoupDeCoeur: { local: base.aucCoupDeCoeur, geminiSeul: gemOnly.aucCoupDeCoeur, ic95Local: ic(A), ic95GeminiSeul: ic(B) },
       aucApprecie: { local: base.aucApprecie, geminiSeul: gemOnly.aucApprecie },

@@ -7,6 +7,7 @@
 //  - checkpoints Upstash (étape, empreintes, cache TMDB) ; reprise après redémarrage ; JAMAIS de résultat partiel publié ;
 //  - un échec (TMDB, Stremio, Gemini, Upstash) conserve le dernier Top 30 complet.
 const { clock, log, redact, sha, Spans, fmtDuration, makeYielder, activity, zurichDay, nextZurichMidnight } = require('./util');
+const embed = require('./embed');
 const cfg = require('./config');
 const stremio = require('./stremio');
 const { Tmdb } = require('./tmdb');
@@ -29,7 +30,7 @@ class SyncEngine {
     this.store = store; this.users = users; this.results = results; this.idleDelayMs = idleDelayMs;
     this.jobs = new Map(); this.running = new Set(); this.timers = new Map(); this.clients = new Map();
     this.snaps = new Map(); this.profileCache = new Map(); this.lastJobSave = new Map(); this.progress = new Map();
-    this.imdb = new Imdb({ store }); this.vf = new VF({ store });
+    this.imdb = new Imdb({ store }); this.vf = new VF({ store }); this.embedSpaces = new Map();
   }
 
   // ---------- état du job ----------
@@ -244,7 +245,9 @@ class SyncEngine {
     const corpus = new Corpus(labeled.map((i) => i.rec));
     for (const it of labeled) it.vec = hashedVec(it.rec, corpus);
     const canEval = Boolean(gem && gem.available);
-    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}`);
+    // embeddings sémantiques : vectorisation de l'historique (cadencée, mise en cache), comparaison des deux façons de trouver des voisins ; ne bloque jamais le calcul
+    const embCtx = await spans.wrap('embeddings', () => embed.prepare({ store: this.store, apiKey: user.secrets.gemini, allowed: settings.common.useGemini !== false, job, labeled, gate, spaces: this.embedSpaces, force, setStage: (l) => this.setStage(uid, job, 'embeddings', l) }));
+    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}|${embCtx.useNeighbors ? 'E' : 'H'}`);
     const retryEval = canEval && job.backtest && job.backtest.key === btKey && job.backtest.geminiEval && job.backtest.geminiEval.skipped && job.backtest.geminiEval.day !== today;      // mesure sautée (Gemini indisponible ou quota) : nouvelle tentative au plus UNE fois par jour
     if (!job.backtest || job.backtest.key !== btKey || force || retryEval) {
       const prev = job.backtest && job.backtest.key === btKey ? job.backtest.geminiEval : null;      // même historique : on réutilise la mesure déjà faite
@@ -255,7 +258,7 @@ class SyncEngine {
           if (prevOk) return prevOk;
           if (!gem || !gem.available) return { skipped: 'Gemini indisponible ou désactivé : aucune mesure', day: today };
           this.setStage(uid, job, 'gemini', 'mesure de l\'apport de Gemini');
-          const ev = await spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, previousMalus: job.malus ? job.malus.params : null, passes: (rec) => pipe.admissible([rec], { settings: effA, type: rec.k === 'm' ? 'movie' : 'series', seenImdb: new Set() }).recs.length === 1 }));
+          const ev = await spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, neighborsFor: embCtx.useNeighbors ? embed.makeNeighborsFor(embCtx.vecOf) : null, previousMalus: job.malus ? job.malus.params : null, passes: (rec) => pipe.admissible([rec], { settings: effA, type: rec.k === 'm' ? 'movie' : 'series', seenImdb: new Set() }).recs.length === 1 }));
           if (ev && ev.skipped) ev.day = today;
           return ev;
         }
@@ -263,6 +266,8 @@ class SyncEngine {
       job.backtest = { key: btKey, ...b };
     }
     { const gm = job.backtest.geminiEval && job.backtest.geminiEval.malus; if (gm && gm.params) job.malus = { params: gm.params, source: gm.source, at: gm.at || job.backtest.at }; }
+    const embBeta = (job.backtest.rank && job.backtest.rank.beta) || 0.33;
+    embCtx.wk = embCtx.enabled ? await spans.wrap('embeddings_poids', () => embed.decideBlend({ ctx: embCtx, job, labeled, testScores: job.backtest.testScores, split: bt.split(labeled.filter((i) => i.label >= 0)), beta: embBeta, gate, force })) : 0;
     const malusParams = (job.malus && job.malus.params) || pipe.DEFAULT_MALUS;
     const chosen = job.backtest.chosen; const risk = job.backtest.risk ? { kappa: job.backtest.risk.kappa, rho: job.backtest.risk.rho } : DEFAULT_RISK;
     const pkey = sha(`${btKey}|${JSON.stringify(chosen.cfg)}`);
@@ -322,9 +327,15 @@ class SyncEngine {
     for (const t of targets) {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
+      if (embCtx.enabled && (embCtx.useNeighbors || embCtx.wk > 0)) {                 // vectorisation des mieux classés, puis mélange par voisins sémantiques (seulement si adopté par la mesure)
+        const er = await spans.wrap(`embeddings_${t}`, () => embed.ensureRecs(embCtx, scored.slice(0, embed.TOP_CANDIDATES).map((c) => c.rec), { setStage: (l) => this.setStage(uid, job, `embeddings ${t}`, l) }));
+        let ab = { applied: false }; if (embCtx.wk > 0) ab = embed.applyBlend(scored, { wk: embCtx.wk, pool: embed.poolOf(labeled, (i) => embCtx.vecOf(i.rec)), beta: embBeta, vecOf: embCtx.vecOf });
+        job.embed.candidates = job.embed.candidates || {}; job.embed.candidates[t] = { vectorises: er, melange: ab, poids: embCtx.wk };
+      }
       pools[t] = scored.slice(0, 100); utils[t] = scored.map((c) => c.util); scoredAll[t] = scored;
       { job.ranks = job.ranks || {}; job.ranks[t] = scored.slice(0, 400).map((c) => [c.rec.im, Math.round(c.util * 1000) / 1000]); job.ranksAt = clock.now(); }   // classement local (400 premiers) : lu par /diag/check
     }
+    if (embCtx.enabled) { try { await embCtx.es.flush(); } catch { /* le cache sera réécrit au prochain calcul */ } }
     // exclusion VF (séries d'origine asiatique/turque sans VF) : AVANT Gemini et la sélection finale ; en cas de doute ou de panne, on GARDE
     let vfCtx = null, vfExcluded = [];
     try {
@@ -333,18 +344,21 @@ class SyncEngine {
         await this.vf.load(); vfCtx = this.vf.begin(vfKeyF, tmdb, gate);
         const r = await spans.wrap('vf_filtre', () => this.vf.filterPool(scoredAll.series, vfCtx, { limit: 100 }));
         pools.series = r.kept; vfExcluded = r.excluded;
+        { const ex = new Set(r.excluded.map((x) => x.imdb)); if (job.ranks && job.ranks.series) for (const e of job.ranks.series) if (ex.has(e[0])) e[2] = 1; }      // rang « avant / après exclusion VF » lu par /diag/check
       }
     } catch (e) { log('warn', 'exclusion VF en échec (ignorée : aucune série écartée)', e.message); vfCtx = null; vfExcluded = []; }
     let adj = null; const arb = { used: false, variante: 'C (proximité : 3 adorés et 3 non aimés les plus proches)', fenetre: pipe.WINDOW, malus: { params: malusParams, source: (job.malus && job.malus.source) || 'réglage par défaut (aucune calibration disponible)' } };
     if (gem && gem.available) {
       const loved = labeled.filter((i) => i.label === 2 && i.vec), rejected = labeled.filter((i) => i.label === 0 && i.vec);
       const all = new Map(); arb.candidatesSent = 0; arb.evaluated = 0; arb.calls = 0; arb.trace = [];
+      const embNb = embCtx.enabled && embCtx.useNeighbors ? (() => { const L = embed.poolOf(loved, (i) => embCtx.vecOf(i.rec)), R = embed.poolOf(rejected, (i) => embCtx.vecOf(i.rec)); return (c) => { const v = embCtx.vecOf(c.rec); return v ? embed.neighborCards(v, L, R) : null; }; })() : null;
+      arb.voisins = embNb ? 'sémantiques (embeddings)' : 'genres + mots-clés'; arb.voisinsSemantiques = 0;
       if (loved.length >= 10 && rejected.length >= 10) for (const t of targets) {
         const win = pools[t].slice(0, pipe.WINDOW);
         for (let off = 0; off < win.length; off += 40) {
           if (!gem.available) break;                                     // quota atteint en cours de route : on garde ce qu'on a
           const cs = []; const byId = new Map();
-          win.slice(off, off + 40).forEach((c) => { const id = `${t[0]}${c.rec.i}`; byId.set(id, c.rec.im); cs.push({ id, titre: c.rec.t, annee: c.rec.y, genres: c.rec.gn || [], mots_cles: (c.rec.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (c.rec.ov || '').slice(0, 180), adores: pipe.nearestK(c, loved, 3), non_aimes: pipe.nearestK(c, rejected, 3) }); });
+          win.slice(off, off + 40).forEach((c) => { const id = `${t[0]}${c.rec.i}`; byId.set(id, c.rec.im); cs.push({ id, titre: c.rec.t, annee: c.rec.y, genres: c.rec.gn || [], mots_cles: (c.rec.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (c.rec.ov || '').slice(0, 180), ...(() => { const nb = embNb ? embNb(c) : null; if (nb) arb.voisinsSemantiques++; return { adores: nb ? nb.adores : pipe.nearestK(c, loved, 3), non_aimes: nb ? nb.non_aimes : pipe.nearestK(c, rejected, 3) }; })() }); });
           this.setStage(uid, job, 'gemini', `comparaison ${t === 'movie' ? 'des films' : 'des séries'} à ton historique (Gemini, ${off + cs.length}/${win.length})`);
           const r = await spans.wrap(`gemini_arbitrage_${t}`, () => gem.json(comparePrompt({ candidats: cs })));
           const pe = parseEvaluations(r, byId); arb.calls++;
