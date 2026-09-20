@@ -323,6 +323,7 @@ class SyncEngine {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
       pools[t] = scored.slice(0, 100); utils[t] = scored.map((c) => c.util); scoredAll[t] = scored;
+      { job.ranks = job.ranks || {}; job.ranks[t] = scored.slice(0, 400).map((c) => [c.rec.im, Math.round(c.util * 1000) / 1000]); job.ranksAt = clock.now(); }   // classement local (400 premiers) : lu par /diag/check
     }
     // exclusion VF (séries d'origine asiatique/turque sans VF) : AVANT Gemini et la sélection finale ; en cas de doute ou de panne, on GARDE
     let vfCtx = null, vfExcluded = [];

@@ -43,9 +43,12 @@ ${keyField('rapidapi', 'Streaming Availability (RapidAPI) — clé API', view, f
 <section><h2>Options communes</h2>
 <label class="chk"><input type="checkbox" name="common.movieCatalog" value="1" ${s.common.movieCatalog ? 'checked' : ''}>Catalogue Films activé</label>
 <label class="chk"><input type="checkbox" name="common.seriesCatalog" value="1" ${s.common.seriesCatalog ? 'checked' : ''}>Catalogue Séries activé</label>
+<label class="chk"><input type="checkbox" name="common.libMovieCatalog" value="1" ${s.common.libMovieCatalog !== false ? 'checked' : ''}>📌 Catalogue « Votre liste de lecture » — Films (toute ta bibliothèque Stremio, vus et non vus)</label>
+<label class="chk"><input type="checkbox" name="common.libSeriesCatalog" value="1" ${s.common.libSeriesCatalog !== false ? 'checked' : ''}>📌 Catalogue « Votre liste de lecture » — Séries (toute ta bibliothèque Stremio, vus et non vus)</label>
+<div class="muted">Ajouter ou retirer un catalogue change la carte d'identité de l'addon : après avoir enregistré, réinstalle-le dans Stremio (bouton « Installer / mettre à jour ») pour que l'accueil se mette à jour.</div>
 <label class="chk"><input type="checkbox" name="common.excludeCancelled" value="1" ${s.common.excludeCancelled ? 'checked' : ''}>Exclure les séries annulées</label>
 <label class="chk"><input type="checkbox" name="common.frMeta" value="1" ${s.common.frMeta ? 'checked' : ''}>Fournir les fiches en français (/meta) — nécessite de réinstaller/mettre à jour l'addon dans Stremio si modifié</label>
-<label class="chk"><input type="checkbox" name="common.useGemini" value="1" ${s.common.useGemini ? 'checked' : ''}>Utiliser Gemini (ADN du profil, anti-recettes, arbitrage) quand une clé est enregistrée</label>
+<label class="chk"><input type="checkbox" name="common.useGemini" value="1" ${s.common.useGemini ? 'checked' : ''}>Utiliser Gemini (comparaison de chaque candidat à ses titres adorés et non aimés les plus proches) quand une clé est enregistrée</label>
 </section>
 <button class="btn" type="submit">${edit ? 'Enregistrer' : 'Créer mon addon'}</button>
 <div class="muted" style="margin-top:8px">Modifier un filtre relance immédiatement le calcul des seuls catalogues concernés, sans réapprendre le profil. Changer l'ordre d'affichage ne relance aucun calcul.</div></form>

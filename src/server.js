@@ -9,6 +9,8 @@ const { secretsReady } = require('./users');
 const ui = require('./ui');
 const diag = require('./diag');
 const { buildMeta } = require('./meta');
+const { LibraryCatalog } = require('./library');
+const inspect = require('./inspect');
 
 const json = (res, code, obj, headers = {}) => { const b = JSON.stringify(obj); res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers }); res.end(b); };
 const html = (res, code, body, headers = {}) => { res.writeHead(code, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', ...headers }); res.end(body); };
@@ -21,7 +23,9 @@ function manifestFor(user) {
   const c = user.settings.common; const catalogs = [];
   if (c.movieCatalog) catalogs.push({ type: 'movie', id: 'antony_movies', name: '🎯 Recommandations selon vos Goûts', extra: [{ name: 'skip' }] });
   if (c.seriesCatalog) catalogs.push({ type: 'series', id: 'antony_series', name: '🎯 Recommandations selon vos Goûts', extra: [{ name: 'skip' }] });
-  return { id: 'com.antony.personalrecommendations', version: cfg.ENGINE_VERSION, name: 'Recommandations personnelles', description: 'Recommandations apprises de vos ❤️, 👍 et des contenus vus sans appréciation. Métadonnées en français.',
+  if (c.libMovieCatalog !== false) catalogs.push({ type: 'movie', id: 'antony_lib_movies', name: '📌 Votre liste de lecture', extra: [{ name: 'skip' }] });
+  if (c.libSeriesCatalog !== false) catalogs.push({ type: 'series', id: 'antony_lib_series', name: '📌 Votre liste de lecture', extra: [{ name: 'skip' }] });
+  return { id: 'com.antony.personalrecommendations', version: cfg.ENGINE_VERSION, name: 'Recommandations personnelles', description: 'Recommandations apprises de vos ❤️, 👍 et des contenus vus sans appréciation, et votre bibliothèque séparée en films et séries. Métadonnées en français.',
     resources: c.frMeta ? ['catalog', { name: 'meta', types: ['movie', 'series'], idPrefixes: ['tt'] }] : ['catalog'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs, behaviorHints: { configurable: true, configurationRequired: false } };
 }
 
@@ -34,13 +38,14 @@ function parseForm(body) {
     settings[t].noWesternAnimation = p.has(`${t}.noWesternAnimation`);
     if (p.has(`${t}.exclude__present`)) settings[t].exclude = p.getAll(`${t}.exclude`);
   }
-  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
+  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
   settings.series.vfCheck = p.has('series.vfCheck');
   return { secrets: { tmdb: g('tmdb') || '', stremio: g('stremio') || '', gemini: g('gemini') || '', rapidapi: g('rapidapi') || '' }, clear: p.has('clearGemini') ? ['gemini'] : [], settings };
 }
 
 function createApp({ store, users, engine, results, started = Date.now() }) {
   const diagToken = () => process.env.DIAG_TOKEN || '';
+  const library = new LibraryCatalog();
   async function handle(req, res) {
     const u = new URL(req.url, 'http://x'); const path = u.pathname; const method = req.method;
     if (method === 'OPTIONS') { res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET,POST,OPTIONS' }); return res.end(); }
@@ -50,6 +55,12 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
       if (!diagToken()) return json(res, 503, { error: 'DIAG_TOKEN non défini sur le serveur' });
       const t = u.searchParams.get('token') || req.headers['x-diag-token'] || '';
       if (!safeEq(t, diagToken())) return json(res, 401, { error: 'non autorisé' });
+      if (path === '/diag/check') {                     // vérification d'une liste de titres (identifiants IMDb ou noms) : vu ? filtré ? classé ?
+        const list = await users.list(); const want = u.searchParams.get('u') || ''; const uid = list.find((x) => want && x.startsWith(want)) || list[0];
+        const user = uid && await users.get(uid);
+        if (!user) return json(res, 404, { error: 'aucun profil' });
+        return json(res, 200, await inspect.run({ q: u.searchParams.get('q') || '', user, engine, results, library }));
+      }
       return json(res, 200, diag.build({ store, users, engine, results, started }));
     }
     if (path === '/configure') {
@@ -81,7 +92,7 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
           const f = parseForm(await readBody(req));
           const { user: nu, persisted } = await users.update(uid, { secrets: f.secrets, clear: f.clear, settings: f.settings });
           const changed = ['movie', 'series'].filter((t) => before[t] !== cfg.settingsFingerprint(nu.settings, t));
-          engine.clients.delete(uid);               // clés éventuellement changées
+          engine.clients.delete(uid); library.invalidate(uid);               // clés éventuellement changées
           engine.onSettingsSaved(uid, changed).catch(() => {});
           res.writeHead(303, { location: `/u/${uid}/configure?${persisted ? 'saved=1' : 'warn=1'}` }); return res.end();
         } catch (e) { return html(res, 400, ui.page({ mode: 'edit', view: users.view(user), host: hostOf(req), notice: { kind: 'err', text: redact(e.message) }, secretsReady: secretsReady() })); }
@@ -89,10 +100,16 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
       if (rest === 'rebuild' && method === 'POST') return json(res, 200, engine.force(uid));
       if (rest === 'vf-test' && method === 'POST') return json(res, 200, await engine.vfTest(uid));
       if (rest === 'status') return json(res, 200, { ...engine.status(uid), vf: await engine.vfView(user) });
-      const c = rest.match(/^catalog\/(movie|series)\/(antony_movies|antony_series)(?:\/([^/]+?))?(?:\.json)?$/);
+      const c = rest.match(/^catalog\/(movie|series)\/(antony_movies|antony_series|antony_lib_movies|antony_lib_series)(?:\/([^/]+?))?(?:\.json)?$/);
       if (c) {
         activity.mark(); engine.touch(uid);
         const type = c[1]; const skip = Number((/skip=(\d+)/.exec(c[3] || '') || [])[1] || 0);
+        if (c[2].startsWith('antony_lib_')) {         // bibliothèque Stremio séparée par type (lecture à la demande, mémoire de 10 minutes)
+          const on = type === 'movie' ? user.settings.common.libMovieCatalog !== false : user.settings.common.libSeriesCatalog !== false;
+          const okType = (c[2] === 'antony_lib_movies') === (type === 'movie');
+          const metas = on && okType && user.secrets.stremio ? await library.metas(uid, user.secrets.stremio, type, skip) : [];
+          return json(res, 200, { metas }, { ...CORS, 'cache-control': 'public, max-age=60' });
+        }
         await results.getFast(uid);
         const metas = skip > 0 ? [] : results.ordered(uid, type, user.settings[type].order);
         return json(res, 200, { metas }, { ...CORS, 'cache-control': 'public, max-age=120' });
