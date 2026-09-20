@@ -161,6 +161,29 @@ Réponds UNIQUEMENT en JSON strict :
 CANDIDATS : ${JSON.stringify(candidats)}`;
 }
 
+// ---- VARIANTE C (validée par l'utilisateur) : comparaison à l'historique par PROXIMITÉ, sans résumé d'ADN, sans filtres, sans jugement de qualité.
+function comparePrompt({ candidats }) {
+  return `Tu compares des candidats (films ou séries) à des titres de l'historique d'un spectateur. Tu ne juges JAMAIS la qualité ni la réputation d'un titre : seulement la ressemblance de l'expérience de visionnage.
+
+Pour chaque candidat, tu reçois :
+- ses caractéristiques (titre, année, genres, mots-clés, synopsis) ;
+- "adores" : les 3 titres de l'historique que le spectateur a ADORÉS (❤️) et qui lui ressemblent le plus ;
+- "non_aimes" : les 3 titres de l'historique que le spectateur a vus SANS LES AIMER (✗) et qui lui ressemblent le plus.
+
+Pour chaque candidat, réponds :
+1. "proche_des_adores" (0-100) : à quel point l'expérience du candidat (univers, ton, rythme, type d'intrigue, humour, enjeux, public visé) ressemble à celle des titres adorés.
+2. "proche_des_non_aimes" (0-100) : la même question avec les titres vus sans les aimer.
+3. "connaissance" (0-100) : à quel point tu connais réellement ce titre. Titre récent ou peu connu : mets une valeur basse et compare d'après le synopsis, sans rien inventer.
+4. "motif" : 14 mots maximum, qui nomme le titre voisin le plus proche.
+
+Règles : compare uniquement l'expérience de visionnage ; un genre n'est ni bon ni mauvais en soi ; les deux notes sont indépendantes (un candidat peut ressembler aux deux, ou à aucun) ; utilise toute l'échelle ; si les voisins fournis ne sont pas pertinents, dis-le par une note basse plutôt que de forcer une ressemblance.
+
+Réponds UNIQUEMENT en JSON strict :
+{"evaluations": [{"id": ..., "proche_des_adores": 0, "proche_des_non_aimes": 0, "connaissance": 0, "motif": "..."}]}
+
+CANDIDATS : ${JSON.stringify(candidats)}`;
+}
+
 // Lecture tolérante de la réponse d'arbitrage : tableau direct ou objet, clés variantes, identifiants nus, scores en fraction (0-1) ou en points (0-100).
 function parseEvaluations(r, byId) {
   const shape = r === null || r === undefined ? 'null' : Array.isArray(r) ? `array[${r.length}]` : `objet{${Object.keys(r).slice(0, 6).join(',')}}`;
@@ -173,17 +196,27 @@ function parseEvaluations(r, byId) {
   const map = new Map();
   if (!list) return { map, shape, listLength: 0 };
   const pick = (...v) => { for (const x of v) { if (x === null || x === undefined || x === '') continue; const n = Number(x); if (Number.isFinite(n)) return n; } return NaN; };
-  const rows = list.filter((e) => e && typeof e === 'object').map((e) => ({ e, fit: pick(e.adequation, e['adéquation'], e.fit, e.score), risk: pick(e.risque, e.risk) })).filter((x) => Number.isFinite(x.fit));
+  const rows = list.filter((e) => e && typeof e === 'object').map((e) => {
+    const a = pick(e.proche_des_adores, e.proche_des_adorés), nn = pick(e.proche_des_non_aimes);
+    const isC = Number.isFinite(a) && Number.isFinite(nn);            // variante C : ressemblance aux titres adorés et aux titres non aimés
+    return { e, isC, a, nn, fit: isC ? a : pick(e.adequation, e['adéquation'], e.fit, e.score), risk: isC ? nn : pick(e.risque, e.risk) };
+  }).filter((x) => Number.isFinite(x.fit));
   const frac = rows.length > 0 && rows.every((x) => x.fit <= 1 && (Number.isNaN(x.risk) || x.risk <= 1));
   const k = frac ? 100 : 1;
-  for (const { e, fit, risk } of rows) {
+  for (const { e, fit, risk, isC, a, nn } of rows) {
     const raw = String(e.id ?? e.identifiant ?? ''); const digits = raw.replace(/\D/g, '');
     const im = byId.get(raw) || (digits && (byId.get('m' + digits) || byId.get('s' + digits)));
     if (!im) continue;
     const kn = pick(e.connaissance, e.knowledge, e.connu); const inc = e.incompatibilite ?? e['incompatibilité'] ?? e.incompatible;
+    if (isC) {                                                                       // fit = (100 + adorés − non aimés) / 2 ; risk = 0 ; les deux ressemblances sont conservées (sim)
+      const A = Math.max(0, Math.min(100, a * k)), N = Math.max(0, Math.min(100, nn * k));
+      const kn2 = pick(e.connaissance, e.knowledge, e.connu);
+      map.set(im, { fit: (100 + A - N) / 2, risk: 0, sim: { adores: A, nonAimes: N }, know: Number.isFinite(kn2) ? Math.max(0, Math.min(100, kn2 * (kn2 <= 1 && frac ? 100 : 1))) : null, incomp: false, note: String(e.note || e.motif || '').slice(0, 100) });
+      continue;
+    }
     map.set(im, { fit: Math.max(0, Math.min(100, fit * k)), risk: Math.max(0, Math.min(100, (Number.isFinite(risk) ? risk : 0) * k)), know: Number.isFinite(kn) ? Math.max(0, Math.min(100, kn * (kn <= 1 && frac ? 100 : 1))) : null, incomp: inc === true || inc === 1 || (typeof inc === 'string' && /^(true|vrai|oui|1)$/i.test(inc.trim())), note: String(e.note || e.motif || '').slice(0, 100) });
   }
   return { map, shape, listLength: list.length };
 }
 
-module.exports = { stratifiedSample, parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };
+module.exports = { comparePrompt, stratifiedSample, parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };
