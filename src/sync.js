@@ -257,7 +257,7 @@ class SyncEngine {
           if (prevOk) return prevOk;
           if (!gem || !gem.available) return { skipped: 'Gemini indisponible ou désactivé : aucune mesure', day: today };
           this.setStage(uid, job, 'gemini', 'mesure de l\'apport de Gemini');
-          const ev = await spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, filtres, previousMalus: job.malus ? job.malus.params : null }));
+          const ev = await spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, filtres, previousMalus: job.malus ? job.malus.params : null, passes: (rec) => pipe.admissible([rec], { settings: effA, type: rec.k === 'm' ? 'movie' : 'series', seenImdb: new Set() }).recs.length === 1 }));
           if (ev && ev.skipped) ev.day = today;
           return ev;
         }

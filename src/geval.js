@@ -77,9 +77,13 @@ function effect(rows, adj, params, ex) {
   return { tailleHautDeListe: K, fenetre: Wm, retires: o, entres: e, partCoeurAvant: love(a), partCoeurApres: love(b), resume: txt, exemplesRetires: out.slice(0, 8).map(ex), exemplesEntres: inn.slice(0, 8).map(ex) };
 }
 
-// ctx : { gem, dev, test, scored, rank, filtres, previousMalus }
+// ctx : { gem, dev, test, scored, rank, filtres, previousMalus, passes }
+// passes(rec) : le titre respecte les filtres ACTUELS de la page de configuration (genres exclus, année, durée, qualité…). Comme les candidats de la production, seuls ces titres sont
+// mesurés : sinon un ❤️ de l'historique qui viole un filtre (dessin animé, téléréalité…) serait sanctionné par Gemini pour une raison qui n'existe pas en production.
 async function evaluate(ctx) {
-  const { gem, dev, test, scored, rank, filtres, previousMalus } = ctx;
+  const { gem, dev, test, rank, filtres, previousMalus, passes } = ctx;
+  const scoredAll = ctx.scored; const scored = passes ? scoredAll.filter((s) => { try { return passes(s.it.rec); } catch { return true; } }) : scoredAll; const horsFiltres = scoredAll.length - scored.length;
+  if (scored.length < MIN_MATCHED) return { error: `trop peu de titres de test respectent les filtres actuels (${scored.length}/${scoredAll.length}, minimum ${MIN_MATCHED}) : mesure impossible`, titresHorsFiltres: horsFiltres };
   try {
     if (!gem || !gem.available) return { skipped: 'Gemini indisponible ou désactivé' };
     const nItems = Math.min(scored.length, MAX_ITEMS), need = 1 + Math.ceil(nItems / BATCH);
@@ -142,8 +146,8 @@ async function evaluate(ctx) {
     const eff = effect(crows, adj, cal.params, ex);
     const dis = rows.map((r, i) => ({ titre: r.s.it.rec.t, annee: r.s.it.rec.y, reel: lab(r.s.it.label), gemini: Math.round(r.gm.fit), rangLocalPct: Math.round(rk.lLove[i] * 100), motif: r.gm.note || undefined }));
     return {
-      at: new Date().toISOString(), model: gem.model || null, titresEvalues: n, lots: batches, requetesGemini: batches + 1,
-      protocole: 'production : ADN régénéré sur les titres d\'apprentissage seulement (tableau de preuves), mêmes prompts et mêmes cartes, sans score local',
+      at: new Date().toISOString(), model: gem.model || null, titresEvalues: n, titresHorsFiltres: horsFiltres, lots: batches, requetesGemini: batches + 1,
+      protocole: 'production : ADN régénéré sur les titres d\'apprentissage seulement (tableau de preuves), mêmes prompts et mêmes cartes, sans score local ; seuls les titres qui respectent les filtres actuels sont mesurés',
       aucCoupDeCoeur: { local: base.aucCoupDeCoeur, geminiSeul: gemOnly.aucCoupDeCoeur, ic95Local: ic(A), ic95GeminiSeul: ic(B) },
       aucApprecie: { local: base.aucApprecie, geminiSeul: gemOnly.aucApprecie },
       melanges: table, meilleur: { poidsGemini: best.poidsGemini, gainAuc: r4(diff), ic95Gain: icDiff }, verdict,
