@@ -1,7 +1,7 @@
 'use strict';
 // Gemini (Google AI Studio) en REST, sans SDK ni dépendance. Facultatif et NON bloquant : toute erreur => null.
 // Budget : ≤ 2 requêtes par synchronisation (1 "ADN + anti-recettes", mise en cache tant que l'historique est identique ;
-// 1 "arbitrage" des candidats frontières Films+Séries) et un plafond quotidien dur (GEMINI_MAX_CALLS_PER_DAY, défaut 6).
+// 1 "arbitrage" des candidats frontières Films+Séries) et un plafond quotidien dur (GEMINI_MAX_CALLS_PER_DAY, défaut 100 ; quota gratuit réel : 1 500 par jour et 15 par heure).
 // Le modèle est choisi dynamiquement (models.list) : les IDs codés en dur disparaissent (gemini-1.5-flash est arrêté).
 const { fetchJson, clock, zurichDay, log } = require('./util');
 
@@ -31,7 +31,7 @@ function extractJson(text) {
 }
 
 class Gemini {
-  constructor({ key, maxPerDay = Number(process.env.GEMINI_MAX_CALLS_PER_DAY || 6), model = process.env.GEMINI_MODEL || '', calls = null } = {}) {
+  constructor({ key, maxPerDay = Number(process.env.GEMINI_MAX_CALLS_PER_DAY || 100), model = process.env.GEMINI_MODEL || '', calls = null } = {}) {
     this.key = key; this.maxPerDay = maxPerDay; this.forced = model || ''; this.model = model || null;
     this.cooldownUntil = 0; this.disabledUntil = 0; this.lastError = null; this.modelCheckedAt = 0;
     this.calls = calls && calls.day === zurichDay() ? calls : { day: zurichDay(), count: 0 };
@@ -79,20 +79,86 @@ class Gemini {
 
 // ---------- prompts (compacts : jamais l'historique complet) ----------
 const card = (rec, extra = {}) => ({ titre: rec.t, annee: rec.y, genres: (rec.gn || []).slice(0, 4), mots_cles: (rec.kw || []).slice(0, 7).map((k) => k[1]), ...extra });
-function dnaPrompt({ loves, likes, rejects, positiveTraits, negativeTraits, recipes }) {
-  const payload = { adorés: loves.map((r) => card(r)), aimés: likes.map((r) => card(r)), rejetés_pourtant_bien_notés: rejects.map((r) => card(r, { note_tmdb: r.va })), traits_appris_positifs: positiveTraits, traits_appris_négatifs: negativeTraits, recettes_négatives_candidates: recipes };
-  return `Tu es un analyste de goûts cinématographiques. Voici un profil COMPACT (échantillons) d'un spectateur.\n` +
-    `"adorés" = coup de cœur fort ; "aimés" = apprécié ; "rejetés_pourtant_bien_notés" = vus sans apprécier alors que TMDB les note bien (donc rejet probablement lié au goût, pas à la qualité).\n` +
-    `Tâches : (1) synthétise l'ADN profond de ses goûts (ambiances, thématiques, ton, sous-genres, structure narrative) au-delà des simples genres ; (2) liste ce qu'il évite ; ` +
-    `(3) pour chaque recette négative candidate, décide si c'est une VRAIE combinaison toxique (thème apprécié gâché par un ton/style) ou une coïncidence (films médiocres, note moyenne basse).\n` +
-    `Réponds UNIQUEMENT en JSON : {"adn":"<=110 mots, français","themes":["..."],"tons":["..."],"evite":["..."],"recettes":[{"id":"R1","toxique":true,"confiance":0.0,"raison":"<=18 mots"}]}\n` +
-    `DONNÉES : ${JSON.stringify(payload)}`;
+// ---------- PROMPTS (structures définies par l'utilisateur) ----------
+// Échantillon représentatif : réparti par genre principal (tour à tour) pour qu'aucun genre aimé (fantastique, comédie…) ne disparaisse de l'ADN.
+function stratifiedSample(items, n) {
+  const groups = new Map();
+  for (const it of items.slice().sort((x, y) => (y.lw || 0) - (x.lw || 0) || (x.key < y.key ? -1 : 1))) {
+    const g = (it.rec.k || '?') + ':' + ((it.rec.gn && it.rec.gn[0]) || 'autre');
+    if (!groups.has(g)) groups.set(g, []); groups.get(g).push(it);
+  }
+  const order = [...groups.entries()].sort((a, b) => b[1].length - a[1].length || (a[0] < b[0] ? -1 : 1)).map((e) => e[1]);
+  const out = []; for (let round = 0; out.length < n; round++) { let any = false; for (const g of order) { if (g[round]) { out.push(g[round].rec); any = true; if (out.length >= n) break; } } if (!any) break; }
+  return out;
 }
-function arbitragePrompt({ adn, evite, candidats }) {
-  return `Tu départages des recommandations pour un spectateur dont l'ADN de goût est : ${adn || '(inconnu)'}\nÀ éviter : ${(evite || []).join(', ') || '(rien de précis)'}.\n` +
-    `Pour chaque candidat (déjà présélectionné par un modèle statistique, score_local 0-100), donne "adequation" (0-100 : probabilité que ce soit un COUP DE CŒUR (❤️) pour lui, pas seulement un titre correct) et "risque" (0-100 : risque de déception, ` +
-    `notamment s'il ressemble à "plus_proche_rejete" plutôt qu'à "plus_proche_aime"). Sois discriminant et fondé sur les nuances sémantiques (ton, thème, structure), pas sur la popularité.\n` +
-    `Réponds UNIQUEMENT en JSON : {"evaluations":[{"id":"<id>","adequation":0,"risque":0,"note":"<=14 mots"}]}\nCANDIDATS : ${JSON.stringify(candidats)}`;
+// ---- PROMPT 1 : ADN (structure VALIDÉE par l'utilisateur). Aucun goût écrit en dur : seuls les FILTRES ACTIFS de la page de configuration sont transmis.
+function dnaPrompt({ filtres, n, tauxGlobal, tableau, loves, likes, rejects, recipes }) {
+  const echantillon = { adorés: (loves || []).map((r) => card(r)), aimés: (likes || []).map((r) => card(r)), rejetés_pourtant_bien_notés: (rejects || []).map((r) => card(r, { note_tmdb: r.va })), recettes_candidates: recipes || [] };
+  return `Tu es un analyste de goûts cinématographiques et télévisuels. À partir de PREUVES
+chiffrées et d'un échantillon de son historique, tu rédiges l'ADN de visionnage d'un
+spectateur.
+
+PRINCIPES
+- Une note (❤️ adoré, 👍 aimé, ✗ vu sans être aimé) concerne UN titre, pas un genre.
+  Ne conclus qu'un genre, un sous-genre ou un mot-clé est rejeté QUE si le tableau
+  le prouve : part d'appréciation nettement sous sa moyenne générale ET fiabilité
+  « suffisante ». Un ou deux titres ratés dans un ensemble ne prouvent rien.
+- « faible » ou « preuve insuffisante » : n'en tire AUCUNE conclusion.
+- Pour chaque ensemble, oppose ce qui est adoré à ce qui est rejeté : c'est cette
+  différence (ton, rythme, sous-genre, acteurs, réalisateur, structure narrative)
+  qui définit l'ADN, pas l'étiquette de genre.
+- Les FILTRES ACTIFS sont des choix de configuration de l'utilisateur, appliqués en
+  amont : ne les interprète pas comme un goût et ne les commente pas.
+
+FILTRES ACTIFS (page de configuration) :
+${filtres || '(aucun)'}
+
+TABLEAU DE PREUVES (historique de ${n} titres ; moyenne générale d'appréciation :
+${tauxGlobal} %) :
+${tableau}
+
+ÉCHANTILLON (réparti par genre) :
+${JSON.stringify(echantillon)}
+
+Réponds UNIQUEMENT en JSON strict :
+{"adn": "<=110 mots", "moteurs_d_adhesion": [...], "facteurs_repulsifs": [...],
+ "nuances": [{"ensemble": "...", "lecture": "..."}],
+ "recettes_toxiques": [{"id": "R1", "toxique": true, "raison": "..."}]}`;
+}
+// ---- PROMPT 2 : arbitrage (structure VALIDÉE) : quatre notes par candidat.
+function arbitragePrompt({ adn, moteurs, repulsifs, nuances, filtres, candidats }) {
+  const l = (a) => ((a && a.length) ? a.join(' ; ') : '(aucun)');
+  return `Tu arbitres des candidats (films ou séries) pour un spectateur dont voici l'ADN :
+${adn || '(inconnu)'}
+Moteurs d'adhésion : ${l(moteurs)}
+Facteurs répulsifs : ${l(repulsifs)}
+Nuances à respecter : ${l(nuances)}
+
+FILTRES ACTIFS (déjà appliqués : tous les candidats les respectent) :
+${filtres || '(aucun)'}
+
+Pour chaque candidat (titre, année, tous ses genres, mots-clés, synopsis, titre aimé
+et titre rejeté les plus proches) :
+1. "adequation" (0-100) : probabilité que ce soit un vrai COUP DE CŒUR (❤️), d'après
+   la dynamique, l'immersion, le ton et le divertissement, pas la réputation critique.
+2. "risque" (0-100) : risque de déception : titre lent, austère, niais, redondant ou
+   ennuyeux pour CE profil.
+3. "connaissance" (0-100) : à quel point tu connais réellement ce titre. Titre récent
+   ou obscur : mets une valeur basse et juge d'après le synopsis, sans rien inventer.
+4. "incompatibilite" (true/false) : true SEULEMENT pour une incompatibilité MAJEURE
+   et précise avec l'ADN, à justifier dans le motif. Jamais pour un simple manque
+   d'enthousiasme.
+5. "motif" : 14 mots maximum.
+
+Règles : utilise toute l'échelle (un titre moyen vaut environ 50) ; sois sévère
+seulement si tu peux le justifier ; ne juge pas un genre entier sur ses mauvais
+exemples : compare avec les titres aimés du même sous-genre.
+
+Réponds UNIQUEMENT en JSON strict :
+{"evaluations": [{"id": ..., "adequation": 0, "risque": 0, "connaissance": 0,
+ "incompatibilite": false, "motif": "..."}]}
+
+CANDIDATS : ${JSON.stringify(candidats)}`;
 }
 
 // Lecture tolérante de la réponse d'arbitrage : tableau direct ou objet, clés variantes, identifiants nus, scores en fraction (0-1) ou en points (0-100).
@@ -114,17 +180,10 @@ function parseEvaluations(r, byId) {
     const raw = String(e.id ?? e.identifiant ?? ''); const digits = raw.replace(/\D/g, '');
     const im = byId.get(raw) || (digits && (byId.get('m' + digits) || byId.get('s' + digits)));
     if (!im) continue;
-    map.set(im, { fit: Math.max(0, Math.min(100, fit * k)), risk: Math.max(0, Math.min(100, (Number.isFinite(risk) ? risk : 0) * k)), note: String(e.note || '').slice(0, 100) });
+    const kn = pick(e.connaissance, e.knowledge, e.connu); const inc = e.incompatibilite ?? e['incompatibilité'] ?? e.incompatible;
+    map.set(im, { fit: Math.max(0, Math.min(100, fit * k)), risk: Math.max(0, Math.min(100, (Number.isFinite(risk) ? risk : 0) * k)), know: Number.isFinite(kn) ? Math.max(0, Math.min(100, kn * (kn <= 1 && frac ? 100 : 1))) : null, incomp: inc === true || inc === 1 || (typeof inc === 'string' && /^(true|vrai|oui|1)$/i.test(inc.trim())), note: String(e.note || e.motif || '').slice(0, 100) });
   }
   return { map, shape, listLength: list.length };
 }
 
-// Prompt de MESURE : aucune information locale (ni score, ni titres voisins) pour que la comparaison avec le modèle soit honnête.
-function evalPrompt({ adn, evite, candidats }) {
-  return `Tu estimes, pour un spectateur dont l'ADN de goût est : ${adn || '(inconnu)'}\nÀ éviter : ${(evite || []).join(', ') || '(rien de précis)'}.\n` +
-    `Pour chaque titre ci-dessous, donne "adequation" (0-100 : probabilité que ce soit un COUP DE CŒUR (❤️) pour lui) et "risque" (0-100 : risque qu'il ne l'apprécie pas). ` +
-    `Appuie-toi sur son ADN et sur le contenu (thème, ton, structure narrative), pas sur la popularité. Sois discriminant : utilise toute l'échelle.\n` +
-    `Réponds UNIQUEMENT en JSON : {"evaluations":[{"id":"<id>","adequation":0,"risque":0}]}\nTITRES : ${JSON.stringify(candidats)}`;
-}
-
-module.exports = { evalPrompt, parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };
+module.exports = { stratifiedSample, parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };

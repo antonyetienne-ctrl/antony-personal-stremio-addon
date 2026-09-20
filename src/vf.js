@@ -53,15 +53,20 @@ const dotOf = (health, hasKey) => (!hasKey || !health || (!health.lastOkAt && !h
 
 class VF {
   constructor({ store }) { this.store = store; this.items = new Map(); this.health = {}; this.loaded = false; this.dirty = false; this.trace = []; }
-  async load() {
+  async load() {                                                     // lecture unique partagée ; pause de 60 s après un échec (pas de relectures en rafale)
     if (this.loaded) return;
-    const s = await this.store.getJson(key.vf, 'vf-load');
-    if (s === undefined) return;                                     // Upstash indisponible : on réessaiera
-    this.loaded = true;
-    if (s && s.items) { for (const [k, v] of Object.entries(s.items)) this.items.set(k, v); this.health = s.health || {}; }
+    if (this._loadP) return this._loadP;
+    if (this._loadFailAt && Date.now() - this._loadFailAt < 60000) return;
+    this._loadP = (async () => {
+      const s = await this.store.getJson(key.vf, 'vf-load');
+      if (s === undefined) { this._loadFailAt = Date.now(); return; }         // Upstash indisponible : on réessaiera plus tard
+      this.loaded = true;
+      if (s && s.items) { for (const [k, v] of Object.entries(s.items)) this.items.set(k, v); this.health = s.health || {}; }
+    })().catch(() => { this._loadFailAt = Date.now(); }).finally(() => { this._loadP = null; });
+    return this._loadP;
   }
   async save() {
-    if (!this.dirty) return true;
+    if (!this.dirty || !this.loaded) return !this.dirty;             // jamais d'écriture si la relecture a échoué : on n'écrase pas le cache existant
     const ok = await this.store.setJson(key.vf, { v: 1, items: Object.fromEntries(this.items), health: this.health }, 'vf-save');
     if (ok) this.dirty = false; return ok;
   }

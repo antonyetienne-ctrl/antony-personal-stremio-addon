@@ -84,7 +84,7 @@ class Store {
     if (!keys.length) return [];
     const res = await this.pipeline(keys.map((k) => ['GET', k]), label);
     if (res === undefined) return undefined;
-    return res.map((r) => (r == null ? null : unpack(r)));
+    return res.map((r) => (r === undefined ? undefined : r === null ? null : unpack(r)));      // undefined = commande en erreur (à ne pas confondre avec une clé absente)
   }
   // écriture groupée : renvoie true si tout est OK
   async setManyJson(entries, label) {

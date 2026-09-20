@@ -120,21 +120,48 @@ function makeMeta(rec, type) {
 }
 
 // Sélection finale : les TOP_N meilleurs, sans quota ni diversité artificielle.
-// adj (arbitrage Gemini) : Map imdb -> {fit, risk, note}. Gemini ne peut que RÉORDONNER la fenêtre frontière (les WINDOW premiers
-// du classement local) : score relatif = 65 % utilité locale normalisée + 35 % avis Gemini normalisé. Un titre hors fenêtre
-// (non évalué) ne peut jamais entrer dans le Top 30 à sa place tant que la fenêtre contient au moins TOP_N titres.
-const WINDOW = 45;
-function finalizeTop(pool, adj) {
-  const wrap = (c, idx, gem = null) => ({ c, u: c.util, gem, localRank: idx + 1 });
-  if (!adj || !adj.size) return pool.slice(0, TOP_N).map((c, i) => wrap(c, i));
-  const win = pool.slice(0, WINDOW).map((c, i) => { const a = adj.get(c.rec.im); return { ...wrap(c, i, a ? { fit: a.fit, risk: a.risk, note: a.note } : null), g: a ? a.fit / 100 - 0.5 * (a.risk / 100) : null }; });
+// adj (arbitrage Gemini) : Map imdb -> {fit, risk, know, incomp, note}. Gemini agit sur la FENÊTRE frontière (les WINDOW premiers du classement local) :
+//  1) MÉLANGE : score relatif = 65 % utilité locale normalisée + 35 % avis Gemini normalisé ;
+//  2) MALUS PROGRESSIF (pas un interrupteur) : gravité du jugement s ∈ [0,1] = adéquation sous `fit0` et/ou risque au-dessus de `risk0`
+//     (plus l'écart est grand, plus s est grand), renforcée de 0,35 si Gemini signale une incompatibilité majeure, réduite de moitié au plus
+//     si Gemini connaît mal le titre ; malus = alpha × s retiré du score. Les trois réglages (fit0, risk0, alpha) sont choisis PAR LE BACKTEST
+//     avec un plancher de sévérité (MALUS_FLOOR : jamais moins sévère). Un titre très pénalisé est remplacé par le suivant.
+//  3) GARDE-FOUS : au plus 40 % de la fenêtre subit le malus complet (les plus graves d'abord ; les autres sont adoucis) ; les titres hors fenêtre,
+//     non évalués, ne peuvent entrer QUE pour remplacer un titre lourdement pénalisé (avec un handicap de 0,10) ; sans avis Gemini : classement local pur ;
+//     le Top est toujours complet.
+const WINDOW = 80;
+const DEFAULT_MALUS = { fit0: 30, risk0: 70, alpha: 0.7 };        // point de départ avant toute calibration
+const MALUS_FLOOR = { fit0: 25, risk0: 75, alpha: 0.5 };          // sévérité minimale : jamais moins que ça
+const MALUS_GRID = { fit0: [25, 30, 35, 40, 45], risk0: [55, 60, 65, 70, 75], alpha: [0.5, 0.7, 1.0] };
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+function severity(a, m) {
+  if (!a) return 0;
+  const sf = clamp01((m.fit0 - a.fit) / Math.max(1, m.fit0)), sr = clamp01((a.risk - m.risk0) / Math.max(1, 100 - m.risk0));
+  let s = Math.max(sf, sr);
+  if (a.incomp) s = Math.min(1, s + 0.35);
+  const know = Number.isFinite(a.know) ? clamp01(a.know / 100) : 1;
+  return s * (0.5 + 0.5 * know);
+}
+function finalizeTop(pool, adj, { top = TOP_N, window = WINDOW, malus = DEFAULT_MALUS } = {}) {
+  const wrap = (c, idx, gem = null) => ({ c, u: c.util, gem, localRank: idx + 1, pen: 0 });
+  const done = (arr, penalised = []) => { const res = arr.slice(0, top); res.penalised = penalised; res.params = malus; return res; };
+  if (!adj || !adj.size) return done(pool.slice(0, top).map((c, i) => wrap(c, i)));
+  const win = pool.slice(0, window).map((c, i) => { const a = adj.get(c.rec.im); return { ...wrap(c, i, a ? { fit: a.fit, risk: a.risk, know: a.know, incomp: a.incomp, note: a.note } : null), g: a ? a.fit / 100 - 0.5 * (a.risk / 100) : null }; });
   const us = win.map((x) => x.c.util), umin = Math.min(...us), umax = Math.max(...us);
-  const gs = win.filter((x) => x.g !== null).map((x) => x.g), gmin = Math.min(...gs), gmax = Math.max(...gs);
+  const gs = win.filter((x) => x.g !== null).map((x) => x.g), gmin = gs.length ? Math.min(...gs) : 0, gmax = gs.length ? Math.max(...gs) : 0;
   const norm = (v, lo, hi) => (hi - lo > 1e-9 ? (v - lo) / (hi - lo) : 0.5);
-  for (const x of win) { const z = norm(x.c.util, umin, umax); x.u = x.g === null ? z : 0.65 * z + 0.35 * norm(x.g, gmin, gmax); }
-  win.sort((a, b) => b.u - a.u || a.c.rec.i - b.c.rec.i);
-  const rest = pool.slice(WINDOW).map((c, i) => wrap(c, WINDOW + i));
-  return [...win.map(({ c, u, gem, localRank }) => ({ c, u, gem, localRank })), ...rest].slice(0, TOP_N);
+  for (const x of win) { const z = norm(x.c.util, umin, umax); x.u = x.g === null ? z : 0.65 * z + 0.35 * norm(x.g, gmin, gmax); x.pen = x.gem ? malus.alpha * severity(x.gem, malus) : 0; }
+  // garde-fou : au plus 40 % de la fenêtre subit le malus complet, les plus graves d'abord
+  const hit = win.filter((x) => x.pen > 0).sort((a, b) => b.pen - a.pen || a.c.rec.i - b.c.rec.i);
+  hit.slice(Math.floor(win.length * 0.4)).forEach((x) => { x.pen *= 0.3; });
+  for (const x of win) x.u -= x.pen;
+  // titres hors fenêtre (non évalués) : score neutre côté Gemini, handicap de 0,10 : ils n'entrent que si des titres de la fenêtre sont lourdement pénalisés
+  const gsN = gs.map((v) => norm(v, gmin, gmax)).sort((a, b) => a - b), gNeutral = gsN.length ? gsN[Math.floor(gsN.length / 2)] : 0.5;
+  const rest = pool.slice(window).map((c, i) => ({ ...wrap(c, window + i), u: 0.65 * Math.max(0, norm(c.util, umin, umax)) + 0.35 * gNeutral - 0.1 }));
+  const strip = ({ c, u, gem, localRank, pen }) => ({ c, u, gem, localRank, pen });
+  const all = [...win, ...rest].sort((a, b) => b.u - a.u || b.c.util - a.c.util || a.c.rec.i - b.c.rec.i);
+  const penalised = win.filter((x) => x.pen > 0).sort((a, b) => b.pen - a.pen || a.c.rec.i - b.c.rec.i).map(strip);
+  return done(all.map(strip), penalised);
 }
 
-module.exports = { exclusions, enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };
+module.exports = { severity, DEFAULT_MALUS, MALUS_FLOOR, MALUS_GRID, WINDOW, exclusions, enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };

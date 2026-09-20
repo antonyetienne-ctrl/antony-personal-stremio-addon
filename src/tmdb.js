@@ -77,14 +77,24 @@ class Tmdb {
   }
 
   // ---------- persistance par blocs ----------
+  // Lecture UNIQUE partagée par tous les appelants ; après un échec, pause de 90 s (évite la tempête de relectures quand Upstash est lent).
   async loadPersisted() {
     if (this.loaded) return true;
     if (!this.store.enabled) { this.loaded = true; this.canFlush = false; return false; }
+    if (this._loadP) return this._loadP;
+    if (this._loadFailAt && Date.now() - this._loadFailAt < (this._loadPauseMs ?? 90000)) return false;
+    this._loadP = this._loadOnce().catch(() => false).finally(() => { this._loadP = null; });
+    return this._loadP;
+  }
+  async _loadOnce() {
     const keys = [];
     for (const kind of ['m', 's']) for (let s = 0; s < SHARDS; s++) keys.push(key.tmdb(kind, s));
     keys.push(key.idmap);
     const res = await this.store.getManyJson(keys, 'tmdb-cache-load');
-    if (res === undefined) { log('warn', 'Cache TMDB persistant illisible (Upstash) : on repart du réseau, sans écraser l\'existant'); this.canFlush = false; return false; }
+    if (res === undefined || res.some((r) => r === undefined)) {                       // échec total OU partiel : on ne charge rien de partiel et on n'écrasera jamais l'existant
+      if (!this._loadFailAt || Date.now() - this._loadFailAt > 5000) log('warn', 'Cache TMDB persistant illisible (Upstash) : on repart du réseau, sans écraser l\'existant');
+      this.canFlush = false; this._loadFailAt = Date.now(); return false;
+    }
     let n = 0;
     res.slice(0, keys.length - 1).forEach((blob) => { if (blob && typeof blob === 'object') for (const [id, rec] of Object.entries(blob)) { if (rec && rec.v === DETAIL_SCHEMA && !this.ram.has(rec.k + id)) { this.ram.set(rec.k + id, rec); n++; } } });
     const idm = res[keys.length - 1];

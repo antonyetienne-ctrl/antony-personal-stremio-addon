@@ -10,9 +10,10 @@ const { clock, log, redact, sha, Spans, fmtDuration, makeYielder, activity, zuri
 const cfg = require('./config');
 const stremio = require('./stremio');
 const { Tmdb } = require('./tmdb');
-const { Gemini, dnaPrompt, arbitragePrompt, parseEvaluations } = require('./gemini');
+const { Gemini, dnaPrompt, arbitragePrompt, parseEvaluations, stratifiedSample } = require('./gemini');
 const { Corpus, hashedVec, makeNamer, nameOfKey } = require('./features');
 const geval = require('./geval');
+const evidence = require('./evidence');
 const model = require('./model');
 const bt = require('./backtest');
 const pipe = require('./pipeline');
@@ -243,22 +244,28 @@ class SyncEngine {
     this.setStage(uid, job, 'apprentissage', 'apprentissage des goûts');
     const corpus = new Corpus(labeled.map((i) => i.rec));
     for (const it of labeled) it.vec = hashedVec(it.rec, corpus);
-    const canEval = Boolean(gem && gem.available);      // la mesure Gemini est refaite si Gemini devient disponible
-    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}|${canEval ? 'g' : 'n'}`);
-    if (!job.backtest || job.backtest.key !== btKey || force) {
+    const filtres = evidence.activeFiltersText(settings, { vfActive: settings.series.vfCheck !== false && Boolean(user.secrets.rapidapi) });   // filtres de la page de configuration, seuls "rejets" connus de Gemini
+    const canEval = Boolean(gem && gem.available);
+    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}`);
+    const retryEval = canEval && job.backtest && job.backtest.key === btKey && job.backtest.geminiEval && job.backtest.geminiEval.skipped && job.backtest.geminiEval.day !== today;      // mesure sautée (Gemini indisponible ou quota) : nouvelle tentative au plus UNE fois par jour
+    if (!job.backtest || job.backtest.key !== btKey || force || retryEval) {
       const prev = job.backtest && job.backtest.key === btKey ? job.backtest.geminiEval : null;      // même historique : on réutilise la mesure déjà faite
       const prevOk = prev && !prev.error && !prev.skipped ? prev : null;
       const b = await spans.wrap('backtest', () => bt.runBacktest(labeled, corpus, gate, {
         onStage: (s) => this.setStage(uid, job, 'backtest', s),
         afterTest: async (ctx) => {
           if (prevOk) return prevOk;
-          if (!gem || !gem.available) return { skipped: 'Gemini indisponible ou désactivé : aucune mesure' };
+          if (!gem || !gem.available) return { skipped: 'Gemini indisponible ou désactivé : aucune mesure', day: today };
           this.setStage(uid, job, 'gemini', 'mesure de l\'apport de Gemini');
-          return spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, explain: (p, nm) => explainProfile(p, nm) }));
+          const ev = await spans.wrap('gemini_eval', () => geval.evaluate({ gem, ...ctx, filtres, previousMalus: job.malus ? job.malus.params : null }));
+          if (ev && ev.skipped) ev.day = today;
+          return ev;
         }
       }));
       job.backtest = { key: btKey, ...b };
     }
+    { const gm = job.backtest.geminiEval && job.backtest.geminiEval.malus; if (gm && gm.params) job.malus = { params: gm.params, source: gm.source, at: gm.at || job.backtest.at }; }
+    const malusParams = (job.malus && job.malus.params) || pipe.DEFAULT_MALUS;
     const chosen = job.backtest.chosen; const risk = job.backtest.risk ? { kappa: job.backtest.risk.kappa, rho: job.backtest.risk.rho } : DEFAULT_RISK;
     const pkey = sha(`${btKey}|${JSON.stringify(chosen.cfg)}`);
     let profiles = this.profileCache.get(uid);
@@ -281,6 +288,22 @@ class SyncEngine {
         for (const kind of ['m', 's']) for (const { it, p } of arr.filter((x) => x.it.rec.k === kind).slice(0, 20)) recheck.push({ title: it.rec.t, year: it.rec.y, imdb: it.rec.im, type: kind === 's' ? 'series' : 'movie', probabilite: +p.toFixed(2), why: whyMap.get(it.rec.im) || null }); }
     } catch { /* facultatif */ }
 
+    // "surprises" : titres ❤️/👍 que le modèle croyait improbables, et "vus sans note" qu'il croyait aimés (estimations hors échantillon)
+    const surprises = { movie: { aimesMaisImprobables: [], nonAimesMaisProbables: [] }, series: { aimesMaisImprobables: [], nonAimesMaisProbables: [] } };
+    try {
+      const g = profiles.global;
+      if (g.keys && g.task1 && g.task1.oof) {
+        const idx = new Map(labeled.map((i) => [i.key, i])); const all = [];
+        g.keys.forEach((k, j) => { const it = idx.get(k); if (it) all.push({ it, p: g.task1.oof[j] }); });
+        for (const [kind, t] of [['m', 'movie'], ['s', 'series']]) {
+          const mine = all.filter((x) => x.it.rec.k === kind);
+          const fmt = ({ it, p }) => ({ titre: it.rec.t, annee: it.rec.y, imdb: it.rec.im, reel: it.label === 2 ? '❤️ Love' : it.label === 1 ? '👍 Like' : 'vu sans note', probabiliteEstimee: +p.toFixed(2) });
+          surprises[t].aimesMaisImprobables = mine.filter((x) => x.it.label > 0).sort((a, b) => a.p - b.p).slice(0, 20).map(fmt);
+          surprises[t].nonAimesMaisProbables = mine.filter((x) => x.it.label === 0).sort((a, b) => b.p - a.p).slice(0, 20).map(fmt);
+        }
+      }
+    } catch { /* facultatif */ }
+
     // 5) ADN + anti-recettes (Gemini, ≤ 1 requête, mis en cache par empreinte) — repli local sinon
     const recipes = model.negativeRecipes(labeled, 24);
     let dna = job.dna && job.dna.labelFP === labelFP && job.dna.engine === cfg.ENGINE_VERSION ? job.dna : null;
@@ -288,10 +311,18 @@ class SyncEngine {
       dna = { labelFP, engine: cfg.ENGINE_VERSION, at: clock.now(), source: 'local', adn: null, themes: [], evite: [], recipes: [] };
       if (gem && gem.available) {
         this.setStage(uid, job, 'gemini', 'ADN du profil (Gemini)');
-        const trait = explainProfile(profiles.global, namer);
-        const pick = (arr, n) => arr.slice().sort((a, b) => b.lw - a.lw || (a.key < b.key ? -1 : 1)).slice(0, n).map((i) => i.rec);
-        const r = await spans.wrap('gemini_dna', () => gem.json(dnaPrompt({ loves: pick(labeled.filter((i) => i.label === 2), 40), likes: pick(labeled.filter((i) => i.label === 1), 30), rejects: pick(labeled.filter((i) => i.label === 0 && i.rec.va >= 6.8), 40), positiveTraits: trait.positive.map((x) => x.name), negativeTraits: trait.negative.map((x) => x.name), recipes: recipes.map((x) => ({ id: x.id, combinaison: x.parts.map((p) => nameOfKey(namer, p)).join(' + '), occurrences_rejetees: x.neg, occurrences_aimees: x.pos, note_tmdb_moyenne: x.meanVa })) })));
-        if (r && typeof r === 'object') { dna.source = 'gemini'; dna.adn = String(r.adn || '').slice(0, 900); dna.themes = [].concat(r.themes || [], r.tons || []).slice(0, 14).map(String); dna.evite = [].concat(r.evite || []).slice(0, 8).map(String); dna.recipes = Array.isArray(r.recettes) ? r.recettes.slice(0, 30).map((x) => ({ id: String(x.id), toxique: Boolean(x.toxique), confiance: Math.max(0, Math.min(1, Number(x.confiance) || 0)), raison: String(x.raison || '').slice(0, 140) })) : []; }
+        // ADN : tableau de PREUVES (sous-genres et mots-clés) + échantillon réparti par genre ; AUCUN critère statistique linéaire, AUCUN goût écrit en dur
+        const ev = evidence.buildEvidence(labeled), ov = evidence.overall(ev);
+        const r = await spans.wrap('gemini_dna', () => gem.json(dnaPrompt({ filtres, n: ov.n, tauxGlobal: ov.taux, tableau: evidence.evidenceText(ev), loves: stratifiedSample(labeled.filter((i) => i.label === 2), 60), likes: stratifiedSample(labeled.filter((i) => i.label === 1), 30), rejects: stratifiedSample(labeled.filter((i) => i.label === 0 && i.rec.va >= 6.8), 40), recipes: recipes.map((x) => ({ id: x.id, combinaison: x.parts.map((p) => nameOfKey(namer, p)).join(' + '), occurrences_rejetees: x.neg, occurrences_aimees: x.pos, note_tmdb_moyenne: x.meanVa })) })));
+        if (r && typeof r === 'object') {
+          dna.source = 'gemini'; dna.adn = String(r.adn || '').slice(0, 900);
+          dna.moteurs = [].concat(r.moteurs_d_adhesion || r.themes || [], r.tons || []).slice(0, 12).map(String);
+          dna.repulsifs = [].concat(r.facteurs_repulsifs || r.evite || []).slice(0, 12).map(String);
+          dna.nuances = (Array.isArray(r.nuances) ? r.nuances : []).slice(0, 10).filter((x) => x && x.ensemble).map((x) => `${x.ensemble} : ${x.lecture || ''}`.slice(0, 200));
+          dna.themes = dna.moteurs; dna.evite = dna.repulsifs;
+          const rawRecipes = Array.isArray(r.recettes_toxiques) ? r.recettes_toxiques : Array.isArray(r.recettes) ? r.recettes : [];
+          dna.recipes = rawRecipes.slice(0, 30).filter((x) => x && x.id).map((x) => ({ id: String(x.id), toxique: Boolean(x.toxique), confiance: x.confiance === undefined ? 0.7 : Math.max(0, Math.min(1, Number(x.confiance) || 0)), raison: String(x.raison || '').slice(0, 140) }));
+        }
       }
       job.dna = dna;
     }
@@ -307,7 +338,7 @@ class SyncEngine {
     for (const t of targets) {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, risk, rank: job.backtest.rank, toxic, yielder: gate }));
-      pools[t] = scored.slice(0, 60); utils[t] = scored.map((c) => c.util); scoredAll[t] = scored;
+      pools[t] = scored.slice(0, 100); utils[t] = scored.map((c) => c.util); scoredAll[t] = scored;
     }
     // exclusion VF (séries d'origine asiatique/turque sans VF) : AVANT Gemini et la sélection finale ; en cas de doute ou de panne, on GARDE
     let vfCtx = null, vfExcluded = [];
@@ -315,31 +346,42 @@ class SyncEngine {
       const vfKeyF = user.secrets.rapidapi;
       if (settings.series.vfCheck !== false && vfKeyF && pools.series && scoredAll.series) {
         await this.vf.load(); vfCtx = this.vf.begin(vfKeyF, tmdb, gate);
-        const r = await spans.wrap('vf_filtre', () => this.vf.filterPool(scoredAll.series, vfCtx, { limit: 60 }));
+        const r = await spans.wrap('vf_filtre', () => this.vf.filterPool(scoredAll.series, vfCtx, { limit: 100 }));
         pools.series = r.kept; vfExcluded = r.excluded;
       }
     } catch (e) { log('warn', 'exclusion VF en échec (ignorée : aucune série écartée)', e.message); vfCtx = null; vfExcluded = []; }
-    let adj = null; const arb = { used: false };
+    let adj = null; const arb = { used: false, fenetre: pipe.WINDOW, malus: { params: malusParams, source: (job.malus && job.malus.source) || 'réglage par défaut (aucune calibration disponible)' } };
     if (gem && gem.available) {
       const loved = labeled.filter((i) => i.label === 2), rejected = labeled.filter((i) => i.label === 0);
-      const cs = []; const byId = new Map();
-      for (const t of targets) pools[t].slice(0, 45).forEach((c, i) => { const near = pipe.nearestTitles(c, loved, rejected); const id = `${t[0]}${c.rec.i}`; byId.set(id, c.rec.im); cs.push({ id, titre: c.rec.t, annee: c.rec.y, genres: (c.rec.gn || []).slice(0, 4), mots_cles: (c.rec.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (c.rec.ov || '').slice(0, 180), score_local: Math.round(c.util * 100), plus_proche_aime: near.aime, plus_proche_rejete: near.rejete }); });
-      this.setStage(uid, job, 'gemini', 'arbitrage des candidats frontières (Gemini)');
-      const r = await spans.wrap('gemini_arbitrage', () => gem.json(arbitragePrompt({ adn: dna.adn, evite: dna.evite, candidats: cs })));
-      const pe = parseEvaluations(r, byId);
-      arb.candidatesSent = cs.length; arb.responseShape = pe.shape; arb.listLength = pe.listLength; arb.trace = gem.trace.slice(-1);
-      if (pe.map.size) { adj = pe.map; arb.used = true; arb.evaluated = pe.map.size; }
-      else log('warn', `Arbitrage Gemini sans évaluation exploitable (${pe.shape}) : classement local conservé`);
+      const all = new Map(); arb.candidatesSent = 0; arb.evaluated = 0; arb.calls = 0; arb.trace = [];
+      for (const t of targets) {
+        if (!gem.available) break;                                     // quota atteint en cours de route : on garde ce qu'on a
+        const cs = []; const byId = new Map();
+        pools[t].slice(0, pipe.WINDOW).forEach((c) => { const near = pipe.nearestTitles(c, loved, rejected); const id = `${t[0]}${c.rec.i}`; byId.set(id, c.rec.im); cs.push({ id, titre: c.rec.t, annee: c.rec.y, genres: c.rec.gn || [], mots_cles: (c.rec.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (c.rec.ov || '').slice(0, 180), plus_proche_aime: near.aime, plus_proche_rejete: near.rejete }); });
+        this.setStage(uid, job, 'gemini', `arbitrage ${t === 'movie' ? 'des films' : 'des séries'} (Gemini, ${cs.length} candidats)`);
+        const r = await spans.wrap(`gemini_arbitrage_${t}`, () => gem.json(arbitragePrompt({ adn: dna.adn, moteurs: dna.moteurs || dna.themes, repulsifs: dna.repulsifs || dna.evite, nuances: dna.nuances, filtres, candidats: cs })));
+        const pe = parseEvaluations(r, byId); arb.calls++;
+        arb.candidatesSent += cs.length; arb[`forme_${t}`] = pe.shape; arb.trace.push(...gem.trace.slice(-1));
+        for (const [k, v] of pe.map) all.set(k, v);
+        if (!pe.map.size) log('warn', `Arbitrage Gemini (${t}) sans évaluation exploitable (${pe.shape}) : classement local conservé pour ce type`);
+      }
+      if (all.size) { adj = all; arb.used = true; arb.evaluated = all.size; }
     }
     // 7) sélection finale + validation, puis publication ATOMIQUE
     const explain = {}, finRecs = {};
     for (const t of targets) {
-      const local = pipe.finalizeTop(pools[t], null), fin = pipe.finalizeTop(pools[t], adj);
+      const local = pipe.finalizeTop(pools[t], null), fin = pipe.finalizeTop(pools[t], adj, { malus: malusParams });
       if (!fin.length) { log('warn', `Aucun candidat pour ${t} : type non publié (ancien résultat conservé)`); continue; }
       if (pools[t].length >= cfg.TOP_N && fin.length !== cfg.TOP_N) throw new Error(`Top ${cfg.TOP_N} incomplet pour ${t} (${fin.length})`);
       sections[t] = { settingsFP: cfg.settingsFingerprint(settings, t), labelFP, short: fin.length < cfg.TOP_N, builtAt: clock.now(), buildId: job.buildId, items: fin.map((x, i) => ({ imdb: x.c.rec.im, tmdb: x.c.rec.i, meta: pipe.makeMeta(x.c.rec, t), score: { rank: i + 1, localRank: x.localRank, util: +x.u.toFixed(4), mu: +x.c.s.mu.toFixed(4), pPos: +x.c.s.pPos.toFixed(3), pLove: +x.c.s.pLove.toFixed(3), sigma: +x.c.s.sigma.toFixed(3), fp: +x.c.s.fp.toFixed(3), toxic: +x.c.tox.toFixed(3), gemini: x.gem } })) };
       const a = new Set(local.map((x) => x.c.rec.im)), b = new Set(fin.map((x) => x.c.rec.im));
       explain[t] = { poolSize: cands[t].length, replacedByGemini: [...b].filter((x) => !a.has(x)).length };
+      const pen = new Map((fin.penalised || []).map((x) => [x.c.rec.im, x.pen]));
+      const row = (x, extra = {}) => ({ titre: x.c.rec.t, annee: x.c.rec.y, imdb: x.c.rec.im, rangLocal: x.localRank, adequation: x.gem ? Math.round(x.gem.fit) : null, risque: x.gem ? Math.round(x.gem.risk) : null, connaissance: x.gem && Number.isFinite(x.gem.know) ? Math.round(x.gem.know) : null, incompatibilite: x.gem && x.gem.incomp ? true : undefined, motif: x.gem && x.gem.note ? x.gem.note : undefined, ...extra });
+      const ent = fin.filter((x) => !a.has(x.c.rec.im)).map((x) => row(x, { rangFinal: fin.indexOf(x) + 1 }));
+      const sor = local.filter((x) => !b.has(x.c.rec.im)).map((x) => { const g = adj && adj.get(x.c.rec.im); const p = pen.get(x.c.rec.im) || 0; return row({ ...x, gem: g ? { fit: g.fit, risk: g.risk, know: g.know, incomp: g.incomp, note: g.note } : null }, { raison: p >= 0.2 ? `malus de Gemini (${p.toFixed(2)})` : 'mélange 65/35' }); });
+      explain[t].entrants = ent; explain[t].sortants = sor; explain[t].nbPenalises = (fin.penalised || []).length;
+      explain[t].penalises = (fin.penalised || []).slice(0, 40).map((x) => row(x, { malus: +x.pen.toFixed(2), dansLeTop: b.has(x.c.rec.im) }));
       finRecs[t] = fin.map((x) => x.c.rec);
     }
     if (!Object.keys(sections).length) throw new Error('aucun résultat valide à publier');
@@ -401,7 +443,7 @@ class SyncEngine {
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
     Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
-    return { outcome: 'published', report: { imdb: job.imdb, favorites, vf: vfReport, bibliotheque: libTop, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
+    return { outcome: 'published', report: { imdb: job.imdb, favorites, vf: vfReport, bibliotheque: libTop, surprises, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }
 
   // ---------- lecture pour l'UI / le diagnostic ----------
