@@ -8,8 +8,9 @@
 //  - un échec (TMDB, Stremio, Gemini, Upstash) conserve le dernier Top 30 complet.
 const { clock, log, redact, sha, Spans, fmtDuration, makeYielder, activity, zurichDay, nextZurichMidnight } = require('./util');
 const embed = require('./embed');
+const gemab = require('./gemab');
+const signals = require('./signals');
 const cv = require('./cv'); const { loveProb } = require('./model');
-const why = require('./why');
 const cfg = require('./config');
 const stremio = require('./stremio');
 const { Tmdb } = require('./tmdb');
@@ -32,7 +33,7 @@ class SyncEngine {
     this.store = store; this.users = users; this.results = results; this.idleDelayMs = idleDelayMs;
     this.jobs = new Map(); this.running = new Set(); this.timers = new Map(); this.clients = new Map();
     this.snaps = new Map(); this.profileCache = new Map(); this.lastJobSave = new Map(); this.progress = new Map();
-    this.imdb = new Imdb({ store }); this.vf = new VF({ store }); this.embedSpaces = new Map(); this.embedTimers = new Map(); this.embedBusy = new Set(); this.why = new why.WhyStore(store);
+    this.imdb = new Imdb({ store }); this.vf = new VF({ store }); this.gemabTimers = new Map(); this.gemabBusy = new Set(); this.gemabState = new Map(); this.embedSpaces = new Map(); this.embedTimers = new Map(); this.embedBusy = new Set();
   }
 
   // ---------- état du job ----------
@@ -74,7 +75,15 @@ class SyncEngine {
   async resumeAll() {
     this.store.del('av7:cards:c1', 'nettoyage').catch(() => {});      // ancien document des fiches descriptives (retirées) : suppression sans conséquence si absent
     const ids = await this.users.list();
-    for (const uid of ids) { const job = await this.loadJob(uid); if (job.status === 'running') { log('warn', 'Job interrompu détecté au démarrage : reprise prévue', { stage: job.stage }); } this._schedule(uid, 3000); if (this._embedTodoCount(job) > 0) this._scheduleEmbed(uid, 120000); }
+    for (const uid of ids) { const job = await this.loadJob(uid); if (job.status === 'running') {
+        job.crashes = (job.crashes || 0) + 1; log('warn', 'Job interrompu détecté au démarrage : reprise prévue', { stage: job.stage, interruptions: job.crashes });
+        if (job.crashes > 2) {          // évite la boucle « plantage → reprise → plantage » : les dernières listes publiées sont conservées, « Forcer un rebuild » relance à la main
+          job.status = 'error'; job.error = `calcul interrompu ${job.crashes} fois de suite à l'étape « ${job.stage || '?'} » (mémoire ?) : reprise automatique arrêtée, dernières listes conservées`; job.crashes = 0;
+          await this.saveJob(job, uid, true); log('error', 'Reprise automatique arrêtée', { stage: job.stage }); continue;
+        }
+        await this.saveJob(job, uid, true);
+      }
+      this._schedule(uid, 3000); if (this._embedTodoCount(job) > 0) this._scheduleEmbed(uid, 120000); if (job.gemab && !job.gemab.analyse) this._scheduleGemab(uid, 240000); }
   }
   async onSettingsSaved(uid, changedTypes) { if (changedTypes.length) this._runBg(uid, { mode: 'rerank', types: changedTypes, reason: 'réglages modifiés' }); }
   force(uid) { return this._runBg(uid, { mode: 'full', force: true, reason: 'Force Rebuild' }); }
@@ -115,6 +124,32 @@ class SyncEngine {
       this._scheduleEmbed(uid, wait);
       return r;
     } finally { this.embedBusy.delete(uid); }
+  }
+
+  // ---------- grand test de Gemini : reprise en arrière-plan (quota de génération préservé, réserve de 60 requêtes) ----------
+  async gemabLoad(uid) { if (this.gemabState.has(uid)) return this.gemabState.get(uid); const st = await this.store.getJson(cfg.key.gemab(uid), 'gemab-load'); if (st) this.gemabState.set(uid, st); return st || null; }
+  async gemabSave(uid, st) { this.gemabState.set(uid, st); await this.store.setJson(cfg.key.gemab(uid), st, 'gemab-save'); }
+  _scheduleGemab(uid, delayMs) {
+    if (process.env.GEMAB_BACKGROUND === 'off') return;
+    const old = this.gemabTimers.get(uid); if (old) clearTimeout(old);
+    const t = setTimeout(() => { this.gemabTimers.delete(uid); this.gemabContinue(uid).catch((e) => log('warn', 'grand test de Gemini en arrière-plan', String(e && e.message || e).slice(0, 120))); }, Math.max(1000, delayMs === undefined ? Number(process.env.GEMAB_DELAY_MS || 60000) : delayMs));
+    if (t.unref) t.unref(); this.gemabTimers.set(uid, t);
+  }
+  async gemabContinue(uid) {
+    if (this.gemabBusy.has(uid)) return { skipped: 'déjà en cours' };
+    if (this.running.has(uid) || this.embedBusy.has(uid)) { this._scheduleGemab(uid, 60000); return { skipped: 'un calcul ou une vectorisation est en cours' }; }
+    const job = await this.loadJob(uid); const G = job.gemab; if (!G || G.analyse) return { skipped: 'rien à faire' };
+    const user = await this.users.get(uid); if (!user || !user.secrets.gemini || user.settings.common.useGemini === false) return { skipped: 'Gemini indisponible ou désactivé' };
+    const st = await this.gemabLoad(uid); if (!st || st.key !== G.key) return { skipped: 'test périmé (historique modifié)' };
+    this.gemabBusy.add(uid);
+    try {
+      const cl = this.clientsFor(user, job); const r = await gemab.runPass({ st, gem: cl.gemini, budgetMs: Number(process.env.GEMAB_PASS_MS || 180000) });
+      await this.gemabSave(uid, st); G.progression = gemab.progress(st); G.derniere = { at: new Date(clock.now()).toISOString(), ...r }; job.geminiCalls = cl.gemini ? cl.gemini.calls : job.geminiCalls;
+      if (!gemab.pending(st).length) { G.analyse = gemab.analyze(st); log('info', 'Grand test de Gemini terminé', { verdict: G.analyse.verdict.resume }); }
+      await this.saveJob(job, uid, true);
+      if (!G.analyse) { const g = cl.gemini, now = clock.now(); let wait; if (g && g.cooldownUntil > now) wait = g.cooldownUntil - now + 5000; else if (r.stop && /réserve|plafond/.test(r.stop)) wait = nextZurichMidnight() - now + 120000; if (r.requests === 0 && !wait) { G.sansProgres = (G.sansProgres || 0) + 1; if (G.sansProgres >= 4) return r; } this._scheduleGemab(uid, wait); }
+      return r;
+    } finally { this.gemabBusy.delete(uid); }
   }
 
   async tick(uid) {
@@ -158,6 +193,7 @@ class SyncEngine {
     this.progress.delete(uid);
     await this.saveJob(job, uid, true);
     this.running.delete(uid);
+    if (!error && job.gemab && !job.gemab.analyse) this._scheduleGemab(uid);
     if (!error && this._embedTodoCount(job) > 0) this._scheduleEmbed(uid, job.embed.pausedUntil > clock.now() ? job.embed.pausedUntil - clock.now() + 5000 : undefined);
     log('info', `BUILD ${error ? 'FAILED' : 'COMPLETE'} (${outcome})  Total: ${fmtDuration(durationMs)}  Films: ${fmtDuration(films)}  Séries: ${fmtDuration(series)}  Autres: ${fmtDuration(job.lastRun.otherMs)}`);
     return { outcome, error };
@@ -288,7 +324,22 @@ class SyncEngine {
     const canEval = Boolean(gem && gem.available);
     // embeddings sémantiques : vectorisation de l'historique (cadencée, mise en cache), comparaison des deux façons de trouver des voisins ; ne bloque jamais le calcul
     const embCtx = await spans.wrap('embeddings', () => embed.prepare({ store: this.store, apiKey: user.secrets.gemini, allowed: settings.common.useGemini !== false, job, labeled, gate, spaces: this.embedSpaces, force, setStage: (l) => this.setStage(uid, job, 'embeddings', l) }));
-    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}|${embCtx.useNeighbors ? 'E' : 'H'}`);
+    // signaux supplémentaires (personnes ; recommandations des autres, seulement ❤️ et 👍) : données TMDB des titres de l'historique (bornées par calcul), puis liens ; le backtest décide s'ils servent
+    const lovedRecs = labeled.filter((i) => i.label === 2).map((i) => i.rec), likedRecs = labeled.filter((i) => i.label === 1).map((i) => i.rec); let sigShare = 0;
+    try {
+      const sr = await spans.wrap('signaux', () => signals.ensure(tmdb, labeled.map((i) => i.rec), { gate, maxCalls: Number(process.env.SIGNALS_MAX_CALLS || 4000) }));
+      signals.edges(labeled.map((i) => i.rec), lovedRecs, likedRecs); sigShare = labeled.filter((i) => i.rec.pe !== undefined && i.rec.rc !== undefined).length / Math.max(1, labeled.length);
+      job.signaux = { ...(job.signaux || {}), historique: { ...sr, couverture: Math.round(sigShare * 1e3) / 1e3 }, at: new Date(clock.now()).toISOString() };
+    } catch (e) { log('warn', 'signaux supplémentaires : indisponibles pour ce calcul', String(e && e.message || e).slice(0, 120)); }
+    // grand test de Gemini (avec / sans les 👍) : échantillon et cartes préparés ici (peu coûteux), requêtes jouées en arrière-plan sur plusieurs passes ; mesure seulement
+    try {
+      const gKey = sha(`${labelFP}|${gemab.CELL}|${embCtx.useNeighbors ? 'E' : 'H'}|g1`);
+      if (!job.gemab || job.gemab.key !== gKey) {
+        const stg = gemab.prepare({ items: labeled, neighborsFor: embCtx.useNeighbors ? embed.makeNeighborsFor(embCtx.vecOf) : null, key: gKey }); await this.gemabSave(uid, stg);
+        job.gemab = { key: gKey, at: stg.at, titres: stg.n, lots: stg.batches.length, progression: gemab.progress(stg), analyse: null };
+      }
+    } catch (e) { log('warn', 'grand test de Gemini : préparation impossible', String(e && e.message || e).slice(0, 120)); }
+    const btKey = sha(`${labelFP}|${cfg.ENGINE_VERSION}|${imdbActive ? 'imdb' : 'tmdb'}|${embCtx.useNeighbors ? 'E' : 'H'}|S${Math.floor(sigShare * 10)}`);
     const retryEval = canEval && job.backtest && job.backtest.key === btKey && job.backtest.geminiEval && job.backtest.geminiEval.skipped && job.backtest.geminiEval.day !== today;      // mesure sautée (Gemini indisponible ou quota) : nouvelle tentative au plus UNE fois par jour
     if (!job.backtest || job.backtest.key !== btKey || retryEval) {      // identique => résultat réutilisé (un rebuild forcé ne refait plus 3 minutes de backtest pour rien)
       const prev = job.backtest && job.backtest.key === btKey ? job.backtest.geminiEval : null;      // même historique : on réutilise la mesure déjà faite
@@ -320,7 +371,7 @@ class SyncEngine {
       } catch (e) { log('warn', 'validation croisée impossible : réglages de sécurité par défaut', String(e && e.message || e).slice(0, 120)); job.cv = { erreur: String(e && e.message || e).slice(0, 140), at: new Date(clock.now()).toISOString(), params: {} }; }
     }
     // réglages de classement et de sécurité par type : ceux de la validation croisée, à défaut le backtest et le seuil par défaut
-    const paramsOf = (t) => { const p = job.cv && job.cv.params && job.cv.params[t]; return p ? { rank: { alpha: p.alpha }, risk: { kappa: p.kappa, rho: p.rho }, safety: { tau: p.tau } } : { rank: job.backtest.rank, risk, safety: { tau: cv.DEFAULTS.tau } }; };
+    const paramsOf = (t) => { const p = job.cv && job.cv.params && job.cv.params[t]; return p ? { rank: { alpha: p.alpha }, risk: { kappa: p.kappa, rho: p.rho }, safety: { tau: p.tau }, calib: (job.cv.calib && job.cv.calib[t]) || null } : { rank: job.backtest.rank, risk, safety: { tau: cv.DEFAULTS.tau } }; };
     const pkey = sha(`${btKey}|${JSON.stringify(chosen.cfg)}`);
     let profiles = this.profileCache.get(uid);
     if (!profiles || profiles.key !== pkey) {
@@ -332,7 +383,6 @@ class SyncEngine {
     }
     const namer = makeNamer(labeled.map((i) => i.rec));
     job.traits = explainProfile(profiles.global, namer);
-    const wide = explainProfile(profiles.global, namer, 90); const whyTraits = why.traitList([...wide.positive, ...wide.negative]);      // traits (genres, mots-clés) pour les fiches « pourquoi »
     // titres "vus sans note" que le modèle pense aimés : oublis probables de notation (à revérifier dans Stremio)
     const recheck = [];
     try {
@@ -379,6 +429,9 @@ class SyncEngine {
     const pools = {}, sections = {}, utils = {}, scoredAll = {};
     for (const t of targets) {
       this.setStage(uid, job, `scoring ${t}`, `scoring de ${cands[t].length} candidats (${t === 'movie' ? 'films' : 'séries'})`);
+      if (chosen.cfg.people || chosen.cfg.reco) {        // variante adoptée : mêmes signaux pour les candidats
+        try { const sc = await spans.wrap(`signaux_${t}`, () => signals.ensure(tmdb, cands[t], { gate, maxCalls: Number(process.env.SIGNALS_MAX_CALLS || 4000) })); signals.edges(cands[t], lovedRecs, likedRecs); job.signaux = { ...(job.signaux || {}), [t]: sc, variante: chosen.id }; } catch (e) { log('warn', 'signaux des candidats indisponibles', String(e && e.message || e).slice(0, 100)); }
+      }
       const scored = await spans.wrap(`score_${t}`, () => pipe.scoreCandidates({ recs: cands[t], corpus, profType: profiles[t], profGlobal: profiles.global, ...paramsOf(t), toxic, yielder: gate }));
       if (embCtx.enabled && (embCtx.useNeighbors || embCtx.wk > 0)) {                 // vectorisation des mieux classés, puis mélange par voisins sémantiques (seulement si adopté par la mesure)
         const er = await spans.wrap(`embeddings_${t}`, () => embed.ensureRecs(embCtx, scored.map((c) => c.rec), { setStage: (l) => this.setStage(uid, job, `embeddings ${t}`, l) }));
@@ -509,35 +562,10 @@ class SyncEngine {
       }
       job.precision = job.precision.slice(-12);
     } catch (e) { log('warn', 'suivi de précision', e.message); }
-    // fiches « pourquoi » (texte ajouté en tête des fiches Stremio) : Top 30 publié + titres non vus de la liste de lecture 📌 quand le modèle est concluant ; n'échoue jamais
-    const whyParts = {};
-    try {
-      const isLoved = (i) => i.label === 2, isDisliked = (i) => i.label === 0;
-      const poolsHash = { loved: embed.poolOf(labeled.filter(isLoved), (i) => i.vec), disliked: embed.poolOf(labeled.filter(isDisliked), (i) => i.vec) };
-      const poolsEmb = embCtx.enabled ? { loved: embed.poolOf(labeled.filter(isLoved), (i) => embCtx.vecOf(i.rec)), disliked: embed.poolOf(labeled.filter(isDisliked), (i) => embCtx.vecOf(i.rec)) } : null;
-      const nbOf = (rec, hv) => why.neighborsOf({ rec, vecOf: embCtx.enabled ? embCtx.vecOf : null, hashVec: () => hv, poolsEmb, poolsHash });
-      for (const t of targets) {
-        if (!sections[t]) continue; const map = {};
-        for (const x of finTop[t]) { const P = paramsOf(t); const w = why.buildWhy({ rec: x.c.rec, pl: loveProb(x.c.s, P.rank.alpha), pPos: x.c.s.pPos, tau: P.safety.tau, neighbors: nbOf(x.c.rec, x.c.item.vec), posTraits: whyTraits, negTraits: whyTraits, mode: 'top', seed: x.c.rec.i }); if (w) map[x.c.rec.im] = w.text; }
-        whyParts[t === 'movie' ? 'movie' : 'series'] = map;
-      }
-      this.setStage(uid, job, 'fiches', 'fiches « pourquoi » de la liste de lecture');
-      const labeledIm = new Set(labeled.map((i) => i.rec.im)); const extra = classified.filter((c) => !c.seen && !labeledIm.has(c.imdb));
-      for (const t of targets) {
-        const ims = extra.filter((c) => c.type === t).map((c) => c.imdb); if (!ims.length) continue;
-        const ids = await tmdb.findMany(ims, t, { gate }); const det = await tmdb.ensureDetails(t === 'series' ? 'tv' : 'movie', [...ids.values()], { gate });
-        const recs = [...ids.values()].map((id) => det.get(id)).filter(Boolean); if (!recs.length) continue;
-        imdbAttach(recs, imdbActive ? this.imdb : null);
-        const sc = await pipe.scoreCandidates({ recs, corpus, profType: profiles[t], profGlobal: profiles.global, ...paramsOf(t), toxic, yielder: gate }); const map = {};
-        for (const c of sc) { const w = why.buildWhy({ rec: c.rec, pl: loveProb(c.s, paramsOf(t).rank.alpha), pPos: c.s.pPos, tau: paramsOf(t).safety.tau, neighbors: nbOf(c.rec, c.item.vec), posTraits: whyTraits, negTraits: whyTraits, mode: 'lib', seed: c.rec.i }); if (w) map[c.rec.im] = w.text; }
-        whyParts[t === 'movie' ? 'libMovie' : 'libSeries'] = map;
-      }
-    } catch (e) { log('warn', 'Fiches « pourquoi » indisponibles pour ce calcul', String(e && e.message || e).slice(0, 140)); }
     const pub = await spans.wrap('publish', () => this.results.publish(uid, sections, { buildId: job.buildId }));
-    try { if (Object.keys(whyParts).length) { await this.why.publish(uid, whyParts, { buildId: job.buildId }); job.whyStats = { ...(job.whyStats || {}), at: new Date(clock.now()).toISOString(), ...Object.fromEntries(Object.entries(whyParts).map(([k, v]) => [k, Object.keys(v).length])) }; } } catch { /* facultatif */ }
     await spans.wrap('cache_flush', () => tmdb.flushPersisted());
     await this.store.setJson(cfg.key.snap(uid), this._makeSnap(classified, statuses), 'snap-save'); this.snaps.set(uid, this._makeSnap(classified, statuses));
-    Object.assign(job, { engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
+    Object.assign(job, { crashes: 0, engine: cfg.ENGINE_VERSION, labelFP, settingsFP: { movie: cfg.settingsFingerprint(settings, 'movie'), series: cfg.settingsFingerprint(settings, 'series') }, lastSuccessAt: clock.now(), nextEligibleAt: nextZurichMidnight() });
     if (mode !== 'rerank') { job.lastFullDay = today; job.lastCheckDay = today; }
     return { outcome: 'published', report: { imdb: job.imdb, favorites, vf: vfReport, bibliotheque: libTop, surprises, counts: { ...counts, stateMatrix: stateMatrixOf(classified, statuses), seriesSamples: seriesSamplesOf(classified, statuses) }, taste: job.taste, recheck, candidates: dstats, arbitrage: { ...arb, ...explain }, dna: { source: dna.source, adn: dna.adn }, toxicRecipes: toxic.map((x) => x.id), persisted: pub.persisted, risk, chosenVariant: chosen.id } };
   }

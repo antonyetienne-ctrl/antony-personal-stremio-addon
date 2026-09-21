@@ -43,13 +43,35 @@ function evalParams(rows, p, K) {
   let v = 0, thumbs = 0, loves = 0, s = 0; for (const i of top) { const l = rows[i].label; v += VALUE[l]; s += l === 2 ? 3 : l === 1 ? 1 : -1; if (l === 0) thumbs++; if (l === 2) loves++; }
   return { J: v / K, valeurMoyenne: s / K, pouceBas: thumbs / K, coeurs: loves / K };
 }
+// CALIBRATION : P(apprécié) estimée -> fréquence réellement observée hors échantillon (régression isotone sur 20 groupes de même effectif : monotone, sans surapprentissage) ; appliquée aux candidats
+function fitCalibration(rows) {
+  const pts = rows.map((r) => [r.b.pPos, r.label > 0 ? 1 : 0]).sort((a, b) => a[0] - b[0]); const n = pts.length; if (n < 60) return null;
+  const G = Math.min(20, Math.floor(n / 25)); const blocks = [];
+  for (let g = 0; g < G; g++) { const seg = pts.slice(Math.floor((g * n) / G), Math.floor(((g + 1) * n) / G)); blocks.push({ w: seg.length, s: seg.reduce((a, p) => a + p[1], 0), xs: seg.reduce((a, p) => a + p[0], 0) }); }
+  const st = []; for (const b of blocks) { st.push({ ...b }); while (st.length > 1 && st[st.length - 2].s / st[st.length - 2].w > st[st.length - 1].s / st[st.length - 1].w) { const y = st.pop(), x = st.pop(); st.push({ w: x.w + y.w, s: x.s + y.s, xs: x.xs + y.xs }); } }
+  return { xs: st.map((b) => r3(b.xs / b.w)), ys: st.map((b) => r3(Math.min(0.99, Math.max(0.01, b.s / b.w)))), n };
+}
+function calibrate(cal, p) {
+  if (!cal || !cal.xs || !cal.xs.length) return p; const { xs, ys } = cal; if (p <= xs[0]) return ys[0]; if (p >= xs[xs.length - 1]) return ys[ys.length - 1];
+  let i = 1; while (i < xs.length && xs[i] < p) i++; const t = (p - xs[i - 1]) / Math.max(1e-9, xs[i] - xs[i - 1]); return ys[i - 1] + t * (ys[i] - ys[i - 1]);
+}
+// intervalle de confiance à 95 % du gain de valeur J (meilleur réglage − défaut) : tirages avec remise des titres, top-K recalculé à chaque tirage
+function bootstrapGain(rows, pA, pB, K, B = 300) {
+  let seed = 12345; const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };
+  const uA = rows.map((r) => scoreOf(r.b, pA)), uB = rows.map((r) => scoreOf(r.b, pB)); const n = rows.length; const gains = [];
+  const J = (u, idx) => { const sc = idx.map((i) => [u[i], i]).sort((a, b) => b[0] - a[0] || a[1] - b[1]).slice(0, K); return sc.reduce((s, [, i]) => s + VALUE[rows[i].label], 0) / K; };
+  for (let b = 0; b < B; b++) { const idx = Array.from({ length: n }, () => Math.floor(rnd() * n)); gains.push(J(uB, idx) - J(uA, idx)); }
+  gains.sort((a, b) => a - b); return [r3(gains[Math.floor(0.025 * B)]), r3(gains[Math.floor(0.975 * B) - 1])];
+}
 function selectParams(rows, K) {
   const base = evalParams(rows, DEFAULTS, K); let best = { p: DEFAULTS, ...base };
   for (const alpha of GRID.alpha) for (const kappa of GRID.kappa) for (const rho of GRID.rho) for (const tau of GRID.tau) {
     const p = { alpha, kappa, rho, tau }; const e = evalParams(rows, p, K); if (e.J > best.J + 1e-9) best = { p, ...e };
   }
-  const adopt = best.J >= base.J + MIN_GAIN; const chosen = adopt ? best : { p: DEFAULTS, ...base };
-  return { params: chosen.p, adopte: adopt, K, parDefaut: { J: r3(base.J), pouceBas: r3(base.pouceBas), valeurMoyenne: r3(base.valeurMoyenne), coeurs: r3(base.coeurs) }, retenu: { J: r3(chosen.J), pouceBas: r3(chosen.pouceBas), valeurMoyenne: r3(chosen.valeurMoyenne), coeurs: r3(chosen.coeurs) } };
+  const gainOk = best.J >= base.J + MIN_GAIN; const ic = gainOk ? bootstrapGain(rows, DEFAULTS, best.p, K) : null;
+  const adopt = gainOk && ic[0] > 0;                                     // adopté seulement si l'avantage résiste à la marge d'erreur (le bruit ne décide jamais)
+  const chosen = adopt ? best : { p: DEFAULTS, ...base };
+  return { params: chosen.p, adopte: adopt, K, ic95GainJ: ic, meilleurTrouve: gainOk ? { ...best.p, J: r3(best.J) } : null, parDefaut: { J: r3(base.J), pouceBas: r3(base.pouceBas), valeurMoyenne: r3(base.valeurMoyenne), coeurs: r3(base.coeurs) }, retenu: { J: r3(chosen.J), pouceBas: r3(chosen.pouceBas), valeurMoyenne: r3(chosen.valeurMoyenne), coeurs: r3(chosen.coeurs) } };
 }
 function safetyCurve(rows, alpha) {
   return TAUS.map((tau) => {
@@ -91,14 +113,17 @@ function stageLosses({ rows, passes, vecOf, pctList = [5, 10, 25] }) {
   return out;
 }
 function summarize({ rows, key, passes, vecOf, folds }) {
-  const out = { key, at: new Date().toISOString(), folds, titres: rows.length, params: {}, selection: {}, courbeSecurite: {}, calibrationRisque: {}, methode: 'valeur de réglage : ❤️ +3, 👍 +1, pouce en bas −4 ; K premiers titres = 3 % du type (au moins 15)' };
+  const out = { key, at: new Date().toISOString(), folds, titres: rows.length, params: {}, selection: {}, courbeSecurite: {}, calibrationRisque: {}, calibrationApres: {}, calib: {}, methode: 'valeur de réglage : ❤️ +3, 👍 +1, pouce en bas −4 ; K premiers titres = 10 % du type (30 au moins), P(apprécié) calibrée par régression isotone hors échantillon ; un réglage n\'est adopté que si son gain a un intervalle à 95 % au-dessus de zéro' };
   for (const type of ['movie', 'series']) {
-    const rs = rows.filter((r) => r.type === type); if (rs.length < 40) { out.params[type] = DEFAULTS; out.selection[type] = { ignore: 'historique trop court' }; continue; }
-    const K = Math.max(15, Math.round(rs.length * 0.03)); const sel = selectParams(rs, K);
-    out.params[type] = sel.params; out.selection[type] = { adopte: sel.adopte, K: sel.K, parDefaut: sel.parDefaut, retenu: sel.retenu };
-    out.courbeSecurite[type] = safetyCurve(rs, sel.params.alpha); out.calibrationRisque[type] = riskCalibration(rs);
+    const raw = rows.filter((r) => r.type === type); if (raw.length < 40) { out.params[type] = DEFAULTS; out.selection[type] = { ignore: 'historique trop court' }; continue; }
+    out.calibrationRisque[type] = riskCalibration(raw);
+    const cal = fitCalibration(raw); out.calib[type] = cal;
+    const rs = cal ? raw.map((r) => ({ ...r, b: { ...r.b, pPosBrute: r.b.pPos, pPos: calibrate(cal, r.b.pPos) } })) : raw; if (cal) out.calibrationApres[type] = riskCalibration(rs);
+    const K = Math.min(150, Math.max(30, Math.round(rs.length * 0.10))); const sel = selectParams(rs, K);
+    out.params[type] = sel.params; out.selection[type] = { adopte: sel.adopte, K: sel.K, ic95GainJ: sel.ic95GainJ, meilleurTrouve: sel.meilleurTrouve, parDefaut: sel.parDefaut, retenu: sel.retenu };
+    out.courbeSecurite[type] = safetyCurve(rs, sel.params.alpha);
   }
   out.pertes = stageLosses({ rows, passes, vecOf });
   return out;
 }
-module.exports = { crossValidate, summarize, selectParams, evalParams, safetyCurve, riskCalibration, stageLosses, scoreOf, LAMBDA, VALUE, DEFAULTS, GRID, MIN_GAIN };
+module.exports = { fitCalibration, calibrate, bootstrapGain, crossValidate, summarize, selectParams, evalParams, safetyCurve, riskCalibration, stageLosses, scoreOf, LAMBDA, VALUE, DEFAULTS, GRID, MIN_GAIN };

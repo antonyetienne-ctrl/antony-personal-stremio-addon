@@ -107,6 +107,32 @@ CANDIDATS : ${JSON.stringify(candidats)}`;
 }
 
 // Lecture tolérante de la réponse d'arbitrage : tableau direct ou objet, clés variantes, identifiants nus, scores en fraction (0-1) ou en points (0-100).
+
+// ---- VARIANTE C (validée par l'utilisateur) : comparaison à l'historique par PROXIMITÉ, sans résumé d'ADN, sans filtres, sans jugement de qualité.
+// Version SANS les titres 👍 (celle de la 7.7.0) : sert au grand test comparatif (src/gemab.js)
+function comparePromptSans({ candidats }) {
+  return `Tu compares des candidats (films ou séries) à des titres de l'historique d'un spectateur. Tu ne juges JAMAIS la qualité ni la réputation d'un titre : seulement la ressemblance de l'expérience de visionnage.
+
+Pour chaque candidat, tu reçois :
+- ses caractéristiques (titre, année, genres, mots-clés, synopsis) ;
+- "adores" : les 3 titres de l'historique que le spectateur a ADORÉS (❤️, coup de cœur : le signal positif maximal) et qui lui ressemblent le plus ;
+- "non_aimes" : les 3 titres de l'historique que le spectateur a vus SANS LES AIMER (✗) et qui lui ressemblent le plus.
+
+Pour chaque candidat, réponds :
+1. "proche_des_adores" (0-100) : à quel point l'expérience du candidat (univers, ton, rythme, type d'intrigue, humour, enjeux, public visé) ressemble à celle des titres adorés.
+2. "proche_des_non_aimes" (0-100) : la même question avec les titres vus sans les aimer.
+3. "connaissance" (0-100) : à quel point tu connais réellement ce titre. Titre récent ou peu connu : mets une valeur basse et compare d'après le synopsis, sans rien inventer.
+4. "motif" : 14 mots maximum, qui nomme le titre voisin le plus proche.
+
+Règles : compare uniquement l'expérience de visionnage ; un genre n'est ni bon ni mauvais en soi ; les notes sont indépendantes (un candidat peut ressembler à plusieurs groupes, ou à aucun) ; utilise toute l'échelle ; si les voisins fournis ne sont pas pertinents, dis-le par une note basse plutôt que de forcer une ressemblance.
+
+Réponds UNIQUEMENT en JSON strict :
+{"evaluations": [{"id": ..., "proche_des_adores": 0, "proche_des_non_aimes": 0, "connaissance": 0, "motif": "..."}]}
+
+CANDIDATS : ${JSON.stringify(candidats)}`;
+}
+
+// Lecture tolérante de la réponse d'arbitrage : tableau direct ou objet, clés variantes, identifiants nus, scores en fraction (0-1) ou en points (0-100).
 function parseEvaluations(r, byId) {
   const shape = r === null || r === undefined ? 'null' : Array.isArray(r) ? `array[${r.length}]` : `objet{${Object.keys(r).slice(0, 6).join(',')}}`;
   let list = null;
@@ -143,4 +169,4 @@ function parseEvaluations(r, byId) {
   return { map, shape, listLength: list.length };
 }
 
-module.exports = { comparePrompt, parseEvaluations, Gemini, pickModel, extractJson };
+module.exports = { comparePromptSans, comparePrompt, parseEvaluations, Gemini, pickModel, extractJson };

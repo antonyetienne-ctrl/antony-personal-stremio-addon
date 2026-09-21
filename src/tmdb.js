@@ -117,6 +117,7 @@ class Tmdb {
     if (ok) { this.dirtyShards.clear(); this.idmapDirty = false; }
     return { written: ok ? entries.length : 0, ok };
   }
+  touch(rec) { this.dirtyShards.add(key.tmdb(rec.k, shardOf(rec.i))); }          // fiche complétée après coup (personnes, recommandations) : sera réécrite au prochain enregistrement du cache
   _put(rec) { this.ram.set(rec.k + rec.i, rec); this.dirtyShards.add(key.tmdb(rec.k, shardOf(rec.i))); }
 
   // ---------- IMDb -> TMDB ----------
@@ -169,6 +170,7 @@ class Tmdb {
 
   // ---------- listes ----------
   async discover(kind, params, opts) { return this.get(`/discover/${kind}`, { include_adult: false, ...params }, { label: 'discover', ...opts }); }
+  async credits(kind, id) { return this.get(`/${kind}/${id}/credits`, {}, { label: 'credits' }); }
   async related(kind, id, what, page = 1) { return this.get(`/${kind}/${id}/${what}`, { page }, { label: what }); }
   async season(tvId, n) {
     const k = `${tvId}:${n}`; const c = this.seasonCache.get(k); if (c) return c;

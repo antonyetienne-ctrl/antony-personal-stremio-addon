@@ -10,7 +10,10 @@ const { hashInt } = require('./util');
 
 const VARIANTS = [
   { id: 'C_prototypes', label: '+ prototypes/kNN/clusters + empilement', cfg: { inter: 2, stack: true } },
-  { id: 'D_triplets', label: '+ triplets', cfg: { inter: 2, triples: true, stack: true } }
+  { id: 'D_triplets', label: '+ triplets', cfg: { inter: 2, triples: true, stack: true } },
+  { id: 'E_people', label: '+ réalisateur, compositeur, acteurs', cfg: { inter: 2, stack: true, people: true } },
+  { id: 'F_reco', label: '+ ce que recommandent les autres (❤️ et 👍 seulement)', cfg: { inter: 2, stack: true, reco: true } },
+  { id: 'G_people_reco', label: '+ personnes et recommandations', cfg: { inter: 2, stack: true, people: true, reco: true } }
 ];
 const GAIN_TO_ADOPT = 0.004;   // une variante plus complexe n'est adoptée que si elle gagne au moins autant en AUC
 

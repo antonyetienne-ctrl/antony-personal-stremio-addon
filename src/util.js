@@ -93,7 +93,7 @@ class Spans {
   constructor() { this.tot = {}; this.open = {}; }
   start(n) { this.open[n] = process.hrtime.bigint(); }
   end(n) { const s = this.open[n]; if (s === undefined) return 0; delete this.open[n]; const d = Number(process.hrtime.bigint() - s) / 1e6; this.tot[n] = (this.tot[n] || 0) + d; return d; }
-  async wrap(n, fn) { this.start(n); try { return await fn(); } finally { this.end(n); } }
+  async wrap(n, fn) { this.start(n); try { return await fn(); } finally { this.end(n); try { require('./memory').guard(n); } catch { /* facultatif */ } } }
   snapshot() { const o = {}; for (const [k, v] of Object.entries(this.tot)) o[k] = Math.round(v); return o; }
 }
 function fmtDuration(ms) {

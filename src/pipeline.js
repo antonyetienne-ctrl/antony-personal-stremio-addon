@@ -5,36 +5,41 @@
 //  ensuite : filtres durs sur fiches complètes, exclusion des vus/commencés, scoring 70/30 de TOUS les candidats.
 const { mapLimit, log } = require('./util');
 const { rowReject, rejectReason } = require('./filters');
-const { hashedVec } = require('./features');
+const { hashedVec, forgetRaw } = require('./features');
 const { scoreProfile, blendScores, recipeMatches, utilityOf, SAFETY_LAMBDA } = require('./model');
 const { TOP_N } = require('./config');
 
-const PAGE_CAP = 250;          // 5 000 lignes par tri (TMDB accepte jusqu'à 500 pages) : l'univers admissible (≈ 4 200 films, ≈ 2 400 séries) est énuméré EN ENTIER par un seul tri
-const CALL_BUDGET = 320;       // appels /discover max par type et par calcul
+const PAGE_CAP = 500;          // TMDB : 500 pages (10 000 lignes) au plus par requête
+const CALL_BUDGET = Number(process.env.DISCOVER_CALL_BUDGET || 900);       // appels /discover max par type et par calcul
 
+// Énumère l'univers admissible EN ENTIER : une requête (triée par votes) si elle tient dans 500 pages, sinon l'intervalle d'années est COUPÉ EN DEUX, récursivement, jusqu'à ce que chaque tranche tienne.
+// `complete` n'est vrai que si toutes les pages de toutes les tranches ont été lues.
 async function enumerateRows(tmdb, kind, settings, type, { gate, onProgress } = {}) {
   const t = settings[type];
   const numeric = t.exclude.filter((x) => typeof x === 'number');
-  const base = { 'vote_average.gte': t.minRating, 'vote_count.gte': t.minVotes };
+  const base = { 'vote_average.gte': t.minRating, 'vote_count.gte': t.minVotes, sort_by: 'vote_count.desc' };
   if (numeric.length) base.without_genres = numeric.join(',');
   if (type === 'movie' && t.minRuntime) base['with_runtime.gte'] = t.minRuntime;
-  if (t.minYear) base[type === 'movie' ? 'primary_release_date.gte' : 'first_air_date.gte'] = `${t.minYear}-01-01`;
-  const rows = new Map(); let calls = 0, complete = false, totalResults = 0, errors = 0;
-  for (const sort of ['vote_count.desc', 'vote_average.desc', 'popularity.desc']) {
-    let first;
-    try { first = await tmdb.discover(kind, { ...base, sort_by: sort, page: 1 }); calls++; } catch { errors++; continue; }
-    totalResults = Math.max(totalResults, first.total_results || 0);
-    const pages = Math.min(first.total_pages || 1, PAGE_CAP);
+  const dateKey = type === 'movie' ? 'primary_release_date' : 'first_air_date';
+  const rows = new Map(); const ctx = { calls: 0, errors: 0, totalResults: 0, complete: true, windows: 0 };
+  const y0 = t.minYear || (type === 'movie' ? 1900 : 1930), y1 = new Date().getUTCFullYear() + 1;
+  async function walk(a, b) {
+    const params = { ...base, [`${dateKey}.gte`]: `${a}-01-01`, [`${dateKey}.lte`]: `${b}-12-31` };
+    if (ctx.calls >= CALL_BUDGET) { ctx.complete = false; return; }
+    let first; try { first = await tmdb.discover(kind, { ...params, page: 1 }); ctx.calls++; } catch { ctx.errors++; ctx.complete = false; return; }
+    const tp = first.total_pages || 1;
+    if (tp > PAGE_CAP && a < b) { const mid = Math.floor((a + b) / 2); await walk(a, mid); await walk(mid + 1, b); return; }
+    if (tp > PAGE_CAP) ctx.complete = false;                       // une seule année dépasse 10 000 lignes (irréaliste) : partielle
+    ctx.windows++; ctx.totalResults += first.total_results || 0;
     for (const r of first.results || []) rows.set(r.id, r);
-    const todo = []; for (let p = 2; p <= pages && calls + todo.length < CALL_BUDGET; p++) todo.push(p);
-    const { results, errors: e } = await mapLimit(todo, 6, (p) => tmdb.discover(kind, { ...base, sort_by: sort, page: p }), gate);
-    calls += todo.length; errors += e;
+    const todo = []; for (let p = 2; p <= Math.min(tp, PAGE_CAP); p++) { if (ctx.calls + todo.length >= CALL_BUDGET) { ctx.complete = false; break; } todo.push(p); }
+    const { results, errors } = await mapLimit(todo, 6, (p) => tmdb.discover(kind, { ...params, page: p }), gate);
+    ctx.calls += todo.length; ctx.errors += errors; if (errors) ctx.complete = false;
     for (const res of results) for (const r of (res && res.results) || []) rows.set(r.id, r);
-    onProgress && onProgress(`énumération ${type} (${sort})`, rows.size);
-    if ((first.total_pages || 1) <= PAGE_CAP) { complete = e === 0; break; }   // univers entièrement couvert par ce tri
-    if (calls >= CALL_BUDGET) break;
+    onProgress && onProgress(`énumération ${type}`, rows.size);
   }
-  return { rows, complete, calls, errors, totalResults };
+  await walk(y0, y1);
+  return { rows, complete: ctx.complete, calls: ctx.calls, errors: ctx.errors, totalResults: ctx.totalResults, windows: ctx.windows };
 }
 
 async function seedRows(tmdb, kind, seedIds, { gate } = {}) {
@@ -90,16 +95,18 @@ function admissible(recs, { settings, type, seenImdb }) {
 
 // Score de tous les candidats : 70 % profil du type + 30 % profil global ; utilité = mu − κσ − ρ·fp − pénalité toxique
 // safety : { tau } = seuil de risque estimé de pouce en bas (1 − P(apprécié)) au-delà duquel un titre est fortement rétrogradé (réglé par type par la validation croisée) ; les titres restent classés : le Top est toujours complet
-async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, rank, safety, yielder }) {
+async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, rank, safety, calib, yielder }) {
   const out = [];
   for (let i = 0; i < recs.length; i++) {
     const rec = recs[i]; const item = { rec, vec: hashedVec(rec, corpus), _sim: new Map() };
     const s = blendScores(scoreProfile(profType, item), scoreProfile(profGlobal, item));
+    if (calib) { s.pPosBrute = s.pPos; s.pPos = require('./cv').calibrate(calib, s.pPos); }       // probabilité d'être apprécié recalée sur la fréquence observée hors échantillon
     let tox = 0; const hits = [];
     for (const t of toxic || []) if (recipeMatches(rec, t.parts)) { tox += t.conf * 0.06; hits.push(t.id); }
     tox = Math.min(0.12, tox);
     const risqueNeg = 1 - s.pPos;
     const util = utilityOf(s, rank) - (risk.kappa || 0) * s.sigma - (risk.rho || 0) * s.fp - tox - (safety && Number.isFinite(safety.tau) ? SAFETY_LAMBDA * Math.max(0, risqueNeg - safety.tau) : 0);
+    item._sim = null; forgetRaw(rec);                 // libère les similarités et les caractéristiques de CE candidat (environ 100 Ko) : le classement ne dépend que de `s` et de `util`
     out.push({ rec, item, s, tox, toxicHits: hits, util, risqueNeg });
     if (yielder && i % 40 === 0) await yielder();
   }

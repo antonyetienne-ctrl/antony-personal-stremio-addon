@@ -6,9 +6,10 @@ const STOP = new Set(('le la les un une des du de d l et en a au aux ce cet cett
   'the and with from that this into their they them have has for are was were his her its our your about after before through while where when will would there than then who what which how also more most some such only other first last new old').split(' ').map(norm));
 const tokenize = (text) => norm(text).split(/[^a-z0-9]+/).filter((t) => t.length >= 4 && !STOP.has(t));
 
-const RAW = new WeakMap();
+let RAW = new WeakMap();
+const forgetRaw = (rec) => { RAW.delete(rec); }, clearRaw = () => { RAW = new WeakMap(); };      // caches recalculables : vidés après chaque candidat noté / sous pression mémoire
 function rawFeatures(rec) {
-  const sig = `${rec.ir}|${rec.iv}`;
+  const sig = `${rec.ir}|${rec.iv}|${rec.pe ? rec.pe.length : ''}|${rec.rl === undefined ? '' : rec.rl + ':' + rec.rk}`;
   let hit = RAW.get(rec); if (hit && hit.sig === sig) return hit.f;
   const f = new Map();
   const add = (k, w) => f.set(k, (f.get(k) || 0) + w);
@@ -30,6 +31,8 @@ function rawFeatures(rec) {
     if (rec.va) add('q:r' + Math.max(0, Math.min(9, Math.floor((rec.va - 5) * 2))), 0.5);
     if (rec.vc) add('q:v' + Math.min(8, Math.floor(Math.log10(Math.max(1, rec.vc)) * 2)), 0.3);
   }
+  for (const p of rec.pe || []) add('pe:' + p, 0.6);                                                   // personnes (mesurées : variante E)
+  if (rec.rl !== undefined) { const sc = (n) => 0.9 * Math.min(1, Math.log1p(n || 0) / Math.log(6)); add('rc:love', sc(rec.rl)); add('rc:like', sc(rec.rk)); }      // recommandations des autres reliées à tes ❤️ / 👍 (variante F)
   const tf = new Map();
   for (const t of tokenize(rec.ov)) tf.set(t, (tf.get(t) || 0) + 1);
   for (const [t, c] of tf) add('w:' + t, 0.35 * (1 + Math.log(c)));
@@ -56,7 +59,7 @@ function fnv(str) {
 // vecteur dense haché (projection signée) : sert à la similarité cosinus, aux prototypes et aux clusters
 function hashedVec(rec, corpus, dim = 256) {
   const v = new Float32Array(dim);
-  for (const [k, w] of rawFeatures(rec)) { if (k.startsWith('q:')) continue; const h = fnv(k); v[h % dim] += ((h >>> 16) & 1 ? 1 : -1) * w * corpus.idf(k); }
+  for (const [k, w] of rawFeatures(rec)) { if (k.startsWith('q:') || k.startsWith('pe:') || k.startsWith('rc:')) continue; const h = fnv(k); v[h % dim] += ((h >>> 16) & 1 ? 1 : -1) * w * corpus.idf(k); }
   let n = 0; for (let i = 0; i < dim; i++) n += v[i] * v[i];
   n = Math.sqrt(n) || 1; for (let i = 0; i < dim; i++) v[i] /= n;
   return v;
@@ -73,11 +76,11 @@ function encodeSparse(rec, dict, corpus, extraKeys = []) {
   for (let i = 0; i < val.length; i++) val[i] *= s;
   return { idx: Int32Array.from(idx), val: Float32Array.from(val) };
 }
-function buildDict(recs, minDf = 2) {
+function buildDict(recs, minDf = 2, keep = null) {
   const df = new Map();
   for (const r of recs) for (const k of rawFeatures(r).keys()) df.set(k, (df.get(k) || 0) + 1);
   const d = new Map();
-  for (const [k, c] of df) if (c >= minDf) d.set(k, d.size);
+  for (const [k, c] of df) if (c >= (k.startsWith('pe:') ? Math.max(minDf, 3) : minDf) && (!keep || keep(k))) d.set(k, d.size);
   return d;
 }
 
@@ -106,4 +109,4 @@ function nameOfKey(namer, key) {
   return namer(key);
 }
 
-module.exports = { tokenize, rawFeatures, Corpus, hashedVec, encodeSparse, buildDict, makeNamer, nameOfKey, fnv };
+module.exports = { forgetRaw, clearRaw, tokenize, rawFeatures, Corpus, hashedVec, encodeSparse, buildDict, makeNamer, nameOfKey, fnv };

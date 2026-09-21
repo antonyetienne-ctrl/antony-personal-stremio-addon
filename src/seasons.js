@@ -1,11 +1,13 @@
 'use strict';
 // 🔔 NOUVELLES SAISONS DISPONIBLES. Règles (validées par l'utilisateur) :
 //  - séries MARQUÉES VUES (macaron : au moins un épisode terminé, règle « vu » du moteur) ET notées 👍 ou ❤️ ; les saisons précédentes (vues ou non) n'ont aucune importance ;
-//  - une série s'affiche quand une saison est sortie il y a MOINS de 12 mois (365 jours) (date du premier épisode de la saison) ;
-//  - elle disparaît quand la saison a plus de 12 mois OU quand TOUS les épisodes de cette saison (sortis ou déjà annoncés) sont marqués vus.
-// Lecture des épisodes vus : la liste `state.watched` de Stremio, « épisodeD'ancrage:longueur:bits compressés », alignée sur la liste d'épisodes de la série (Cinemeta, à défaut TMDB).
-// Le décodage est CONTRÔLÉ (le dernier bit à 1 doit être l'épisode d'ancrage, dans l'un des deux ordres de bits possibles) ; en cas de doute la série reste affichée (jamais cachée à tort)
-// jusqu'à la limite des 90 jours. Lecture seule, aucune écriture Upstash ; TMDB et Cinemeta en mémoire (6 h / 12 h).
+//  - une NOUVELLE saison est une saison n° 2 ou plus (la saison 1 d'une série déjà vue n'est jamais « nouvelle ») dont le PREMIER ÉPISODE est déjà sorti depuis moins de 12 mois (365 jours) ;
+//    une saison annoncée pour plus tard est ignorée ;
+//  - elle disparaît quand la saison a plus de 12 mois OU quand TOUS ses épisodes SORTIS (pas les épisodes seulement annoncés) sont marqués vus.
+// Lecture des épisodes vus : la liste `state.watched` de Stremio, « épisodeD'ancrage:longueur:bits compressés » (bits dans l'ordre « lsb »), alignée sur la liste d'épisodes de la série
+// (Cinemeta, à défaut TMDB). Deux formes réelles : épisodes regardés un à un (le dernier bit à 1 est l'ancre) ; saison ou série marquée « vue » en une fois (l'ancre est un épisode quelconque
+// dont le bit est à 1, les bits vont au-delà) ; une liste incohérente est refusée et la série reste affichée par prudence (jamais cachée à tort) jusqu'à la limite des 12 mois.
+// Lecture seule, aucune écriture Upstash ; TMDB et Cinemeta en mémoire (6 h / 12 h).
 const zlib = require('zlib');
 const { fetchJson, clock, mapLimit, LRU, log } = require('./util');
 const { classify } = require('./stremio');
@@ -26,19 +28,20 @@ function parseWatched(str) {
 }
 const bitAt = (bytes, i, order) => { const b = bytes[i >> 3]; if (b === undefined) return 0; return order === 'msb' ? (b >> (7 - (i & 7))) & 1 : (b >> (i & 7)) & 1; };
 // videos : identifiants « imdb:saison:épisode » dans l'ordre de Stremio. Renvoie { ok, order, offset, watched:Set } ou { ok:false, why }.
+// Contrôle : l'épisode d'ancrage est dans la liste, son bit est à 1 et TOUS les bits à 1 tombent dans la liste. Deux formes existent :
+//  - épisodes regardés un à un : le dernier bit à 1 est celui de l'ancre ;
+//  - saison marquée vue après coup (constaté : Outlast, Pluribus) : la liste d'ancrage est courte mais des bits à 1 la dépassent ; ils désignent les épisodes SUIVANTS, alignés sur le début de la liste.
 function decodeWatched(parsed, videos) {
   if (!parsed) return { ok: false, why: 'liste d\'épisodes vus illisible' };
   if (!videos || !videos.length) return { ok: false, why: 'aucune liste d\'épisodes de la série' };
   const idx = videos.indexOf(parsed.anchorId); if (idx < 0) return { ok: false, why: 'épisode d\'ancrage absent de la liste d\'épisodes' };
   const offset = idx + 1 - parsed.anchorLen; const nbits = parsed.bytes.length * 8;
-  for (const order of ['lsb', 'msb']) {
-    let last = -1; for (let i = 0; i < nbits; i++) if (bitAt(parsed.bytes, i, order)) last = i;
-    if (last !== parsed.anchorLen - 1) continue;                     // contrôle : le dernier épisode vu est bien l'ancre
-    const watched = new Set();
-    for (let i = 0; i <= last; i++) if (bitAt(parsed.bytes, i, order)) { const v = videos[i + offset]; if (v !== undefined) watched.add(v); }
-    return { ok: true, order, offset, watched };
-  }
-  return { ok: false, why: 'contrôle du dernier épisode vu non concordant' };
+  const read = (order) => { let last = -1; const watched = new Set(); let bad = false; for (let i = 0; i < nbits; i++) if (bitAt(parsed.bytes, i, order)) { last = i; const v = videos[i + offset]; if (v === undefined) bad = true; else watched.add(v); } return { last, watched, bad }; };
+  // 1) forme stricte (épisodes regardés un à un) : le dernier bit à 1 EST celui de l'ancre ; les deux ordres de bits sont essayés (le format réel de Stremio est « lsb »)
+  for (const order of ['lsb', 'msb']) { const r = read(order); if (!r.bad && r.last === parsed.anchorLen - 1) return { ok: true, order, offset, watched: r.watched }; }
+  // 2) saison marquée vue après coup (constaté : Outlast, Pluribus) : des bits à 1 dépassent l'ancre ; seul l'ordre réel « lsb » est accepté, l'ancre doit être à 1 et tous les bits doivent tomber dans la liste
+  { const r = read('lsb'); if (!r.bad && r.watched.size && bitAt(parsed.bytes, parsed.anchorLen - 1, 'lsb') && r.last >= parsed.anchorLen - 1) return { ok: true, order: 'lsb', offset, watched: r.watched, apres: true }; }
+  return { ok: false, why: 'lecture non concordante avec la liste d\'épisodes' };
 }
 // (tests / outils) fabrique une liste « ancre:longueur:bits » à partir des indices d'épisodes vus dans `videos`
 function encodeWatched(videos, watchedIdx, { order = 'lsb', compress = true } = {}) {
@@ -88,16 +91,20 @@ class NewSeasons {
     const d = await tmdb.get(`/tv/${id}`, {}, { label: 'tv-seasons' }).catch(() => null);
     if (!d || !Array.isArray(d.seasons)) return hit ? hit.recent : null;         // échec réseau : on garde l'ancien résultat
     const now = clock.now();
-    const rec = d.seasons.filter((s) => s.season_number >= 1 && s.air_date && Date.parse(s.air_date) <= now && now - Date.parse(s.air_date) <= this.days * DAY_MS).sort((a, b) => Date.parse(b.air_date) - Date.parse(a.air_date))[0];
+    const rec = d.seasons.filter((s) => s.season_number >= 2 && s.air_date && Date.parse(s.air_date) <= now && now - Date.parse(s.air_date) <= this.days * DAY_MS).sort((a, b) => Date.parse(b.air_date) - Date.parse(a.air_date))[0];
     const recent = rec ? { tmdbId: id, season: rec.season_number, premiere: rec.air_date, epCount: rec.episode_count || 0, seasons: d.seasons.map((s) => ({ season_number: s.season_number, episode_count: s.episode_count || 0 })) } : null;
     this.tv.set(imdb, { at: now, recent }); return recent;
   }
   // état d'une série pour sa saison récente : { total, seen, decode, source, why }
   async statusOf(item, recent, tmdb) {
     const cm = await this.cinemeta(item.imdb);
-    let total = recent.epCount || 0;
-    if (cm) total = Math.max(total, cm.filter((v) => v.season === recent.season).length);
-    try { const s = await tmdb.season(recent.tmdbId, recent.season); if (s && Array.isArray(s.episodes)) total = Math.max(total, s.episodes.length); } catch { /* le total connu suffit */ }
+    // total = épisodes SORTIS de la saison (jamais les épisodes seulement annoncés) ; une source datée prime sur une source sans dates
+    const now = clock.now(); const dated = [], undated = [];
+    const count = (list, dateOf) => { if (list.some((e) => dateOf(e))) dated.push(list.filter((e) => dateOf(e) && Date.parse(dateOf(e)) <= now).length); else undated.push(list.length); };
+    if (cm) count(cm.filter((v) => v.season === recent.season), (v) => v.released);
+    try { const s = await tmdb.season(recent.tmdbId, recent.season); if (s && Array.isArray(s.episodes)) count(s.episodes, (e) => e.air_date); } catch { /* la source restante suffit */ }
+    let total = dated.length ? Math.max(...dated) : (undated.length ? Math.max(...undated) : (recent.epCount || 0));
+    if (!dated.length && recent.epCount) total = Math.max(total, recent.epCount);
     const parsed = parseWatched(item.state && item.state.watched); const res = { total, seen: null, decode: 'indéterminé', source: null, why: null, allWatched: false };
     if (!parsed) {
       const w = item.state && item.state.watched;

@@ -58,7 +58,7 @@ function interKeysFor(rec, inter) {
 
 async function fitA(items, y, w, cfg, corpus, yielder) {
   const recs = items.map((it) => it.rec);
-  const dict = buildDict(recs, 2);
+  const dict = buildDict(recs, 2, (k) => (cfg.people || !k.startsWith('pe:')) && (cfg.reco || !k.startsWith('rc:')));      // personnes / recommandations : seulement dans les variantes qui les demandent
   let inter = null;
   if (cfg.inter >= 2) {
     const orders = cfg.triples ? [2, 3] : [2];
