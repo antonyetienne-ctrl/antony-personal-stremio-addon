@@ -7,15 +7,17 @@ const { clock, log } = require('./util');
 const { key } = require('./config');
 const embed = require('./embed');
 
-// ---- niveaux (sur la probabilité de coup de cœur estimée ; le modèle est un peu trop confiant : seuils calés plus bas que 0,5 / 0,7)
+// ---- niveaux : valeur attendue sur l'échelle de l'utilisateur (❤️ +3, 👍 +1, pouce en bas −1) = 3·P(❤️) + 1·P(👍 seul) − 1·P(pouce en bas)
+const { expectedScale } = require('./model');
 const TIERS = [
-  { id: 'top', min: 0.66, head: 'COUP DE CŒUR TRÈS PROBABLE', icon: '🎯', dots: 5 },
-  { id: 'probable', min: 0.56, head: 'COUP DE CŒUR PROBABLE', icon: '🎯', dots: 4 },
-  { id: 'possible', min: 0.46, head: 'BONNES CHANCES DE TE PLAIRE', icon: '👍', dots: 3 },
-  { id: 'incertain', min: 0.30, head: 'À TENTER, MAIS INCERTAIN', icon: '🤔', dots: 2 },
-  { id: 'peu', min: -1, head: 'PEU DE CHANCES DE TE PLAIRE', icon: '⚠️', dots: 1 }
+  { id: 'top', minE: 1.9, head: 'COUP DE CŒUR TRÈS PROBABLE', icon: '🎯', dots: 5 },
+  { id: 'probable', minE: 1.65, head: 'COUP DE CŒUR PROBABLE', icon: '🎯', dots: 4 },
+  { id: 'possible', minE: 1.35, head: 'BONNES CHANCES DE TE PLAIRE', icon: '👍', dots: 3 },
+  { id: 'incertain', minE: 0.9, head: 'À TENTER, MAIS INCERTAIN', icon: '🤔', dots: 2 },
+  { id: 'peu', minE: -99, head: 'PEU DE CHANCES DE TE PLAIRE', icon: '⚠️', dots: 1 }
 ];
-const tierOf = (pLove, pPos) => { if (pPos !== undefined && pPos < 0.5 && pLove < 0.3) return TIERS[4]; return TIERS.find((t) => pLove >= t.min) || TIERS[4]; };
+// pl = probabilité de ❤️ (les trois issues) ; pPos = probabilité d'être apprécié (❤️ ou 👍)
+const tierOf = (pl, pPos) => { const E = expectedScale(pl, pPos); if (pPos < 0.5 && E < 0.9) return TIERS[4]; return TIERS.find((t) => E >= t.minE) || TIERS[4]; };
 const dots = (n) => '●'.repeat(n) + '○'.repeat(5 - n);
 const NUM = ['', "l'un", 'deux', 'trois'];
 
@@ -57,8 +59,8 @@ const pick = (arr, seed) => arr[Math.abs(seed) % arr.length];
 
 // neighbours : { loved: [{ rec, sim }], disliked: [{ rec, sim }], minSim }  (déjà triés par similarité décroissante)
 // mode : 'top' (titre du Top 30 : toujours un texte) | 'lib' (liste de lecture : seulement si concluant)
-function buildWhy({ rec, pLove, pPos, neighbors, posTraits, negTraits, mode = 'top', seed = 0 }) {
-  const tier = tierOf(pLove, pPos);
+function buildWhy({ rec, pl, pPos, tau = 0.2, neighbors, posTraits, negTraits, mode = 'top', seed = 0 }) {
+  const tier = tierOf(pl, pPos); const risk = 1 - pPos, pct = Math.round(risk * 100);
   if (mode === 'lib' && tier.id === 'incertain') return null;                                  // non concluant : aucun texte
   const nb = neighbors || { loved: [], disliked: [], minSim: 0 };
   const loved = (nb.loved || []).filter((n) => n.sim >= nb.minSim).slice(0, 2);
@@ -79,6 +81,8 @@ function buildWhy({ rec, pLove, pPos, neighbors, posTraits, negTraits, mode = 't
   const closest = disliked[0], bestLoved = loved[0];
   if (closest && (!bestLoved || closest.sim >= bestLoved.sim - 0.04)) lines.push(`⚠️ À surveiller : il ressemble aussi à ${titleOf(closest.rec)}, un titre que tu n'as pas aimé`);
   else { const neg = matchTraits(rec, negTraits, -1, 2); if (neg.length) lines.push(`⚠️ À surveiller : ${joinFr(neg)}, plutôt rare dans tes coups de cœur`); }
+  // sécurité : risque estimé de pouce en bas (1 − chance d'être apprécié) ; au-delà du seuil de sécurité de son type, le titre est signalé comme un peu plus incertain
+  lines.push(risk > tau ? `⚠️ Un peu plus incertain que les autres : risque estimé de déception ${pct} %` : `🛡️ Sécurité ${risk <= 0.1 ? 'très forte' : risk <= 0.2 ? 'forte' : 'correcte'} : risque estimé de déception ${pct} %`);
   if (lines.length === 1) lines.push(mode === 'top' ? 'Sélectionné d\'après l\'ensemble de tes goûts.' : '');
   return { tier: tier.id, text: lines.filter(Boolean).join('\n') };
 }
@@ -116,8 +120,10 @@ class WhyStore {
   }
   text(uid, imdb) { const d = this.ram.get(uid); if (!d) return null; const it = d.items; return (it.movie && it.movie[imdb]) || (it.series && it.series[imdb]) || (it.libMovie && it.libMovie[imdb]) || (it.libSeries && it.libSeries[imdb]) || null; }
 }
+// points de chances (●●●●○) lus dans la première ligne d'un texte « pourquoi » : affichés sous les affiches des catalogues
+const dotsOf = (text) => { const m = /([●○]{5})/.exec(String(text || '').split('\n')[0]); return m ? m[1] : null; };
 const SEPARATOR = '──────────────────';
 // description finale : le texte « pourquoi » puis la fiche d'origine, inchangée
 const withWhy = (why, description) => (why ? `${why}\n${SEPARATOR}\n${description || ''}` : description || '');
 
-module.exports = { TIERS, tierOf, dots, KW_FR, traitList, matchTraits, buildWhy, neighborsOf, WhyStore, withWhy, SEPARATOR };
+module.exports = { dotsOf, TIERS, tierOf, dots, KW_FR, traitList, matchTraits, buildWhy, neighborsOf, WhyStore, withWhy, SEPARATOR };

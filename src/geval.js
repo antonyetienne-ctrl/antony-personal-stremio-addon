@@ -87,7 +87,7 @@ async function evaluate(ctx) {
     const nItems = Math.min(scored.length, MAX_ITEMS), need = Math.ceil(nItems / BATCH);
     const left = typeof gem._quotaLeft === 'function' ? gem._quotaLeft() : 99;
     if (left < need) return { skipped: `quota quotidien Gemini insuffisant (${left} requête(s) restante(s), il en faut ${need})` };
-    const lovedDev = dev.filter((i) => i.label === 2 && i.vec), rejDev = dev.filter((i) => i.label === 0 && i.vec);
+    const lovedDev = dev.filter((i) => i.label === 2 && i.vec), rejDev = dev.filter((i) => i.label === 0 && i.vec), likedDev = dev.filter((i) => i.label === 1 && i.vec);
     if (lovedDev.length < 10 || rejDev.length < 10) return { skipped: 'historique d\'apprentissage trop court pour trouver des voisins (moins de 10 adorés ou de 10 non aimés)' };
     // titres de TEST, ordre pseudo-aléatoire reproductible, en lots de 50
     const items = scored.slice().sort((a, b) => hashInt('geval' + a.it.key) - hashInt('geval' + b.it.key)).slice(0, MAX_ITEMS);
@@ -96,7 +96,7 @@ async function evaluate(ctx) {
       const chunk = items.slice(i, i + BATCH); const byId = new Map();
       const cards = chunk.map((s, j) => {
         const id = 't' + (i + j + 1); byId.set(id, s.it.key); const r = s.it.rec; const c = { item: s.it };
-        return { id, titre: r.t, annee: r.y, genres: r.gn || [], mots_cles: (r.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (r.ov || '').slice(0, 180), ...(() => { const nb = neighborsFor ? neighborsFor(s.it, lovedDev, rejDev) : null; return { adores: nb ? nb.adores : nearestK(c, lovedDev, 3), non_aimes: nb ? nb.non_aimes : nearestK(c, rejDev, 3) }; })() };
+        return { id, titre: r.t, annee: r.y, genres: r.gn || [], mots_cles: (r.kw || []).slice(0, 8).map((k) => k[1]), synopsis: (r.ov || '').slice(0, 180), ...(() => { const nb = neighborsFor ? neighborsFor(s.it, lovedDev, rejDev, likedDev) : null; return { adores: nb ? nb.adores : nearestK(c, lovedDev, 3), apprecies: nb ? nb.apprecies : nearestK(c, likedDev, 2), non_aimes: nb ? nb.non_aimes : nearestK(c, rejDev, 3) }; })() };
       });
       const res = await gem.json(comparePrompt({ candidats: cards })); batches++;
       const pe = parseEvaluations(res, byId);
@@ -138,7 +138,7 @@ async function evaluate(ctx) {
     // désaccords : ❤️ que Gemini juge très éloignés des adorés / titres non aimés qu'il juge très proches des adorés
     const dis = rows.map((r, i) => ({ titre: r.s.it.rec.t, annee: r.s.it.rec.y, reel: lab(r.s.it.label), net: Math.round(r.gm.fit), procheDesAdores: r.gm.sim ? Math.round(r.gm.sim.adores) : null, procheDesNonAimes: r.gm.sim ? Math.round(r.gm.sim.nonAimes) : null, rangLocalPct: Math.round(rk.lLove[i] * 100), motif: r.gm.note || undefined }));
     return {
-      at: new Date().toISOString(), model: gem.model || null, variante: 'C (proximité)', voisins: neighborsFor ? 'sémantiques (embeddings)' : 'genres + mots-clés', titresEvalues: n, titresHorsFiltres: horsFiltres, lots: batches, requetesGemini: batches,
+      at: new Date().toISOString(), model: gem.model || null, variante: 'C (proximité : adorés, appréciés, non aimés)', voisins: neighborsFor ? 'sémantiques (embeddings)' : 'genres + mots-clés', titresEvalues: n, titresHorsFiltres: horsFiltres, lots: batches, requetesGemini: batches,
       protocole: 'production : mêmes prompt et mêmes cartes (3 adorés et 3 non aimés les plus proches, tirés de l\'apprentissage seulement), ni ADN rédigé, ni filtres, ni score local ; seuls les titres qui respectent les filtres actuels sont mesurés',
       aucCoupDeCoeur: { local: base.aucCoupDeCoeur, geminiSeul: gemOnly.aucCoupDeCoeur, ic95Local: ic(A), ic95GeminiSeul: ic(B) },
       aucApprecie: { local: base.aucApprecie, geminiSeul: gemOnly.aucApprecie },

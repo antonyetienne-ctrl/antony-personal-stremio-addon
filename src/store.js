@@ -38,7 +38,7 @@ class Store {
     try {
       const body = JSON.stringify(cmd);
       this.stats.bytesOut += body.length;
-      const res = await fetchJson(this.url, { method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }, body, timeoutMs: 7000, retries: 1, label: 'upstash' });
+      const res = await fetchJson(this.url, { method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }, body, timeoutMs: 7000, retries: /^(SET|DEL|SADD|SREM|EXPIRE|HSET)$/i.test(String(cmd[0])) ? 2 : 1, label: 'upstash' });      // écritures : 3 essais (idempotentes), lectures : 2
       this._count([cmd], label);
       if (res && res.error) throw new Error(res.error);
       const r = res ? (res.result ?? null) : null;
@@ -53,7 +53,7 @@ class Store {
     try {
       const body = JSON.stringify(cmds);
       this.stats.bytesOut += body.length;
-      const res = await fetchJson(`${this.url}/pipeline`, { method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }, body, timeoutMs: 12000, retries: 1, label: 'upstash' });
+      const res = await fetchJson(`${this.url}/pipeline`, { method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' }, body, timeoutMs: 12000, retries: cmds.some((c) => /^(SET|DEL|SADD|SREM|EXPIRE|HSET)$/i.test(String(c[0]))) ? 2 : 1, label: 'upstash' });
       this._count(cmds, label);
       if (!Array.isArray(res)) throw new Error('pipeline: réponse invalide');
       this._ok();

@@ -2,7 +2,9 @@
 // Modèle de goût. Trois niveaux (Films / Séries / Global), chacun :
 //   tâche 1 : P(apprécié | œuvre)  = ❤️+👍 contre "vu sans appréciation" (les négatifs pèsent selon la qualité TMDB de l'œuvre)
 //   tâche 2 : P(❤️ | apprécié)    = ce qui distingue un ❤️ d'un 👍 (apprise UNIQUEMENT sur les positifs)
-//   utilité attendue : mu = P(apprécié) × (1 + (U−1)·P(❤️|apprécié)) / U   avec U = 3 (❤️ vaut 3 👍)
+//   ÉCHELLE STRICTE (exigence de l'utilisateur) : ❤️ = +3, 👍 = +1, vu sans note = −1 (pouce en bas, symétrique du 👍) ; le 👍 n'est JAMAIS regroupé avec le vu sans note :
+//   tâche « apprécié » : un ❤️ pèse 3 (les 👍 et les vus sans note pèsent 1) ; tâche « ❤️ direct » : ❤️ contre vu sans note, les 👍 sont EXCLUS (ils ne sont ni des ❤️ ni des rejets) ;
+//   valeur attendue d'un titre : 3·P(❤️) + 1·P(👍 seul) − 1·P(pouce en bas)
 // Chaque tâche empile : (A) régression logistique creuse (features + interactions ordre 2/3),
 // (B) prototypes/kNN/clusters multi-pôles positifs ET négatifs, puis une régression d'empilement entraînée sur des
 // prédictions hors-échantillon (validation croisée) : pas de fuite, non-linéarité par seuils/saturations/combinaisons.
@@ -10,7 +12,9 @@ const { Corpus, hashedVec, encodeSparse, buildDict, rawFeatures } = require('./f
 const ml = require('./ml');
 
 const U_LOVE = 3;
-const DEFAULT_CFG = { inter: 2, triples: false, stack: true, l2: 0.02, halfLifeDays: null, folds: 4 };
+const DEFAULT_CFG = { inter: 2, triples: false, stack: true, l2: 0.02, halfLifeDays: null, folds: 4, loveWeight: 3 };
+const SCALE = { love: 3, like: 1, none: -1 };
+const SAFETY_LAMBDA = 6;                       // rétrogradation d'un titre dont le risque estimé de pouce en bas dépasse le seuil de sécurité de son type (voir src/cv.js)
 
 const baseKeysOf = (rec, baseSet) => { const out = []; for (const k of rawFeatures(rec).keys()) if (baseSet.has(k)) out.push(k); return out; };
 function combos(list, order, cb) {
@@ -151,25 +155,28 @@ function sampleWeights(items, cfg, ref) {
 async function trainProfile(items, cfg, corpus, yielder) {
   const c = { ...DEFAULT_CFG, ...cfg };
   const y1 = Uint8Array.from(items, (i) => (i.label > 0 ? 1 : 0));
-  const w1 = sampleWeights(items, c);
+  const w1 = sampleWeights(items, c).map((w, i) => (items[i].label === 2 ? w * (c.loveWeight || 1) : w));      // un ❤️ apprend 3 fois plus qu'un 👍 ou qu'un pouce en bas
   const task1 = await trainTask(items, y1, w1, c, corpus, yielder);
   const pos = items.filter((i) => i.label > 0);
   const nLove = pos.filter((i) => i.label === 2).length, nLike = pos.length - nLove;
   let task2 = null;
   if (nLove >= 6 && nLike >= 6) task2 = await trainTask(pos, Uint8Array.from(pos, (i) => (i.label === 2 ? 1 : 0)), pos.map(() => 1), { ...c, folds: 3, inter: c.inter, triples: false }, corpus, yielder);
-  // tâche ❤️ directe : ❤️ contre tout le reste (👍 et vus sans appréciation) — comparée à la décomposition P(apprécié)·P(❤️|apprécié)
-  const taskLove = await trainTask(items, Uint8Array.from(items, (i) => (i.label === 2 ? 1 : 0)), w1, c, corpus, yielder);
-  return { task1, task2, taskLove, keys: items.map((i) => i.key), loveRate: (nLove + 1) / (pos.length + 2), n: items.length, nPos: pos.length, nLove, nNeg: items.length - pos.length, cfg: c };
+  // tâche ❤️ directe : ❤️ contre vu sans note, les 👍 sont EXCLUS (un 👍 n'est pas un pouce en bas) — comparée à la décomposition P(apprécié)·P(❤️|apprécié)
+  const itemsL = items.filter((i) => i.label !== 1);
+  const taskLove = await trainTask(itemsL, Uint8Array.from(itemsL, (i) => (i.label === 2 ? 1 : 0)), sampleWeights(itemsL, c), c, corpus, yielder);
+  return { task1, task2, taskLove, keys: items.map((i) => i.key), keysLove: itemsL.map((i) => i.key), keysPos: pos.map((i) => i.key), loveRate: (nLove + 1) / (pos.length + 2), n: items.length, nPos: pos.length, nLove, nNeg: items.length - pos.length, cfg: c };
 }
 // score d'une œuvre : {pPos, pLove, mu, sigma, fp, parts}
 function scoreProfile(profile, item) {
   const r1 = profile.task1.predict(item);
   const pLove = profile.task2 ? profile.task2.predict(item).p : profile.loveRate;
-  const mu = r1.p * (1 + (U_LOVE - 1) * pLove) / U_LOVE;
+  const mu = r1.p * (1 + (U_LOVE - 1) * pLove) / U_LOVE;      // (conservé pour le diagnostic ; le classement utilise la valeur attendue sur l'échelle)
   const a = ml.sigmoid(r1.parts.zA), k = r1.parts.knnShare == null ? a : r1.parts.knnShare;
   const mean3 = (a + k + r1.p) / 3, dis = Math.sqrt(((a - mean3) ** 2 + (k - mean3) ** 2 + (r1.p - mean3) ** 2) / 3);
   const novelty = r1.parts.maxSim == null ? 0 : Math.max(0, 0.5 - r1.parts.maxSim) / 0.5;
-  const pLoveDirect = profile.taskLove ? profile.taskLove.predict(item).p : null;
+  // ❤️ direct : appris sans les 👍, donc P(❤️ | ❤️ ou pouce en bas) ; ramené à P(❤️) parmi les trois issues en retirant la part de 👍 seul estimée par la décomposition
+  const dec = r1.p * pLove;
+  const pLoveDirect = profile.taskLove ? profile.taskLove.predict(item).p * (1 - Math.max(0, r1.p - dec)) : null;
   return { pPos: r1.p, pLove, pLoveDirect, mu, sigma: Math.min(1, 2 * dis + 0.4 * novelty), fp: r1.parts.knnShare == null ? 0 : 1 - r1.parts.knnShare, parts: r1.parts };
 }
 // 70 % profil du type + 30 % profil global : ratio FIXE (exigence fonctionnelle)
@@ -182,14 +189,18 @@ function blendScores(a, g) {
 // Classement orienté ❤️ : P(❤️) = (1-α)·P(apprécié)·P(❤️|apprécié) + α·P(❤️ direct) ; utilité = P(❤️) + β·P(👍 seul).
 // α et β sont choisis par le backtest (taux de ❤️ dans le Top 30 sur la période de test).
 const DEFAULT_RANK = { alpha: 0.5, beta: 0.33 };
-function utilityOf(s, rank) {
-  const { alpha, beta } = { ...DEFAULT_RANK, ...(rank || {}) };
+// probabilité de ❤️ (les trois issues : ❤️, 👍 seul, pouce en bas) : mélange de la décomposition P(apprécié)·P(❤️|apprécié) et du modèle ❤️ direct
+function loveProb(s, alpha) {
   const dec = s.pPos * s.pLove;
   const pl = s.pLoveDirect == null ? dec : (1 - alpha) * dec + alpha * s.pLoveDirect;
-  return pl + beta * Math.max(0, s.pPos - pl);
+  return Math.max(0, Math.min(s.pPos, pl));
 }
-// Poids d'un négatif (conservé pour compatibilité ; le moteur v7.1 traite un vu-sans-note comme l'inverse d'un 👍 : poids 1) : un film mal noté par TMDB est plus probablement rejeté pour sa qualité que pour son thème.
-const negWeight = (va) => 0.25 + 0.75 / (1 + Math.exp(-((Number(va) || 0) - 6.6) / 0.5));
+// valeur attendue sur l'échelle stricte de l'utilisateur : 3·P(❤️) + 1·P(👍 seul) − 1·P(pouce en bas)
+const expectedScale = (pl, pPos) => SCALE.love * pl + SCALE.like * (pPos - pl) + SCALE.none * (1 - pPos);
+function utilityOf(s, rank) {
+  const { alpha } = { ...DEFAULT_RANK, ...(rank || {}) };
+  return expectedScale(loveProb(s, alpha), s.pPos);
+}
 
 // Recettes négatives candidates (pour analyse Gemini / règle locale) : combinaisons sur-représentées chez les négatifs,
 // avec la note TMDB moyenne des œuvres concernées (pour séparer "thème toxique" et "film médiocre").
@@ -205,4 +216,4 @@ function negativeRecipes(items, cap = 24) {
 }
 function recipeMatches(rec, parts) { const f = rawFeatures(rec); return parts.every((p) => f.has(p)); }
 
-module.exports = { DEFAULT_RANK, utilityOf, U_LOVE, DEFAULT_CFG, W_TYPE, W_GLOBAL, trainProfile, scoreProfile, blendScores, negWeight, negativeRecipes, recipeMatches, mineInteractions, hashedVec, Corpus };
+module.exports = { SAFETY_LAMBDA, SCALE, expectedScale, loveProb, DEFAULT_RANK, utilityOf, U_LOVE, DEFAULT_CFG, W_TYPE, W_GLOBAL, trainProfile, scoreProfile, blendScores, negativeRecipes, recipeMatches, mineInteractions, hashedVec, Corpus };

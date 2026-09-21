@@ -192,12 +192,16 @@ function knnProbs(v, pool, { k = K_NEIGHBORS, tau = TAU_EMB, prior, skipKey } = 
   for (const { sim, item } of nb) { const w = Math.exp((sim - s1) / tau); sw += w; if (item.label > 0) sp += w; if (item.label === 2) sl += w; }
   return { pPos: (sp + PRIOR_W * prior.pos) / (sw + PRIOR_W), pLove: (sl + PRIOR_W * prior.love) / (sw + PRIOR_W), top: s1 };
 }
-const uKnn = (p, beta) => p.pLove + beta * Math.max(0, p.pPos - p.pLove);          // même forme que l'utilité du modèle local
+const uKnn = (p) => 3 * p.pLove + (p.pPos - p.pLove) - (1 - p.pPos);          // valeur attendue sur l'échelle −1 / +1 / +3, comme l'utilité du modèle local
 const cardOf = (rec) => ({ titre: rec.t, annee: rec.y, genres: (rec.gn || []).slice(0, 3), mots_cles: (rec.kw || []).slice(0, 3).map((x) => x[1]) });
-function neighborCards(v, lovedPool, rejPool, k = 3) { return { adores: topK(v, lovedPool, k).map((n) => cardOf(n.item.rec)), non_aimes: topK(v, rejPool, k).map((n) => cardOf(n.item.rec)) }; }
+function neighborCards(v, lovedPool, rejPool, k = 3, likedPool = null) { return { adores: topK(v, lovedPool, k).map((n) => cardOf(n.item.rec)), apprecies: likedPool ? topK(v, likedPool, 2).map((n) => cardOf(n.item.rec)) : [], non_aimes: topK(v, rejPool, k).map((n) => cardOf(n.item.rec)) }; }
 function makeNeighborsFor(vecOf) {                                                   // voisins sémantiques d'un titre de test (pools mémorisés) ; null si le titre n'a pas de vecteur
-  let src = null, L = null, R = null;
-  return (it, lovedDev, rejDev) => { const v = vecOf(it.rec); if (!v) return null; if (src !== lovedDev) { src = lovedDev; L = poolOf(lovedDev, (i) => vecOf(i.rec)); R = poolOf(rejDev, (i) => vecOf(i.rec)); } return neighborCards(v, L, R); };
+  let src = null, L = null, R = null, K = null;
+  return (it, lovedDev, rejDev, likedDev) => {
+    const v = vecOf(it.rec); if (!v) return null;
+    if (src !== lovedDev) { src = lovedDev; L = poolOf(lovedDev, (i) => vecOf(i.rec)); R = poolOf(rejDev, (i) => vecOf(i.rec)); K = likedDev ? poolOf(likedDev, (i) => vecOf(i.rec)) : null; }
+    return neighborCards(v, L, R, 3, K);
+  };
 }
 const poolOf = (items, vecOf) => items.map((i) => ({ key: i.key, v: vecOf(i), label: i.label, rec: i.rec })).filter((p) => p.v);
 

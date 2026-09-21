@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.7.0';
+const ENGINE_VERSION = '7.8.0';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB
@@ -36,7 +36,7 @@ function defaultSettings() {
   return {
     movie: { ratingMode: 'auto', minRating: 7.2, minVotes: 2000, minRuntime: 70, minYear: 1990, exclude: [], noWesternAnimation: false, order: 'score' },
     series: { ratingMode: 'auto', minRating: 7.2, minVotes: 2000, minYear: 0, exclude: [], noWesternAnimation: true, vfCheck: true, order: 'score' },
-    common: { excludeCancelled: true, movieCatalog: true, seriesCatalog: true, libMovieCatalog: true, libSeriesCatalog: true, frMeta: true, useGemini: true, newSeasonsCatalog: true, catalogOrder: CATALOG_IDS.slice(), install: defaultInstall() }
+    common: { excludeCancelled: true, movieCatalog: true, seriesCatalog: true, libMovieCatalog: true, libSeriesCatalog: true, frMeta: true, useGemini: true, newSeasonsCatalog: true, whyMeta: true, whyCards: true, whyStream: true, semanticRescue: false, catalogOrder: CATALOG_IDS.slice(), install: defaultInstall() }
   };
 }
 
@@ -67,7 +67,7 @@ function normalizeSettings(input = {}, prev = defaultSettings()) {
   if ('minVotes' in s) p.series.minVotes = Math.round(num(s.minVotes, p.series.minVotes, 0, 1e7));
   if ('exclude' in s) p.series.exclude = parseExclude(s.exclude, TV_GENRES);
   if ('order' in s) p.series.order = s.order === 'random' ? 'random' : 'score';
-  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'newSeasonsCatalog', 'frMeta', 'useGemini']) if (k in c) p.common[k] = Boolean(c[k]);
+  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'newSeasonsCatalog', 'whyMeta', 'whyCards', 'whyStream', 'semanticRescue', 'frMeta', 'useGemini']) if (k in c) p.common[k] = Boolean(c[k]);
   p.common.install = normalizeInstall(c.install, p.common.install);
   if ('catalogOrder' in c) p.common.catalogOrder = normalizeOrder(c.catalogOrder); else p.common.catalogOrder = normalizeOrder(p.common.catalogOrder);
   return p;
@@ -91,7 +91,6 @@ const key = {
   idmap: `${NS}:idmap`,
   imdb: `${NS}:imdbr`,
   vf: `${NS}:vf`,
-  cards: (v) => `${NS}:cards:${v}`,                     // fiches descriptives de contenu (document partagé)
   why: (id) => `${NS}:why:${id}`,                       // fiches « pourquoi » (un document par utilisateur)
   emb: (tag, shard) => `${NS}:emb:${tag}:${shard}`     // embeddings sémantiques (blocs de titres, vecteurs quantifiés)
 };

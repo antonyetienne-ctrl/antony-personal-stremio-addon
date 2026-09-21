@@ -6,10 +6,10 @@
 const { mapLimit, log } = require('./util');
 const { rowReject, rejectReason } = require('./filters');
 const { hashedVec } = require('./features');
-const { scoreProfile, blendScores, recipeMatches, utilityOf } = require('./model');
+const { scoreProfile, blendScores, recipeMatches, utilityOf, SAFETY_LAMBDA } = require('./model');
 const { TOP_N } = require('./config');
 
-const PAGE_CAP = 100;          // 2 000 lignes par tri
+const PAGE_CAP = 250;          // 5 000 lignes par tri (TMDB accepte jusqu'à 500 pages) : l'univers admissible (≈ 4 200 films, ≈ 2 400 séries) est énuméré EN ENTIER par un seul tri
 const CALL_BUDGET = 320;       // appels /discover max par type et par calcul
 
 async function enumerateRows(tmdb, kind, settings, type, { gate, onProgress } = {}) {
@@ -89,7 +89,8 @@ function admissible(recs, { settings, type, seenImdb }) {
 }
 
 // Score de tous les candidats : 70 % profil du type + 30 % profil global ; utilité = mu − κσ − ρ·fp − pénalité toxique
-async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, rank, yielder }) {
+// safety : { tau } = seuil de risque estimé de pouce en bas (1 − P(apprécié)) au-delà duquel un titre est fortement rétrogradé (réglé par type par la validation croisée) ; les titres restent classés : le Top est toujours complet
+async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, rank, safety, yielder }) {
   const out = [];
   for (let i = 0; i < recs.length; i++) {
     const rec = recs[i]; const item = { rec, vec: hashedVec(rec, corpus), _sim: new Map() };
@@ -97,8 +98,9 @@ async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic
     let tox = 0; const hits = [];
     for (const t of toxic || []) if (recipeMatches(rec, t.parts)) { tox += t.conf * 0.06; hits.push(t.id); }
     tox = Math.min(0.12, tox);
-    const util = utilityOf(s, rank) - (risk.kappa || 0) * s.sigma - (risk.rho || 0) * s.fp - tox;
-    out.push({ rec, item, s, tox, toxicHits: hits, util });
+    const risqueNeg = 1 - s.pPos;
+    const util = utilityOf(s, rank) - (risk.kappa || 0) * s.sigma - (risk.rho || 0) * s.fp - tox - (safety && Number.isFinite(safety.tau) ? SAFETY_LAMBDA * Math.max(0, risqueNeg - safety.tau) : 0);
+    out.push({ rec, item, s, tox, toxicHits: hits, util, risqueNeg });
     if (yielder && i % 40 === 0) await yielder();
   }
   out.sort((a, b) => b.util - a.util || a.rec.i - b.rec.i);
@@ -169,6 +171,16 @@ function finalizeTop(pool, adj, { top = TOP_N, window = WINDOW, malus = DEFAULT_
   const penalised = win.filter((x) => x.pen > 0).sort((a, b) => b.pen - a.pen || a.c.rec.i - b.c.rec.i).map(strip);
   return done(all.map(strip), penalised);
 }
+// REPÊCHAGE SÉMANTIQUE (option, désactivée par défaut) : R places de la fenêtre que Gemini vérifie vont aux meilleurs titres, HORS fenêtre, selon le score de voisins sémantiques
+// (tes ❤️/👍/vus sans note les plus proches par le sens du synopsis, semOf renvoie la valeur attendue sur l'échelle) ; les autres places restent au classement local.
+function rescueSemantic(full, { window = WINDOW, R = 20, semOf, poolSize = 100 }) {
+  if (!R || full.length <= window) return full;
+  const keep = full.slice(0, window - R);
+  const cand = full.slice(window).map((c) => ({ c, s: semOf(c) })).filter((x) => x.s !== null && x.s !== undefined).sort((a, b) => b.s - a.s || a.c.rec.i - b.c.rec.i).slice(0, R).map((x) => x.c);
+  for (const c of cand) c.rescued = true;
+  const used = new Set([...keep, ...cand]);
+  return [...keep, ...cand, ...full.slice(0, poolSize + R).filter((c) => !used.has(c))].slice(0, poolSize);
+}
 // k titres de l'historique les plus proches d'un candidat (similarité cosinus des vecteurs hachés), sous forme compacte pour un prompt
 function nearestK(cand, arr, k = 3) {
   const v = cand.item.vec; const sc = [];
@@ -177,4 +189,4 @@ function nearestK(cand, arr, k = 3) {
   return sc.slice(0, k).map(([, l]) => ({ titre: l.rec.t, annee: l.rec.y, genres: (l.rec.gn || []).slice(0, 3), mots_cles: (l.rec.kw || []).slice(0, 3).map((x) => x[1]) }));
 }
 
-module.exports = { nearestK, severity, DEFAULT_MALUS, MALUS_FLOOR, MALUS_GRID, WINDOW, exclusions, enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };
+module.exports = { rescueSemantic, nearestK, severity, DEFAULT_MALUS, MALUS_FLOOR, MALUS_GRID, WINDOW, exclusions, enumerateRows, discoverCandidates, admissible, scoreCandidates, nearestTitles, makeMeta, finalizeTop, PAGE_CAP };

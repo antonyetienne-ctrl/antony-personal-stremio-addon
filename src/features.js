@@ -7,16 +7,8 @@ const STOP = new Set(('le la les un une des du de d l et en a au aux ce cet cett
 const tokenize = (text) => norm(text).split(/[^a-z0-9]+/).filter((t) => t.length >= 4 && !STOP.has(t));
 
 const RAW = new WeakMap();
-// critères des fiches descriptives (ordre = src/cards.js CRITERIA) ; utilisés seulement quand `rec.cd` (18 caractères) est présent : mesure des fiches, jamais en production tant qu'elles ne sont pas adoptées
-const CARD_KEYS = ['sombre', 'humour', 'emotion', 'suspense', 'romance', 'action', 'violence', 'rythme', 'complexite', 'realisme', 'epique', 'univers', 'historique', 'faitsReels', 'public', 'introspection', 'feuilleton'];
-function addCardFeatures(rec, add) {
-  const cd = rec.cd; if (typeof cd !== 'string' || cd.length !== 18) return;
-  const V = Array.from(cd, (ch) => '0123456789a'.indexOf(ch)); if (V.some((v) => v < 0)) return;
-  const c = 0.4 + 0.6 * V[17] / 10;                        // une fiche peu fiable pèse moins
-  CARD_KEYS.forEach((k, i) => { if (k === 'feuilleton' && rec.k !== 's') return; add('x:' + k, 0.9 * (V[i] / 10) * c); add('x:' + k + ':' + (V[i] <= 3 ? 'lo' : V[i] <= 6 ? 'mid' : 'hi'), 0.5 * c); });
-}
 function rawFeatures(rec) {
-  const sig = `${rec.ir}|${rec.iv}|${rec.cd || ''}`;
+  const sig = `${rec.ir}|${rec.iv}`;
   let hit = RAW.get(rec); if (hit && hit.sig === sig) return hit.f;
   const f = new Map();
   const add = (k, w) => f.set(k, (f.get(k) || 0) + w);
@@ -38,7 +30,6 @@ function rawFeatures(rec) {
     if (rec.va) add('q:r' + Math.max(0, Math.min(9, Math.floor((rec.va - 5) * 2))), 0.5);
     if (rec.vc) add('q:v' + Math.min(8, Math.floor(Math.log10(Math.max(1, rec.vc)) * 2)), 0.3);
   }
-  addCardFeatures(rec, add);
   const tf = new Map();
   for (const t of tokenize(rec.ov)) tf.set(t, (tf.get(t) || 0) + 1);
   for (const [t, c] of tf) add('w:' + t, 0.35 * (1 + Math.log(c)));
@@ -65,7 +56,7 @@ function fnv(str) {
 // vecteur dense haché (projection signée) : sert à la similarité cosinus, aux prototypes et aux clusters
 function hashedVec(rec, corpus, dim = 256) {
   const v = new Float32Array(dim);
-  for (const [k, w] of rawFeatures(rec)) { if (k.startsWith('q:') || k.startsWith('x:')) continue; const h = fnv(k); v[h % dim] += ((h >>> 16) & 1 ? 1 : -1) * w * corpus.idf(k); }
+  for (const [k, w] of rawFeatures(rec)) { if (k.startsWith('q:')) continue; const h = fnv(k); v[h % dim] += ((h >>> 16) & 1 ? 1 : -1) * w * corpus.idf(k); }
   let n = 0; for (let i = 0; i < dim; i++) n += v[i] * v[i];
   n = Math.sqrt(n) || 1; for (let i = 0; i < dim; i++) v[i] /= n;
   return v;
@@ -99,7 +90,6 @@ function makeNamer(recs) {
     if (t === 'g') return `genre « ${g.get(Number(id)) || id} »`;
     if (t === 'k') return `mot-clé « ${k.get(Number(id)) || id} »`;
     if (t === 'w') return `mot « ${id} »`;
-    if (t === 'x') return `critère ${id}`;
     if (t === 'dec') return `années ${id}`;
     if (t === 'l') return `langue ${id}`;
     if (t === 'c') return `pays ${id}`;
@@ -116,4 +106,4 @@ function nameOfKey(namer, key) {
   return namer(key);
 }
 
-module.exports = { CARD_KEYS, tokenize, rawFeatures, Corpus, hashedVec, encodeSparse, buildDict, makeNamer, nameOfKey, fnv };
+module.exports = { tokenize, rawFeatures, Corpus, hashedVec, encodeSparse, buildDict, makeNamer, nameOfKey, fnv };

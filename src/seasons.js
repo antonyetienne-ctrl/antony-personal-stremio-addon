@@ -1,8 +1,8 @@
 'use strict';
 // 🔔 NOUVELLES SAISONS DISPONIBLES. Règles (validées par l'utilisateur) :
 //  - séries MARQUÉES VUES (macaron : au moins un épisode terminé, règle « vu » du moteur) ET notées 👍 ou ❤️ ; les saisons précédentes (vues ou non) n'ont aucune importance ;
-//  - une série s'affiche quand une saison est sortie il y a MOINS de 90 jours (date du premier épisode de la saison) ;
-//  - elle disparaît quand la saison a plus de 90 jours OU quand TOUS les épisodes de cette saison (sortis ou déjà annoncés) sont marqués vus.
+//  - une série s'affiche quand une saison est sortie il y a MOINS de 12 mois (365 jours) (date du premier épisode de la saison) ;
+//  - elle disparaît quand la saison a plus de 12 mois OU quand TOUS les épisodes de cette saison (sortis ou déjà annoncés) sont marqués vus.
 // Lecture des épisodes vus : la liste `state.watched` de Stremio, « épisodeD'ancrage:longueur:bits compressés », alignée sur la liste d'épisodes de la série (Cinemeta, à défaut TMDB).
 // Le décodage est CONTRÔLÉ (le dernier bit à 1 doit être l'épisode d'ancrage, dans l'un des deux ordres de bits possibles) ; en cas de doute la série reste affichée (jamais cachée à tort)
 // jusqu'à la limite des 90 jours. Lecture seule, aucune écriture Upstash ; TMDB et Cinemeta en mémoire (6 h / 12 h).
@@ -10,7 +10,7 @@ const zlib = require('zlib');
 const { fetchJson, clock, mapLimit, LRU, log } = require('./util');
 const { classify } = require('./stremio');
 
-const DAYS = 90, DAY_MS = 86400000, TV_TTL = 6 * 3600e3, CM_TTL = 12 * 3600e3;
+const DAYS = 365, DAY_MS = 86400000, TV_TTL = 6 * 3600e3, CM_TTL = 12 * 3600e3;
 const CINEMETA = 'https://v3-cinemeta.strem.io';
 
 // ---------- liste des épisodes vus ----------

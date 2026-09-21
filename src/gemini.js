@@ -81,105 +81,27 @@ class Gemini {
 const card = (rec, extra = {}) => ({ titre: rec.t, annee: rec.y, genres: (rec.gn || []).slice(0, 4), mots_cles: (rec.kw || []).slice(0, 7).map((k) => k[1]), ...extra });
 // ---------- PROMPTS (structures définies par l'utilisateur) ----------
 // Échantillon représentatif : réparti par genre principal (tour à tour) pour qu'aucun genre aimé (fantastique, comédie…) ne disparaisse de l'ADN.
-function stratifiedSample(items, n) {
-  const groups = new Map();
-  for (const it of items.slice().sort((x, y) => (y.lw || 0) - (x.lw || 0) || (x.key < y.key ? -1 : 1))) {
-    const g = (it.rec.k || '?') + ':' + ((it.rec.gn && it.rec.gn[0]) || 'autre');
-    if (!groups.has(g)) groups.set(g, []); groups.get(g).push(it);
-  }
-  const order = [...groups.entries()].sort((a, b) => b[1].length - a[1].length || (a[0] < b[0] ? -1 : 1)).map((e) => e[1]);
-  const out = []; for (let round = 0; out.length < n; round++) { let any = false; for (const g of order) { if (g[round]) { out.push(g[round].rec); any = true; if (out.length >= n) break; } } if (!any) break; }
-  return out;
-}
-// ---- PROMPT 1 : ADN (structure VALIDÉE par l'utilisateur). Aucun goût écrit en dur : seuls les FILTRES ACTIFS de la page de configuration sont transmis.
-function dnaPrompt({ filtres, n, tauxGlobal, tableau, loves, likes, rejects, recipes }) {
-  const echantillon = { adorés: (loves || []).map((r) => card(r)), aimés: (likes || []).map((r) => card(r)), rejetés_pourtant_bien_notés: (rejects || []).map((r) => card(r, { note_tmdb: r.va })), recettes_candidates: recipes || [] };
-  return `Tu es un analyste de goûts cinématographiques et télévisuels. À partir de PREUVES
-chiffrées et d'un échantillon de son historique, tu rédiges l'ADN de visionnage d'un
-spectateur.
-
-PRINCIPES
-- Une note (❤️ adoré, 👍 aimé, ✗ vu sans être aimé) concerne UN titre, pas un genre.
-  Ne conclus qu'un genre, un sous-genre ou un mot-clé est rejeté QUE si le tableau
-  le prouve : part d'appréciation nettement sous sa moyenne générale ET fiabilité
-  « suffisante ». Un ou deux titres ratés dans un ensemble ne prouvent rien.
-- « faible » ou « preuve insuffisante » : n'en tire AUCUNE conclusion.
-- Pour chaque ensemble, oppose ce qui est adoré à ce qui est rejeté : c'est cette
-  différence (ton, rythme, sous-genre, acteurs, réalisateur, structure narrative)
-  qui définit l'ADN, pas l'étiquette de genre.
-- Les FILTRES ACTIFS sont des choix de configuration de l'utilisateur, appliqués en
-  amont : ne les interprète pas comme un goût et ne les commente pas.
-
-FILTRES ACTIFS (page de configuration) :
-${filtres || '(aucun)'}
-
-TABLEAU DE PREUVES (historique de ${n} titres ; moyenne générale d'appréciation :
-${tauxGlobal} %) :
-${tableau}
-
-ÉCHANTILLON (réparti par genre) :
-${JSON.stringify(echantillon)}
-
-Réponds UNIQUEMENT en JSON strict :
-{"adn": "<=110 mots", "moteurs_d_adhesion": [...], "facteurs_repulsifs": [...],
- "nuances": [{"ensemble": "...", "lecture": "..."}],
- "recettes_toxiques": [{"id": "R1", "toxique": true, "raison": "..."}]}`;
-}
-// ---- PROMPT 2 : arbitrage (structure VALIDÉE) : quatre notes par candidat.
-function arbitragePrompt({ adn, moteurs, repulsifs, nuances, filtres, candidats }) {
-  const l = (a) => ((a && a.length) ? a.join(' ; ') : '(aucun)');
-  return `Tu arbitres des candidats (films ou séries) pour un spectateur dont voici l'ADN :
-${adn || '(inconnu)'}
-Moteurs d'adhésion : ${l(moteurs)}
-Facteurs répulsifs : ${l(repulsifs)}
-Nuances à respecter : ${l(nuances)}
-
-FILTRES ACTIFS (déjà appliqués : tous les candidats les respectent) :
-${filtres || '(aucun)'}
-
-Pour chaque candidat (titre, année, tous ses genres, mots-clés, synopsis, titre aimé
-et titre rejeté les plus proches) :
-1. "adequation" (0-100) : probabilité que ce soit un vrai COUP DE CŒUR (❤️), d'après
-   la dynamique, l'immersion, le ton et le divertissement, pas la réputation critique.
-2. "risque" (0-100) : risque de déception : titre lent, austère, niais, redondant ou
-   ennuyeux pour CE profil.
-3. "connaissance" (0-100) : à quel point tu connais réellement ce titre. Titre récent
-   ou obscur : mets une valeur basse et juge d'après le synopsis, sans rien inventer.
-4. "incompatibilite" (true/false) : true SEULEMENT pour une incompatibilité MAJEURE
-   et précise avec l'ADN, à justifier dans le motif. Jamais pour un simple manque
-   d'enthousiasme.
-5. "motif" : 14 mots maximum.
-
-Règles : utilise toute l'échelle (un titre moyen vaut environ 50) ; sois sévère
-seulement si tu peux le justifier ; ne juge pas un genre entier sur ses mauvais
-exemples : compare avec les titres aimés du même sous-genre.
-
-Réponds UNIQUEMENT en JSON strict :
-{"evaluations": [{"id": ..., "adequation": 0, "risque": 0, "connaissance": 0,
- "incompatibilite": false, "motif": "..."}]}
-
-CANDIDATS : ${JSON.stringify(candidats)}`;
-}
-
 // ---- VARIANTE C (validée par l'utilisateur) : comparaison à l'historique par PROXIMITÉ, sans résumé d'ADN, sans filtres, sans jugement de qualité.
 function comparePrompt({ candidats }) {
   return `Tu compares des candidats (films ou séries) à des titres de l'historique d'un spectateur. Tu ne juges JAMAIS la qualité ni la réputation d'un titre : seulement la ressemblance de l'expérience de visionnage.
 
 Pour chaque candidat, tu reçois :
 - ses caractéristiques (titre, année, genres, mots-clés, synopsis) ;
-- "adores" : les 3 titres de l'historique que le spectateur a ADORÉS (❤️) et qui lui ressemblent le plus ;
+- "adores" : les 3 titres de l'historique que le spectateur a ADORÉS (❤️, coup de cœur : le signal positif maximal) et qui lui ressemblent le plus ;
+- "apprecies" : les 2 titres de l'historique que le spectateur a APPRÉCIÉS (👍, franchement positif mais bien moins fort qu'un adoré) et qui lui ressemblent le plus ;
 - "non_aimes" : les 3 titres de l'historique que le spectateur a vus SANS LES AIMER (✗) et qui lui ressemblent le plus.
 
 Pour chaque candidat, réponds :
 1. "proche_des_adores" (0-100) : à quel point l'expérience du candidat (univers, ton, rythme, type d'intrigue, humour, enjeux, public visé) ressemble à celle des titres adorés.
-2. "proche_des_non_aimes" (0-100) : la même question avec les titres vus sans les aimer.
-3. "connaissance" (0-100) : à quel point tu connais réellement ce titre. Titre récent ou peu connu : mets une valeur basse et compare d'après le synopsis, sans rien inventer.
-4. "motif" : 14 mots maximum, qui nomme le titre voisin le plus proche.
+2. "proche_des_apprecies" (0-100) : la même question avec les titres appréciés (👍).
+3. "proche_des_non_aimes" (0-100) : la même question avec les titres vus sans les aimer.
+4. "connaissance" (0-100) : à quel point tu connais réellement ce titre. Titre récent ou peu connu : mets une valeur basse et compare d'après le synopsis, sans rien inventer.
+5. "motif" : 14 mots maximum, qui nomme le titre voisin le plus proche.
 
-Règles : compare uniquement l'expérience de visionnage ; un genre n'est ni bon ni mauvais en soi ; les deux notes sont indépendantes (un candidat peut ressembler aux deux, ou à aucun) ; utilise toute l'échelle ; si les voisins fournis ne sont pas pertinents, dis-le par une note basse plutôt que de forcer une ressemblance.
+Règles : compare uniquement l'expérience de visionnage ; un genre n'est ni bon ni mauvais en soi ; les trois notes sont indépendantes (un candidat peut ressembler à plusieurs groupes, ou à aucun) ; utilise toute l'échelle ; si les voisins fournis ne sont pas pertinents, dis-le par une note basse plutôt que de forcer une ressemblance.
 
 Réponds UNIQUEMENT en JSON strict :
-{"evaluations": [{"id": ..., "proche_des_adores": 0, "proche_des_non_aimes": 0, "connaissance": 0, "motif": "..."}]}
+{"evaluations": [{"id": ..., "proche_des_adores": 0, "proche_des_apprecies": 0, "proche_des_non_aimes": 0, "connaissance": 0, "motif": "..."}]}
 
 CANDIDATS : ${JSON.stringify(candidats)}`;
 }
@@ -197,21 +119,23 @@ function parseEvaluations(r, byId) {
   if (!list) return { map, shape, listLength: 0 };
   const pick = (...v) => { for (const x of v) { if (x === null || x === undefined || x === '') continue; const n = Number(x); if (Number.isFinite(n)) return n; } return NaN; };
   const rows = list.filter((e) => e && typeof e === 'object').map((e) => {
-    const a = pick(e.proche_des_adores, e.proche_des_adorés), nn = pick(e.proche_des_non_aimes);
+    const a = pick(e.proche_des_adores, e.proche_des_adorés), nn = pick(e.proche_des_non_aimes), lk = pick(e.proche_des_apprecies, e.proche_des_appréciés);
     const isC = Number.isFinite(a) && Number.isFinite(nn);            // variante C : ressemblance aux titres adorés et aux titres non aimés
-    return { e, isC, a, nn, fit: isC ? a : pick(e.adequation, e['adéquation'], e.fit, e.score), risk: isC ? nn : pick(e.risque, e.risk) };
+    return { e, isC, a, nn, lk, fit: isC ? a : pick(e.adequation, e['adéquation'], e.fit, e.score), risk: isC ? nn : pick(e.risque, e.risk) };
   }).filter((x) => Number.isFinite(x.fit));
   const frac = rows.length > 0 && rows.every((x) => x.fit <= 1 && (Number.isNaN(x.risk) || x.risk <= 1));
   const k = frac ? 100 : 1;
-  for (const { e, fit, risk, isC, a, nn } of rows) {
+  for (const { e, fit, risk, isC, a, nn, lk } of rows) {
     const raw = String(e.id ?? e.identifiant ?? ''); const digits = raw.replace(/\D/g, '');
     const im = byId.get(raw) || (digits && (byId.get('m' + digits) || byId.get('s' + digits)));
     if (!im) continue;
     const kn = pick(e.connaissance, e.knowledge, e.connu); const inc = e.incompatibilite ?? e['incompatibilité'] ?? e.incompatible;
     if (isC) {                                                                       // fit = (100 + adorés − non aimés) / 2 ; risk = 0 ; les deux ressemblances sont conservées (sim)
       const A = Math.max(0, Math.min(100, a * k)), N = Math.max(0, Math.min(100, nn * k));
+      const L = Number.isFinite(lk) ? Math.max(0, Math.min(100, lk * k)) : null;
+      const Apos = L === null ? A : (3 * A + L) / 4;                           // côté positif sur l'échelle de l'utilisateur : la ressemblance à un adoré compte 3, à un apprécié 1
       const kn2 = pick(e.connaissance, e.knowledge, e.connu);
-      map.set(im, { fit: (100 + A - N) / 2, risk: 0, sim: { adores: A, nonAimes: N }, know: Number.isFinite(kn2) ? Math.max(0, Math.min(100, kn2 * (kn2 <= 1 && frac ? 100 : 1))) : null, incomp: false, note: String(e.note || e.motif || '').slice(0, 100) });
+      map.set(im, { fit: (100 + Apos - N) / 2, risk: 0, sim: { adores: A, ...(L === null ? {} : { apprecies: L }), nonAimes: N }, know: Number.isFinite(kn2) ? Math.max(0, Math.min(100, kn2 * (kn2 <= 1 && frac ? 100 : 1))) : null, incomp: false, note: String(e.note || e.motif || '').slice(0, 100) });
       continue;
     }
     map.set(im, { fit: Math.max(0, Math.min(100, fit * k)), risk: Math.max(0, Math.min(100, (Number.isFinite(risk) ? risk : 0) * k)), know: Number.isFinite(kn) ? Math.max(0, Math.min(100, kn * (kn <= 1 && frac ? 100 : 1))) : null, incomp: inc === true || inc === 1 || (typeof inc === 'string' && /^(true|vrai|oui|1)$/i.test(inc.trim())), note: String(e.note || e.motif || '').slice(0, 100) });
@@ -219,4 +143,4 @@ function parseEvaluations(r, byId) {
   return { map, shape, listLength: list.length };
 }
 
-module.exports = { comparePrompt, stratifiedSample, parseEvaluations, Gemini, pickModel, extractJson, dnaPrompt, arbitragePrompt };
+module.exports = { comparePrompt, parseEvaluations, Gemini, pickModel, extractJson };
