@@ -10,6 +10,8 @@ const ui = require('./ui');
 const diag = require('./diag');
 const { buildMeta } = require('./meta');
 const { LibraryCatalog } = require('./library');
+const { withWhy } = require('./why');
+const { NewSeasons } = require('./seasons');
 const inspect = require('./inspect');
 
 const json = (res, code, obj, headers = {}) => { const b = JSON.stringify(obj); res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers }); res.end(b); };
@@ -19,14 +21,21 @@ const readBody = (req, max = 100000) => new Promise((resolve, reject) => { let d
 const hostOf = (req) => `${(req.headers['x-forwarded-proto'] || 'https').split(',')[0]}://${req.headers.host}`;
 const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 
-function manifestFor(user) {
+// n : numéro de l'installation (1 par défaut ; 2 si l'utilisateur a choisi deux installations). Mêmes réglages, mêmes résultats : seule la liste des catalogues change.
+function manifestFor(user, n = 1) {
   const c = user.settings.common; const catalogs = [];
   if (c.movieCatalog) catalogs.push({ type: 'movie', id: 'antony_movies', name: '🎯 Recommandations selon vos Goûts', extra: [{ name: 'skip' }] });
   if (c.seriesCatalog) catalogs.push({ type: 'series', id: 'antony_series', name: '🎯 Recommandations selon vos Goûts', extra: [{ name: 'skip' }] });
   if (c.libMovieCatalog !== false) catalogs.push({ type: 'movie', id: 'antony_lib_movies', name: '📌 Votre liste de lecture', extra: [{ name: 'skip' }] });
   if (c.libSeriesCatalog !== false) catalogs.push({ type: 'series', id: 'antony_lib_series', name: '📌 Votre liste de lecture', extra: [{ name: 'skip' }] });
-  return { id: 'com.antony.personalrecommendations', version: cfg.ENGINE_VERSION, name: 'Recommandations personnelles', description: 'Recommandations apprises de vos ❤️, 👍 et des contenus vus sans appréciation, et votre bibliothèque séparée en films et séries. Métadonnées en français.',
-    resources: c.frMeta ? ['catalog', { name: 'meta', types: ['movie', 'series'], idPrefixes: ['tt'] }] : ['catalog'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs, behaviorHints: { configurable: true, configurationRequired: false } };
+  if (c.newSeasonsCatalog !== false) catalogs.push({ type: 'series', id: 'antony_new_seasons', name: '🔔 Nouvelles Saisons Disponibles', extra: [{ name: 'skip' }] });
+  const order = cfg.normalizeOrder(c.catalogOrder); catalogs.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));      // ordre choisi dans la page de configuration
+  const inst = cfg.normalizeInstall(c.install); const multi = inst.count === 2;
+  const mine = multi ? catalogs.filter((k) => inst.assign[k.id] === n) : (n === 1 ? catalogs : []);
+  const types = [...new Set(mine.map((k) => k.type))]; const tt = types.length ? types : ['movie', 'series'];
+  const suffix = multi ? (types.length === 1 ? (types[0] === 'movie' ? ' — Films' : ' — Séries') : ` (${n})`) : '';
+  return { id: n === 1 ? 'com.antony.personalrecommendations' : `com.antony.personalrecommendations.${n}`, version: cfg.ENGINE_VERSION, name: `Recommandations personnelles${suffix}`, description: 'Recommandations apprises de vos ❤️, 👍 et des contenus vus sans appréciation, votre bibliothèque séparée en films et séries, et les nouvelles saisons de vos séries. Métadonnées en français.',
+    resources: c.frMeta && types.length ? ['catalog', { name: 'meta', types, idPrefixes: ['tt'] }] : ['catalog'], types: tt, idPrefixes: ['tt'], catalogs: mine, behaviorHints: { configurable: true, configurationRequired: false } };
 }
 
 // formulaire -> {secrets, clear, settings}
@@ -38,14 +47,16 @@ function parseForm(body) {
     settings[t].noWesternAnimation = p.has(`${t}.noWesternAnimation`);
     if (p.has(`${t}.exclude__present`)) settings[t].exclude = p.getAll(`${t}.exclude`);
   }
-  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
+  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'newSeasonsCatalog', 'frMeta', 'useGemini']) settings.common[k] = p.has(`common.${k}`);
+  if (p.has('install.count')) { settings.common.install = { count: Number(p.get('install.count')), assign: {} }; for (const id of cfg.CATALOG_IDS) if (p.has(`install.assign.${id}`)) settings.common.install.assign[id] = Number(p.get(`install.assign.${id}`)); }
   settings.series.vfCheck = p.has('series.vfCheck');
+  if (p.has('catalogOrder.0')) settings.common.catalogOrder = [0, 1, 2, 3, 4].map((i) => p.get(`catalogOrder.${i}`)).filter(Boolean);
   return { secrets: { tmdb: g('tmdb') || '', stremio: g('stremio') || '', gemini: g('gemini') || '', rapidapi: g('rapidapi') || '' }, clear: p.has('clearGemini') ? ['gemini'] : [], settings };
 }
 
 function createApp({ store, users, engine, results, started = Date.now() }) {
   const diagToken = () => process.env.DIAG_TOKEN || '';
-  const library = new LibraryCatalog();
+  const library = new LibraryCatalog(); const newSeasons = new NewSeasons();
   async function handle(req, res) {
     const u = new URL(req.url, 'http://x'); const path = u.pathname; const method = req.method;
     if (method === 'OPTIONS') { res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET,POST,OPTIONS' }); return res.end(); }
@@ -60,7 +71,7 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
         const list = await users.list(); const want = u.searchParams.get('u') || ''; const uid = list.find((x) => want && x.startsWith(want)) || list[0];
         const user = uid && await users.get(uid);
         if (!user) return json(res, 404, { error: 'aucun profil' });
-        return json(res, 200, await inspect.run({ q, user, engine, results, library }));
+        return json(res, 200, await inspect.run({ q, user, engine, results, library, newSeasons }));
       }
       return json(res, 200, diag.build({ store, users, engine, results, started }));
     }
@@ -85,7 +96,8 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
       const uid = m[1]; const rest = m[2];
       const user = await users.get(uid);
       if (!user) return json(res, 404, { error: 'introuvable' }, CORS);
-      if (rest === 'manifest.json') { engine.touch(uid); return json(res, 200, manifestFor(user), { ...CORS, 'cache-control': 'no-store' }); }
+      if (rest === 'manifest.json') { engine.touch(uid); return json(res, 200, manifestFor(user, 1), { ...CORS, 'cache-control': 'no-store' }); }
+      if (rest === 'manifest2.json') { engine.touch(uid); if (cfg.normalizeInstall(user.settings.common.install).count !== 2) return json(res, 404, { error: 'installation 2 non activée dans la page de configuration' }, CORS); return json(res, 200, manifestFor(user, 2), { ...CORS, 'cache-control': 'no-store' }); }
       if (rest === 'configure' && method === 'GET') return html(res, 200, ui.page({ mode: 'edit', view: users.view(user), host: hostOf(req), notice: u.searchParams.has('created') ? { kind: 'ok', text: 'Profil créé. Le premier calcul complet a démarré : garde cette page ouverte jusqu\'à ce que les deux catalogues affichent leurs titres, puis installe l\'addon dans Stremio.' } : u.searchParams.has('saved') ? { kind: 'ok', text: 'Configuration enregistrée.' } : u.searchParams.has('warn') ? { kind: 'warn', text: 'Enregistré en mémoire seulement (Upstash indisponible) : nouvelle tentative automatique.' } : null, secretsReady: secretsReady() }));
       if (rest === 'config' && method === 'POST') {
         try {
@@ -93,7 +105,7 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
           const f = parseForm(await readBody(req));
           const { user: nu, persisted } = await users.update(uid, { secrets: f.secrets, clear: f.clear, settings: f.settings });
           const changed = ['movie', 'series'].filter((t) => before[t] !== cfg.settingsFingerprint(nu.settings, t));
-          engine.clients.delete(uid); library.invalidate(uid);               // clés éventuellement changées
+          engine.clients.delete(uid); library.invalidate(uid); newSeasons.invalidate();               // clés éventuellement changées
           engine.onSettingsSaved(uid, changed).catch(() => {});
           res.writeHead(303, { location: `/u/${uid}/configure?${persisted ? 'saved=1' : 'warn=1'}` }); return res.end();
         } catch (e) { return html(res, 400, ui.page({ mode: 'edit', view: users.view(user), host: hostOf(req), notice: { kind: 'err', text: redact(e.message) }, secretsReady: secretsReady() })); }
@@ -101,10 +113,20 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
       if (rest === 'rebuild' && method === 'POST') return json(res, 200, engine.force(uid));
       if (rest === 'vf-test' && method === 'POST') return json(res, 200, await engine.vfTest(uid));
       if (rest === 'status') return json(res, 200, { ...engine.status(uid), vf: await engine.vfView(user) });
-      const c = rest.match(/^catalog\/(movie|series)\/(antony_movies|antony_series|antony_lib_movies|antony_lib_series)(?:\/([^/]+?))?(?:\.json)?$/);
+      const c = rest.match(/^catalog\/(movie|series)\/(antony_movies|antony_series|antony_lib_movies|antony_lib_series|antony_new_seasons)(?:\/([^/]+?))?(?:\.json)?$/);
       if (c) {
         activity.mark(); engine.touch(uid);
         const type = c[1]; const skip = Number((/skip=(\d+)/.exec(c[3] || '') || [])[1] || 0);
+        if (c[2] === 'antony_new_seasons') {            // 🔔 séries vues et aimées dont une saison est sortie depuis moins de 90 jours (disparaît quand la saison est entièrement vue)
+          let metas = [];
+          try {
+            if (type === 'series' && user.settings.common.newSeasonsCatalog !== false && user.secrets.stremio) {
+              const lib = await library.load(uid, user.secrets.stremio);
+              if (lib.items) { const snap = await engine.loadSnap(uid).catch(() => null); const labels = new Map(); if (snap) for (const [im, v] of Object.entries(snap.items)) labels.set(im, v[1]); metas = await newSeasons.metas({ libItems: lib.items, labels, tmdb: engine.clientsFor(user, engine.jobs.get(uid) || {}).tmdb }, { skip }); }
+            }
+          } catch (e) { log('warn', 'Nouvelles saisons indisponibles', String(e && e.message || e).slice(0, 120)); }
+          return json(res, 200, { metas }, { ...CORS, 'cache-control': 'public, max-age=120' });
+        }
         if (c[2].startsWith('antony_lib_')) {         // bibliothèque Stremio séparée par type (lecture à la demande, mémoire de 10 minutes)
           const on = type === 'movie' ? user.settings.common.libMovieCatalog !== false : user.settings.common.libSeriesCatalog !== false;
           const okType = (c[2] === 'antony_lib_movies') === (type === 'movie');
@@ -123,7 +145,8 @@ function createApp({ store, users, engine, results, started = Date.now() }) {
         try {
           const meta = await Promise.race([buildMeta(cl.tmdb, mm[1], mm[2]), new Promise((r) => setTimeout(() => r('timeout'), 7000))]);
           if (!meta || meta === 'timeout') return json(res, 404, { meta: null }, CORS);
-          return json(res, 200, { meta }, { ...CORS, 'cache-control': 'public, max-age=3600' });
+          let out = meta; try { await engine.why.getFast(uid); const wt = engine.why.text(uid, mm[2]); if (wt) out = { ...meta, description: withWhy(wt, meta.description) }; } catch { /* la fiche reste celle d'origine */ }
+          return json(res, 200, { meta: out }, { ...CORS, 'cache-control': 'public, max-age=600' });
         } catch (e) { log('warn', 'meta indisponible', e.message); return json(res, 404, { meta: null }, CORS); }
       }
       return json(res, 404, { error: 'introuvable' }, CORS);

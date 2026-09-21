@@ -6,18 +6,27 @@
 //  3) comparer objectivement les deux façons de trouver des voisins sur TOUT l'historique (validation « un contre tous », plus de 1 300 titres).
 // Contraintes : plan gratuit (cadence et plafond quotidien), tout est mis en CACHE (Upstash, vecteurs quantifiés sur 8 bits), vectorisation étalée sur plusieurs calculs si besoin,
 // aucune erreur ne bloque le calcul : sans embeddings on retombe exactement sur le comportement précédent.
-const { fetchJson, clock, sleep, log, zurichDay, hashInt, mulberry32, sha, nextZurichMidnight } = require('./util');
+const { fetchJson, clock, sleep, log, hashInt, mulberry32, sha } = require('./util');
 const { fnv } = require('./features');
 const { key } = require('./config');
 const ml = require('./ml');
 
 const BASE = 'https://generativelanguage.googleapis.com/v1beta';
+// Les quotas de Google (par jour) sont remis à zéro à MINUIT HEURE DU PACIFIQUE (≈ 9 h à Zurich) : la « journée de quota » est celle du Pacifique.
+const pacificDay = (ts = clock.now()) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ts));
+function nextPacificMidnight(ts = clock.now()) {
+  const day = pacificDay(ts); let lo = ts, hi = ts;
+  for (let i = 0; i < 30 && pacificDay(hi) === day; i++) { lo = hi; hi += 3600e3; }
+  while (hi - lo > 1000) { const mid = Math.floor((lo + hi) / 2); if (pacificDay(mid) === day) lo = mid; else hi = mid; }
+  return hi;
+}
+const QUOTA_RESET_MARGIN_MS = 180000;                // reprise 3 minutes après la remise à zéro
 const DIM = () => Number(process.env.EMBED_DIM || 256);
 const MODELS = () => (process.env.GEMINI_EMBED_MODEL ? [process.env.GEMINI_EMBED_MODEL] : ['gemini-embedding-001', 'gemini-embedding-2']);
 const SHARDS = 12;
 const MIN_COVERAGE = 0.9;                      // part minimale de l'historique vectorisé pour utiliser les embeddings
 const K_NEIGHBORS = 12, TAU_EMB = 0.04, TAU_HASH = 0.08, PRIOR_W = 0.7;
-const TOP_CANDIDATES = 250;                    // candidats vectorisés par type (les mieux classés par le modèle local)
+const TOP_CANDIDATES = 400;                    // fenêtre de couverture : le mélange n'est appliqué que si 90 % des 400 mieux classés (par le modèle local) ont un vecteur ; TOUS les candidats sont vectorisés (dans l'ordre du classement)
 
 // ---------- texte à vectoriser (français : c'est la langue des synopsis) ----------
 function embeddingText(rec) {
@@ -86,15 +95,15 @@ class EmbedStore {
 const RATE0 = () => Number(process.env.EMBED_TEXTS_PER_MIN || 70), RATE_MAX = () => Number(process.env.EMBED_MAX_TEXTS_PER_MIN || 100), RATE_MIN = 15;
 class Embedder {
   constructor({ key: apiKey, dim = DIM(), calls = null, minIntervalMs = Number(process.env.EMBED_MIN_INTERVAL_MS ?? 4500), maxBatch = Number(process.env.EMBED_BATCH || 100),
-    maxPerDay = Number(process.env.EMBED_MAX_CALLS_PER_DAY || 300), maxTextsPerDay = Number(process.env.EMBED_MAX_TEXTS_PER_DAY || 1400), minBatch = 8,
+    maxPerDay = Number(process.env.EMBED_MAX_CALLS_PER_DAY || 300), maxTextsPerDay = Number(process.env.EMBED_MAX_TEXTS_PER_DAY || 900), minBatch = 8,
     backoffMs = Number(process.env.EMBED_BACKOFF_MS ?? 20000), model = null, textsPerMin = null, maxTextsPerMin = null, minTextsPerMin = null, rate = null } = {}) {
     this.key = apiKey; this.dim = dim; this.model = model; this.minIntervalMs = minIntervalMs; this.maxBatch = maxBatch; this.minBatch = minBatch; this.maxPerDay = maxPerDay; this.maxTextsPerDay = maxTextsPerDay; this.backoff0 = backoffMs;
     this.maxRate = maxTextsPerMin || RATE_MAX(); this.minRate = minTextsPerMin || RATE_MIN; this.rate = Math.max(this.minRate, Math.min(this.maxRate, Math.round(rate || textsPerMin || RATE0())));
-    this.calls = calls && calls.day === zurichDay() ? { day: calls.day, count: calls.count || 0, texts: calls.texts || 0 } : { day: zurichDay(), count: 0, texts: 0 };
+    this.calls = calls && calls.day === pacificDay() ? { day: calls.day, count: calls.count || 0, texts: calls.texts || 0 } : { day: pacificDay(), count: 0, texts: 0 };
     this.nextAt = 0; this.okStreak = 0; this.consec429 = 0; this.consecErr = 0; this.backoffMs = backoffMs; this.pausedUntil = 0;
     this.stats = { requests: 0, ok: 0, rate429: 0, errors: 0, texts: 0 }; this.lastError = null;
   }
-  _day() { if (this.calls.day !== zurichDay()) this.calls = { day: zurichDay(), count: 0, texts: 0 }; }
+  _day() { if (this.calls.day !== pacificDay()) this.calls = { day: pacificDay(), count: 0, texts: 0 }; }
   quotaLeft() { this._day(); return this.maxPerDay - this.calls.count; }
   textsLeft() { this._day(); return this.maxTextsPerDay - this.calls.texts; }
   get batchSize() { return Math.max(this.minBatch, Math.min(this.maxBatch, Math.round(this.rate / 2))); }
@@ -131,7 +140,7 @@ class Embedder {
     const res = { embedded: 0, requests: 0, stop: null }; let i = 0; let lastFlush = clock.now();
     const doFlush = async () => { if (flush && es.dirty && es.dirty.size) { try { await flush(); } catch { /* la sauvegarde sera retentée */ } lastFlush = clock.now(); } };
     while (i < list.length) {
-      if (!this.available) { res.stop = this.quotaLeft() <= 0 ? 'plafond quotidien de requêtes atteint' : this.textsLeft() <= 0 ? 'plafond quotidien de titres atteint' : 'pause (quota ou erreur récente)'; break; }
+      if (!this.available) { const cap = this.quotaLeft() <= 0 || this.textsLeft() <= 0; if (cap) this.pausedUntil = Math.max(this.pausedUntil, nextPacificMidnight() + QUOTA_RESET_MARGIN_MS); res.stop = this.quotaLeft() <= 0 ? 'plafond quotidien de requêtes atteint' : this.textsLeft() <= 0 ? 'plafond quotidien de titres atteint' : 'pause (quota ou erreur récente)'; break; }
       const wait = Math.max(0, this.nextAt - clock.now());
       if (clock.now() + wait > deadline) { res.stop = 'délai du calcul atteint'; break; }
       if (wait) await sleep(wait);
@@ -142,13 +151,13 @@ class Embedder {
         chunk.forEach((x, j) => es.put(x.id, x.h, vecs[j]));
         i += chunk.length; res.embedded += chunk.length; this.calls.texts += chunk.length; this.stats.ok++; this.stats.texts += chunk.length;
         this.okStreak++; this.consec429 = 0; this.consecErr = 0; this.backoffMs = this.backoff0;
-        if (this.okStreak >= 4) { this.rate = Math.min(this.maxRate, Math.round(this.rate * 1.1)); this.okStreak = 0; }
+        if (this.okStreak >= 3) { this.rate = Math.min(this.maxRate, Math.round(this.rate * 1.25)); this.okStreak = 0; }
         this.nextAt = clock.now() + Math.max(this.minIntervalMs, Math.round(chunk.length * 60000 / this.rate));
       } catch (e) {
         this._err(e);
         if (e.status === 429) {
           this.stats.rate429++; this.consec429++; this.okStreak = 0;
-          if (/perday|per day|par jour|daily/i.test(String(e.body || '') + String(e.message || ''))) { this.pausedUntil = nextZurichMidnight() + 120000; res.stop = 'quota journalier de Google atteint : reprise demain'; break; }
+          if (/perday|per day|par jour|daily/i.test(String(e.body || '') + String(e.message || '')) || (this.consec429 >= 3 && this.rate <= this.minRate)) { this.pausedUntil = nextPacificMidnight() + QUOTA_RESET_MARGIN_MS; res.stop = 'quota journalier de Google atteint : reprise à la remise à zéro du quota'; break; }
           this.rate = Math.max(this.minRate, Math.floor(this.rate * 0.6));             // trop vite : le débit baisse de 40 %
           this.nextAt = clock.now() + this.backoffMs; this.backoffMs = Math.min(this.backoffMs * 2, 120000);
           if (this.consec429 >= 5) { this.pausedUntil = clock.now() + 30 * 60e3; res.stop = 'quota dépassé (429 répétés) : reprise plus tard'; break; }
@@ -240,18 +249,19 @@ async function evaluateBlend({ dev, test, scores, embOf, beta, gate, grid = [0, 
 // ---------- application au classement des candidats : mélange (1 − wk) × utilité locale + wk × utilité par voisins ----------
 function applyBlend(scored, { wk, pool, beta, vecOf, topN = TOP_CANDIDATES, minCoverage = MIN_COVERAGE }) {
   const N = Math.min(topN, scored.length); if (!N || !pool.length) return { applied: false, coverage: 0, N };
-  const prior = priorOf(pool); const upd = [];
-  for (let i = 0; i < N; i++) { const v = vecOf(scored[i].rec); if (!v) continue; const p = knnProbs(v, pool, { tau: TAU_EMB, prior }); if (p) upd.push([i, uKnn(p, beta), p]); }
-  const coverage = upd.length / N;
-  if (coverage < minCoverage) return { applied: false, coverage: r4(coverage), N };          // couverture insuffisante : classement local inchangé (jamais de mélange partiel incohérent)
-  for (const [i, u, p] of upd) { const c = scored[i]; c.utilLocal = c.util; c.util = (1 - wk) * c.util + wk * u; c.knn = { pPos: r4(p.pPos), pLove: r4(p.pLove), top: r4(p.top) }; }
+  const prior = priorOf(pool); const probs = new Array(scored.length).fill(null); let have = 0, total = 0;
+  for (let i = 0; i < scored.length; i++) { const v = vecOf(scored[i].rec); if (!v) continue; const p = knnProbs(v, pool, { tau: TAU_EMB, prior }); if (p) { probs[i] = p; total++; if (i < N) have++; } }
+  const coverage = have / N;
+  if (coverage < minCoverage) return { applied: false, coverage: r4(coverage), N, vectorises: total };      // les mieux classés ne sont pas assez vectorisés : classement local inchangé
+  const neutral = uKnn({ pPos: prior.pos, pLove: prior.love }, beta);                                     // candidat sans vecteur : valeur neutre (la moyenne de ton historique), donc aucune avance ni retard artificiel
+  for (let i = 0; i < scored.length; i++) { const c = scored[i]; const p = probs[i]; c.utilLocal = c.util; c.util = (1 - wk) * c.util + wk * (p ? uKnn(p, beta) : neutral); if (p) c.knn = { pPos: r4(p.pPos), pLove: r4(p.pLove), top: r4(p.top) }; }
   scored.sort((a, b) => b.util - a.util || a.rec.i - b.rec.i);
-  return { applied: true, coverage: r4(coverage), N };
+  return { applied: true, coverage: r4(coverage), N, vectorises: total, candidats: scored.length };
 }
 
 // ---------- étape « embeddings » d'un calcul ----------
 // Renvoie un contexte { enabled, es, embedder, coverage, useNeighbors, vecOf, ... } ; ne lève jamais.
-async function prepare({ store, apiKey, allowed, job, labeled, gate, setStage, spaces, budgetMs = Number(process.env.EMBED_BUDGET_MS || 240000), embedderOpts = {}, force = false }) {
+async function prepare({ store, apiKey, allowed, job, labeled, gate, setStage, spaces, budgetMs = Number(process.env.EMBED_BUDGET_MS || 90000), embedderOpts = {}, force = false }) {
   const S = job.embed = job.embed || {};
   const off = (why) => { S.status = why; S.useNeighbors = false; return { enabled: false, useNeighbors: false, wk: 0, why }; };
   try {
@@ -273,7 +283,8 @@ async function prepare({ store, apiKey, allowed, job, labeled, gate, setStage, s
       Object.assign(run, r, { ms: clock.now() - t0 }); await es.flush();
     }
     S.lastRun = { at: new Date(clock.now()).toISOString(), ...run }; S.rate = embedder.rate; S.calls = embedder.calls;
-    S.todo = { labeledIds: items.filter((x) => !es.has(x.id, x.h)).map((x) => x.id), candIds: ((S.todo && S.todo.candIds) || []).filter((id) => !es.has(id)), at: new Date(clock.now()).toISOString() };      // reprise en arrière-plan : titres restant à vectoriser S.stats = { ...embedder.stats }; S.lastError = embedder.lastError; S.pausedUntil = embedder.pausedUntil > clock.now() ? embedder.pausedUntil : 0; S.batch = embedder.batchSize;
+    S.todo = { labeledIds: items.filter((x) => !es.has(x.id, x.h)).map((x) => x.id), candIds: ((S.todo && S.todo.candIds) || []).filter((id) => !es.has(id)), at: new Date(clock.now()).toISOString() };   // reprise en arrière-plan : titres restant à vectoriser
+    S.stats = { ...embedder.stats }; S.lastError = embedder.lastError; S.pausedUntil = embedder.pausedUntil > clock.now() ? embedder.pausedUntil : 0; S.batch = embedder.batchSize;
     const vecOf = (rec) => es.vec(idOf(rec));
     const have = labeled.filter((i) => vecOf(i.rec)).length; const coverage = have / Math.max(1, labeled.length);
     S.coverage = { historique: r4(coverage), titres: have, total: labeled.length, cache: es.size };
@@ -310,7 +321,7 @@ async function decideBlend({ ctx, job, labeled, testScores, split, beta, gate, f
 }
 
 // Vectorise les candidats les mieux classés d'un type (budget de temps borné) ; ne lève jamais
-async function ensureRecs(ctx, recs, { budgetMs = Number(process.env.EMBED_CAND_BUDGET_MS || 90000), setStage } = {}) {
+async function ensureRecs(ctx, recs, { budgetMs = Number(process.env.EMBED_CAND_BUDGET_MS || 45000), setStage } = {}) {
   if (!ctx || !ctx.enabled) return { embedded: 0, skipped: true };
   try {
     const list = recs.map((r) => ({ id: idOf(r), text: embeddingText(r), h: 0 })); list.forEach((x) => { x.h = hashOfText(x.text); });
@@ -318,7 +329,7 @@ async function ensureRecs(ctx, recs, { budgetMs = Number(process.env.EMBED_CAND_
     setStage && setStage(`vectorisation des candidats (${need.length})`);
     const t0 = clock.now(); const r = await ctx.embedder.run(need, { es: ctx.es, deadline: t0 + budgetMs, flush: () => ctx.es.flush() });
     ctx.S.rate = ctx.embedder.rate; ctx.S.todo = ctx.S.todo || { labeledIds: [], candIds: [] };
-    ctx.S.todo.candIds = [...new Set([...(ctx.S.todo.candIds || []).filter((id) => !ctx.es.has(id)), ...need.filter((x) => !ctx.es.has(x.id, x.h)).map((x) => x.id)])].slice(0, 3000);
+    ctx.S.todo.candIds = [...new Set([...(ctx.S.todo.candIds || []).filter((id) => !ctx.es.has(id)), ...need.filter((x) => !ctx.es.has(x.id, x.h)).map((x) => x.id)])].slice(0, 8000);
     ctx.S.calls = ctx.embedder.calls; ctx.S.stats = { ...ctx.embedder.stats }; ctx.S.lastError = ctx.embedder.lastError; ctx.S.pausedUntil = ctx.embedder.pausedUntil > clock.now() ? ctx.embedder.pausedUntil : 0;
     return { need: need.length, ...r };
   } catch (e) { return { error: String(e && e.message || e).slice(0, 100) }; }
@@ -349,4 +360,4 @@ async function continueTodo({ store, apiKey, job, tmdb, spaces, budgetMs = Numbe
   } catch (e) { log('warn', 'Reprise de la vectorisation impossible', String(e && e.message || e).slice(0, 160)); return { error: String(e && e.message || e).slice(0, 100) }; }
 }
 
-module.exports = { embeddingText, idOf, EmbedStore, Embedder, topK, knnProbs, uKnn, neighborCards, makeNeighborsFor, poolOf, priorOf, evaluateSpaces, evaluateBlend, applyBlend, prepare, decideBlend, ensureRecs, continueTodo, quantize, dequantize, normalize, MIN_COVERAGE, TOP_CANDIDATES };
+module.exports = { pacificDay, nextPacificMidnight, QUOTA_RESET_MARGIN_MS, embeddingText, idOf, EmbedStore, Embedder, topK, knnProbs, uKnn, neighborCards, makeNeighborsFor, poolOf, priorOf, evaluateSpaces, evaluateBlend, applyBlend, prepare, decideBlend, ensureRecs, continueTodo, quantize, dequantize, normalize, MIN_COVERAGE, TOP_CANDIDATES };

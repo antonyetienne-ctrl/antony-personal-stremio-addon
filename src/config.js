@@ -1,7 +1,7 @@
 'use strict';
 const { num, sha } = require('./util');
 
-const ENGINE_VERSION = '7.4.1';
+const ENGINE_VERSION = '7.7.0';
 const NS = 'av7';            // préfixe de toutes les clés Upstash (incompatible avec v6 = 'antony:v6:')
 const LANG = 'fr-FR';        // langue TMDB, présente dans les clés de cache
 const DETAIL_SCHEMA = 1;     // version du format compact des fiches TMDB
@@ -12,12 +12,31 @@ const MOVIE_GENRES = [[28, 'Action'], [12, 'Aventure'], [16, 'Animation'], [35, 
 // TMDB n'a PAS de genre Horreur/Romance/Musique pour les séries : on les détecte par mots-clés (genres "virtuels").
 const TV_GENRES = [[10759, 'Action & Aventure'], [16, 'Animation'], [35, 'Comédie'], [80, 'Crime'], [99, 'Documentaire'], [18, 'Drame'], [10751, 'Familial'], [9648, 'Mystère'], [10763, 'Actualités'], [10764, 'Téléréalité'], [10765, 'Science-Fiction & Fantastique'], [10766, 'Feuilleton'], [10767, 'Talk-show'], [10768, 'Guerre & Politique'], [37, 'Western'], ['v:horror', 'Horreur (détectée par mots-clés)'], ['v:romance', 'Romance (détectée par mots-clés)'], ['v:music', 'Musique (détectée par mots-clés)'], ['v:sitcom', 'Sitcom (détectée par mots-clés)'], ['v:kids', 'Kids / Enfants (genre TMDB + mots-clés)']];
 
+// Ordre d'affichage des catalogues de l'addon dans l'accueil de Stremio (l'ordre du manifest fait foi)
+const CATALOG_IDS = ['antony_movies', 'antony_series', 'antony_lib_movies', 'antony_lib_series', 'antony_new_seasons'];
+function normalizeOrder(list) {
+  const out = []; for (const v of Array.isArray(list) ? list : []) { const s = String(v); if (CATALOG_IDS.includes(s) && !out.includes(s)) out.push(s); }
+  for (const id of CATALOG_IDS) if (!out.includes(id)) out.push(id);            // doublons ignorés, catalogues manquants ajoutés à la fin dans l'ordre par défaut
+  return out;
+}
+
+// Installations : 1 ou 2 « cartes d'identité » de la MÊME application (mêmes réglages, mêmes résultats) ; chaque catalogue est affecté à l'installation 1 ou 2.
+const defaultInstall = () => ({ count: 1, assign: Object.fromEntries(CATALOG_IDS.map((id) => [id, 1])) });
+function normalizeInstall(input, prev) {
+  const base = prev && prev.assign ? { count: prev.count === 2 ? 2 : 1, assign: { ...defaultInstall().assign, ...prev.assign } } : defaultInstall();
+  if (!input || typeof input !== 'object') return base;
+  const out = { count: 'count' in input ? (Number(input.count) === 2 ? 2 : 1) : base.count, assign: { ...base.assign } };
+  for (const id of CATALOG_IDS) if (input.assign && id in input.assign) out.assign[id] = Number(input.assign[id]) === 2 ? 2 : 1;
+  for (const id of CATALOG_IDS) if (out.assign[id] !== 1 && out.assign[id] !== 2) out.assign[id] = 1;
+  return out;
+}
+
 function defaultSettings() {
   // AUCUN genre exclu par défaut. Seuils note/votes : mode automatique (calculé sur les ❤️/👍) ; valeurs manuelles = point de départ initial.
   return {
     movie: { ratingMode: 'auto', minRating: 7.2, minVotes: 2000, minRuntime: 70, minYear: 1990, exclude: [], noWesternAnimation: false, order: 'score' },
     series: { ratingMode: 'auto', minRating: 7.2, minVotes: 2000, minYear: 0, exclude: [], noWesternAnimation: true, vfCheck: true, order: 'score' },
-    common: { excludeCancelled: true, movieCatalog: true, seriesCatalog: true, libMovieCatalog: true, libSeriesCatalog: true, frMeta: true, useGemini: true }
+    common: { excludeCancelled: true, movieCatalog: true, seriesCatalog: true, libMovieCatalog: true, libSeriesCatalog: true, frMeta: true, useGemini: true, newSeasonsCatalog: true, catalogOrder: CATALOG_IDS.slice(), install: defaultInstall() }
   };
 }
 
@@ -48,7 +67,9 @@ function normalizeSettings(input = {}, prev = defaultSettings()) {
   if ('minVotes' in s) p.series.minVotes = Math.round(num(s.minVotes, p.series.minVotes, 0, 1e7));
   if ('exclude' in s) p.series.exclude = parseExclude(s.exclude, TV_GENRES);
   if ('order' in s) p.series.order = s.order === 'random' ? 'random' : 'score';
-  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'frMeta', 'useGemini']) if (k in c) p.common[k] = Boolean(c[k]);
+  for (const k of ['excludeCancelled', 'movieCatalog', 'seriesCatalog', 'libMovieCatalog', 'libSeriesCatalog', 'newSeasonsCatalog', 'frMeta', 'useGemini']) if (k in c) p.common[k] = Boolean(c[k]);
+  p.common.install = normalizeInstall(c.install, p.common.install);
+  if ('catalogOrder' in c) p.common.catalogOrder = normalizeOrder(c.catalogOrder); else p.common.catalogOrder = normalizeOrder(p.common.catalogOrder);
   return p;
 }
 
@@ -70,7 +91,9 @@ const key = {
   idmap: `${NS}:idmap`,
   imdb: `${NS}:imdbr`,
   vf: `${NS}:vf`,
+  cards: (v) => `${NS}:cards:${v}`,                     // fiches descriptives de contenu (document partagé)
+  why: (id) => `${NS}:why:${id}`,                       // fiches « pourquoi » (un document par utilisateur)
   emb: (tag, shard) => `${NS}:emb:${tag}:${shard}`     // embeddings sémantiques (blocs de titres, vecteurs quantifiés)
 };
 
-module.exports = { ENGINE_VERSION, NS, LANG, DETAIL_SCHEMA, TOP_N, MOVIE_GENRES, TV_GENRES, defaultSettings, normalizeSettings, settingsFingerprint, key };
+module.exports = { CATALOG_IDS, normalizeOrder, normalizeInstall, defaultInstall, ENGINE_VERSION, NS, LANG, DETAIL_SCHEMA, TOP_N, MOVIE_GENRES, TV_GENRES, defaultSettings, normalizeSettings, settingsFingerprint, key };

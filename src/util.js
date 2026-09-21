@@ -47,7 +47,7 @@ async function fetchJson(url, opts = {}) {
         if (!text) return null;
         try { return JSON.parse(text); } catch { throw new HttpError(res.status, `${label}: JSON invalide`); }
       }
-      lastErr = new HttpError(res.status, `${label} HTTP ${res.status}`, text.slice(0, 300));
+      lastErr = new HttpError(res.status, `${label} HTTP ${res.status}`, text.slice(0, 1200));
       retryable = retryStatuses.includes(res.status);
       const ra = Number(res.headers && res.headers.get && res.headers.get('retry-after'));
       if (ra > 0) wait = Math.min(ra * 1000, 15000);

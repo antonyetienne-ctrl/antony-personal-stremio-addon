@@ -92,7 +92,7 @@ function admissible(recs, { settings, type, seenImdb }) {
 async function scoreCandidates({ recs, corpus, profType, profGlobal, risk, toxic, rank, yielder }) {
   const out = [];
   for (let i = 0; i < recs.length; i++) {
-    const rec = recs[i]; const item = { rec, vec: hashedVec(rec, corpus) };
+    const rec = recs[i]; const item = { rec, vec: hashedVec(rec, corpus), _sim: new Map() };
     const s = blendScores(scoreProfile(profType, item), scoreProfile(profGlobal, item));
     let tox = 0; const hits = [];
     for (const t of toxic || []) if (recipeMatches(rec, t.parts)) { tox += t.conf * 0.06; hits.push(t.id); }

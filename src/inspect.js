@@ -7,6 +7,7 @@ const { attach } = require('./imdb');
 const { classify } = require('./stremio');
 const { virtualTags } = require('./filters');
 const embed = require('./embed');
+const { parseWatched } = require('./seasons');
 
 const MAX_ENTRIES = 30, MAX_MATCHES = 5;
 const fold = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -27,7 +28,7 @@ function effectiveSettings(user, job) {
   return eff;
 }
 
-async function run({ q, user, engine, results, library }) {
+async function run({ q, user, engine, results, library, newSeasons }) {
   const uid = user.id;
   const entries = [...new Set(String(q || '').split(/[\n,;|]+/).map((s) => s.trim()).filter(Boolean))].slice(0, MAX_ENTRIES);
   if (!entries.length) return { usage: 'Ajoute ?q= une liste de titres séparés par des virgules : identifiants IMDb (tt0111161) ou noms (Outlander, Off Campus). Maximum 30.', exemple: '/diag/check?token=…&q=tt0111161,Outlander,Off Campus' };
@@ -93,8 +94,14 @@ async function run({ q, user, engine, results, library }) {
         presente: true, retire: lib.removed, temporaire: lib.temp, decision: c.seen ? 'VU' : c.started ? 'commencé' : 'rien', signaux: c.why,
         statut: snap ? LABEL[(sn && sn[1]) || '?'] : 'inconnu (aucun instantané)', dernierVisionnage: c.lw ? new Date(c.lw).toISOString().slice(0, 10) : null,
         etatBrut: { timesWatched: s.timesWatched ?? null, flaggedWatched: s.flaggedWatched ?? null, timeWatched: s.timeWatched ?? null, timeOffset: s.timeOffset ?? null, duration: s.duration ?? null, video_id: s.video_id ?? null,
-          watched: typeof s.watched === 'string' ? `liste d'épisodes présente (${s.watched.length} caractères)` : s.watched === true ? 'true' : null, lastWatched: s.lastWatched ?? null, _mtime: lib.mtime }
+          watched: typeof s.watched === 'string' ? s.watched.slice(0, 400) : s.watched === true ? 'true' : null, watchedCaracteres: typeof s.watched === 'string' ? s.watched.length : null, lastWatched: s.lastWatched ?? null, _mtime: lib.mtime }
       };
+    if (lib && lib.state && typeof lib.state.watched === 'string' && lib.state.watched) {          // liste des épisodes vus : lecture brute (aide à valider le décodage)
+      const pw = parseWatched(lib.state.watched);
+      if (pw) { const cnt = (o) => { let n = 0; for (let i = 0; i < pw.bytes.length * 8; i++) { const b = pw.bytes[i >> 3]; if (o === 'msb' ? (b >> (7 - (i & 7))) & 1 : (b >> (i & 7)) & 1) n++; } return n; }; r.bibliotheque.decodageListeVue = { episodeAncre: pw.anchorId, longueurAncre: pw.anchorLen, octets: pw.bytes.length, compresse: pw.compressed, bitsAUnLsb: cnt('lsb'), bitsAUnMsb: cnt('msb') }; }
+      else r.bibliotheque.decodageListeVue = { illisible: true };
+    }
+    if (t.type === 'series' && lib && newSeasons) { try { const label = sn ? sn[1] : null; r.nouvellesSaisons = await newSeasons.explain(lib, label, cl.tmdb); } catch (e) { r.nouvellesSaisons = { erreur: String(e && e.message || e).slice(0, 100) }; } }
     } else if (sn) r.bibliotheque = { presente: 'absente de la bibliothèque en direct, présente au dernier calcul', decision: sn[2].includes('s') ? 'VU' : sn[2].includes('t') ? 'commencé' : 'rien', signaux: sn[4] || null, statut: LABEL[sn[1]] || 'inconnu' };
     else r.bibliotheque = { presente: false };
     // --- filtres actuels

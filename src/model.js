@@ -90,7 +90,9 @@ function baseFeats(base, item) {
   const z = zA(base.A, item.rec);
   const parts = { zA: z };
   if (!base.pos.length && !base.neg.length) return { f: [z, Math.tanh(z / 3), 0, 0, 0, 0, 0, 0, 0, 0, 0], parts };
-  const sp = base.pos.map((p) => ml.dot(item.vec, p.v)), sn = base.neg.map((p) => ml.dot(item.vec, p.v));
+  // similarités : mémorisées par candidat quand `item._sim` (Map) existe (scoring des candidats) ; les tâches et profils partagent les mêmes vecteurs d'entraînement => 3 à 5 fois moins de produits scalaires
+  const dt = item._sim instanceof Map ? (v) => { let s = item._sim.get(v); if (s === undefined) { s = ml.dot(item.vec, v); item._sim.set(v, s); } return s; } : (v) => ml.dot(item.vec, v);
+  const sp = base.pos.map((p) => dt(p.v)), sn = base.neg.map((p) => dt(p.v));
   const sPos = meanTop(sp, 3), sNeg = meanTop(sn, 3);
   const all = []; base.pos.forEach((p, i) => all.push([sp[i], p.w, 1])); base.neg.forEach((p, i) => all.push([sn[i], p.w, 0]));
   all.sort((a, b) => b[0] - a[0]);
