@@ -6,4 +6,4 @@ COPY package.json ./
 COPY src ./src
 EXPOSE 10000
 USER node
-CMD ["node", "src/index.js"]
+CMD ["node", "--expose-gc", "src/index.js"]

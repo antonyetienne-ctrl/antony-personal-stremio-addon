@@ -1,6 +1,6 @@
 {
   "name": "antony-personal-stremio-addon",
-  "version": "7.8.0",
+  "version": "7.9.0",
   "private": true,
   "description": "Moteur de recommandation Stremio personnel (Love/Like/vu-sans-appréciation), RAM-first, Render Free + Upstash Free.",
   "main": "src/index.js",
